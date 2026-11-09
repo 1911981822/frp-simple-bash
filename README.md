@@ -210,6 +210,7 @@ FRP_TEST_MODE=1 FRP_CONFIG_DIR=/tmp/frp-simple-demo bash bin/frpc
 
 ## 设计依据与验证记录
 
+- [项目结构与各文件功能说明](<docs/项目结构与功能说明.md>)
 - [需求文档](<docs/frp二次封装需求文档.md>)
 - [概要设计](<docs/frp二次封装概要设计文档.md>)
 - [详细设计](<docs/frp二次封装详细设计文档.md>)

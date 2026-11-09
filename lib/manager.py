@@ -363,14 +363,27 @@ def ask(prompt, default=None, secret=False):
     return default if not v and default is not None else v
 
 def confirm(prompt): return ask(prompt + ' [y/N]').lower() in ('y', 'yes')
+
+def clear_screen():
+    if sys.stdout.isatty(): print('\033[2J\033[H', end='')
+
+def pause(message='按回车返回上一级菜单'):
+    if sys.stdin.isatty():
+        print('\n' + '─' * 42)
+        input(message + '：')
+
+def result_ok(message): print(f'\n[成功] {message}')
+def result_info(message): print(f'\n[提示] {message}')
+def result_error(message): print(f'\n[失败] {message}')
+
 def choose(items, title='请选择'):
-    print('\n' + title)
-    for n, item in enumerate(items, 1): print(f'{n}. {item}')
-    print('0. 返回/退出')
+    print('\n[菜单] ' + title)
+    for n, item in enumerate(items, 1): print(f'  {n}. {item}')
+    print('  0. 返回上一级')
     while True:
-        v = ask('请输入数字')
+        v = ask('请输入编号 > ')
         if v.isdecimal() and 0 <= int(v) <= len(items): return int(v)
-        print('无效编号，请重新输入。')
+        result_error('无效编号，请输入列表中的数字。')
 
 def require_active():
     pid = active()
@@ -415,7 +428,7 @@ def save_mappings(pid, items):
         try: mappings(pid); apply(pid)
         except Exception: atomic(path, old); raise
         s = state(); s['pending'] = True; save_json(ROOT / 'state.json', s); audit('mappings-saved', pid)
-    print('端口映射配置已保存。' + ('当前 frpc 运行中，请按提示重启后生效。' if running('frpc') else '当前 frpc 未运行，下次启动时生效。'))
+    result_ok('端口映射配置已保存。' + ('当前 frpc 运行中，请按提示重启后生效。' if running('frpc') else '当前 frpc 未运行，下次启动时生效。'))
     if running('frpc') and confirm('配置已保存，立即重启 frpc 生效？'):
         service('frpc', 'restart'); wait_connection(pid)
         s = state(); s['pending'] = False; save_json(ROOT / 'state.json', s)
@@ -433,6 +446,7 @@ def mapping_wizard(old=None):
 
 def mapping_menu():
     while True:
+        clear_screen()
         pid = require_active(); print('\n当前 frps：' + label(load_profile(pid)))
         n = choose(['新增端口映射', '查看当前服务端映射', '修改端口映射', '启用/停用端口映射', '删除端口映射'])
         if not n: return
@@ -447,15 +461,18 @@ def mapping_menu():
                 if not index: continue
                 if n == 3: items[index-1] = mapping_wizard(items[index-1])
                 elif n == 4: items[index-1]['enabled'] = not items[index-1].get('enabled', True)
-                elif not confirm('确认删除映射 ' + items[index-1]['name'] + '？'): continue
+                elif not confirm('确认删除映射 ' + items[index-1]['name'] + '？'): result_info('已取消删除。'); continue
                 else: items.pop(index-1)
-                save_mappings(pid, items)
-        except (ValueError, OSError, KeyError) as e: print('操作失败：' + str(e))
+                save_mappings(pid, items); result_ok('端口映射操作已完成。')
+                pause()
+        except (ValueError, OSError, KeyError) as e: result_error(str(e)); pause()
 
 def edit_profile():
+    clear_screen()
     pid = require_active(); p = load_profile(pid); s = secrets_for(pid)
     version = hashlib.sha256((pdir(pid) / 'profile.toml').read_bytes() + (pdir(pid) / 'secrets.toml').read_bytes()).hexdigest()
     while True:
+        clear_screen()
         n = choose(['查看连接配置', '修改服务端名称', '修改服务器地址', '修改服务器端口', '修改 token', '修改 TLS 配置', '修改 Dashboard/API', '保存并返回', '删除当前服务端及全部映射'], label(p))
         if n == 0: return
         if n == 1: print(json.dumps(p, ensure_ascii=False, indent=2))
@@ -659,13 +676,14 @@ def service_feedback(role, action):
     state_value = service(role, 'status').strip().lower()
     expected = {'start': ('active', 'started', 'running'), 'stop': ('inactive', 'stopped', 'dead'), 'restart': ('active', 'started', 'running')}[action]
     if state_value in expected:
-        print(f'{labels[action]}成功：当前状态为 {"运行中" if action != "stop" else "已停止"}。')
+        result_ok(f'{labels[action]}成功：当前状态为 {"运行中" if action != "stop" else "已停止"}。')
     else:
-        print(f'{labels[action]}请求已发送，但当前服务状态为：{state_value or "未知"}。请查看日志。')
+        result_error(f'{labels[action]}请求已发送，但当前服务状态为：{state_value or "未知"}。请查看日志。')
     return state_value
 
 def main_menu(role):
     while True:
+        clear_screen()
         try:
             data = show_status(role)
             alias = data.get('active_profile', {}).get('name', '未选择')
@@ -711,7 +729,9 @@ def main_menu(role):
                 elif n == 10: autostart(role)
                 elif n == 11: uninstall(role)
                 elif n == 12: upgrade(role)
-        except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as e: print('操作失败：' + str(e))
+        except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as e: result_error(str(e))
+        if n != 1:
+            pause()
 
 def show_logs(role):
     path = ROOT / 'logs' / (role + '.log')

@@ -755,17 +755,15 @@ Dashboard/API：127.0.0.1:7500
 配置路径：/etc/frp/frps.toml
 
 请选择操作：
-1. 查看运行状态
-2. 查看版本信息
-3. 查看安装路径
-4. 启动 frps
-5. 停止 frps
-6. 重启 frps
-7. 查看客户端连接信息
-8. 修改服务端配置
-9. 查看日志
-10. 设置/取消开机自启动
-11. 卸载 frps
+1. 查看服务信息（状态、版本、路径）
+2. 启动 frps
+3. 停止 frps
+4. 重启 frps
+5. 查看客户端连接信息
+6. 修改服务端配置
+7. 查看日志
+8. 设置/取消开机自启动
+9. 卸载 frps
 0. 返回/退出
 请输入数字：
 ```
@@ -773,17 +771,16 @@ Dashboard/API：127.0.0.1:7500
 分发映射：
 
 ```text
-1 -> show_frps_status
-2 -> show_version
-3 -> show_paths
-4 -> start_frps
-5 -> confirm_then_stop_frps
-6 -> confirm_then_restart_frps
-7 -> show_client_connections
-8 -> frps_config_menu
-9 -> logs_menu
-10 -> boot_menu
-11 -> uninstall_menu
+1 -> show_frps_status_version_path
+2 -> start_frps
+3 -> confirm_then_stop_frps
+4 -> confirm_then_restart_frps
+5 -> show_client_connections
+6 -> frps_config_menu
+7 -> logs_menu
+8 -> boot_menu
+9 -> uninstall_menu
+10 -> upgrade_menu
 0 -> exit
 ```
 

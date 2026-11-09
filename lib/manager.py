@@ -692,7 +692,7 @@ def main_menu(role):
             alias = '配置错误'
         if role == 'frpc':
             items = ['查看当前状态', '启动 frpc', '停止 frpc', '重启 frpc', '新建 frps 服务端', '查看服务端列表', '切换当前 frps 服务端', '修改当前 frps 配置', f'修改当前 frps（{alias}）端口映射', '查看日志与连接诊断', '设置/取消开机自启动', '卸载 frpc', '升级 frpc']
-        else: items = ['查看运行状态', '查看版本信息', '查看安装路径', '启动 frps', '停止 frps', '重启 frps', '查看客户端连接信息', '修改服务端配置', '查看日志', '设置/取消开机自启动', '卸载 frps', '升级 frps']
+        else: items = ['查看服务信息（状态、版本、路径）', '启动 frps', '停止 frps', '重启 frps', '查看客户端连接信息', '修改服务端配置', '查看日志', '设置/取消开机自启动', '卸载 frps', '升级 frps']
         n = choose(items)
         if not n: return
         try:
@@ -717,18 +717,18 @@ def main_menu(role):
                 elif n == 12: uninstall(role)
                 elif n == 13: upgrade(role)
             else:
-                if n == 1: continue  # The next menu frame refreshes status once.
-                elif n == 2: print(VERSION)
-                elif n == 3: print(f'原生程序：{binary(role)}\n配置目录：{ROOT}')
-                elif n in (4,5,6):
-                    if n == 4 or confirm(items[n-1] + '？'):
-                        service_feedback(role, {4:'start',5:'stop',6:'restart'}[n])
-                elif n == 7: server_clients()
-                elif n == 8: configure_server()
-                elif n == 9: show_logs(role)
-                elif n == 10: autostart(role)
-                elif n == 11: uninstall(role)
-                elif n == 12: upgrade(role)
+                if n == 1:
+                    result_info('正在刷新服务信息。')
+                    show_status(role)
+                elif n in (2,3,4):
+                    if n == 2 or confirm(items[n-1] + '？'):
+                        service_feedback(role, {2:'start',3:'stop',4:'restart'}[n])
+                elif n == 5: server_clients()
+                elif n == 6: configure_server()
+                elif n == 7: show_logs(role)
+                elif n == 8: autostart(role)
+                elif n == 9: uninstall(role)
+                elif n == 10: upgrade(role)
         except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as e: result_error(str(e))
         if n != 1:
             pause()

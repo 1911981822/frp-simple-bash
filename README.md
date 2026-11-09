@@ -2,7 +2,50 @@
 
 frp v0.72.0 的终端数字菜单管理封装。Linux 使用 Bash 安装入口，Windows 使用 PowerShell 安装入口；共享业务核心使用 Python：3.11+ 采用标准库；Linux 3.9/3.10 使用发行版 `tomli` 包，不通过 pip 修改系统 Python。
 
-**当前是开发版。Debian 12/systemd 已完成实际安装、启停、自启动注册、profile/映射切换和卸载测试；OpenRC、其他发行版和 Windows 仍待实机验收。远程安装入口要等代码推送到 main 后才可用。请先在测试环境验证。**
+**当前是开发版。Debian 12/systemd 已完成实际安装、启停、自启动注册、profile/映射切换和卸载测试；OpenRC、其他发行版和 Windows 仍待实机验收。请先在测试环境验证。**
+
+## 一键安装
+
+复制对应命令到终端执行，按提示完成配置。Linux 需要 `curl` 和 `tar`；普通用户使用下面的 `sudo` 命令，已登录 root 时去掉 `sudo`。安装过程需要交互输入，使用命令替换方式保留终端输入。
+
+### Linux 服务端 frps
+
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-frps.sh)"
+```
+
+### Linux 客户端 frpc
+
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-frpc.sh)"
+```
+
+### Windows 服务端 frps
+
+以**管理员身份打开 PowerShell**，执行：
+
+```powershell
+irm https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-frps.ps1 | iex
+```
+
+### Windows 客户端 frpc
+
+以**管理员身份打开 PowerShell**，执行：
+
+```powershell
+irm https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-frpc.ps1 | iex
+```
+
+Windows 需要预先安装 Python 3.11+ 并加入 PATH。以上命令会下载并执行本仓库的安装脚本；如需先查看脚本，可使用后文的下载后安装方式。安装包下载受限时，参见 Linux 安装章节的本地包入口。
+
+安装后输入对应命令打开菜单（Windows 请打开一个新终端）：
+
+```text
+frps
+frpc
+```
+
+然后输入功能编号并回车即可操作，输入 `0` 返回或退出。
 
 ## 交互方式
 
@@ -49,7 +92,7 @@ sudo bash install-frpc.sh
 
 缺少基础依赖时支持 apt/dnf/yum/apk 安装，先显示包列表并确认；Python 3.9/3.10 自动检测发行版 TOML 包并提示安装。旧系统无法提供 Python 3.9 或 TOML 包时明确停止，安装器不会静默添加第三方软件源。没有 systemd/OpenRC 的容器不会假装完成自启动安装。
 
-后续推送 main 后的远程入口：
+下载脚本后安装（可先查看脚本内容）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-frps.sh -o install-frps.sh

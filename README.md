@@ -6,18 +6,18 @@ frp v0.72.0 的终端数字菜单管理封装。Linux 使用 Bash 安装入口�
 
 ## 一键安装
 
-复制对应命令到终端执行，按提示完成配置。Linux 需要 `curl` 和 `tar`；普通用户使用下面的 `sudo` 命令，已登录 root 时去掉 `sudo`。安装过程需要交互输入，使用命令替换方式保留终端输入。
+复制对应命令到终端执行，按提示完成配置。Linux 需要 `curl` 和 `tar`；普通用户使用下面的 `sudo` 命令，已登录 root 时去掉 `sudo`。先成功下载脚本，再执行安装：下载失败立即停止，并保留终端交互输入。
 
 ### Linux 服务端 frps
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-frps.sh)"
+script="$(curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-frps.sh)" && sudo bash -c "$script"
 ```
 
 ### Linux 客户端 frpc
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-frpc.sh)"
+script="$(curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-frpc.sh)" && sudo bash -c "$script"
 ```
 
 ### Windows 服务端 frps
@@ -122,6 +122,35 @@ powershell -File .\install-frpc.ps1
 安装器使用 WinSW v2.12.0 注册 Windows Service，原生 frp.exe 不直接当成 SCM 服务程序。WinSW 校验官方 metadata digest；旧资产缺少 digest 时，校验本次从官方固定 asset ID 93386820 下载登记的 SHA256：`05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da`。该值是官方下载资产的固定记录，不代表官方另行发布的签名。不会跳过校验运行下载程序。配置 ACL 只允许 SYSTEM 和 Administrators。
 
 在新终端输入 `frps`/`frpc`，CMD 包装器转发到 PowerShell，再调用共享核心。配置与中文输出使用 UTF-8 无 BOM。当前开发机没有 PowerShell/Windows，SCM、ACL 和终端编码尚待实机验证。
+
+## 下载故障：证书域名不匹配
+
+如果出现 `curl: (60) SSL: no alternative certificate subject name matches target host name`，脚本尚未下载，常见原因是 `/etc/hosts` 固定了过期/错误的 GitHub IP，或网络代理返回了不匹配的证书。请先检查：
+
+```bash
+getent hosts raw.githubusercontent.com
+getent -s dns ahostsv4 raw.githubusercontent.com
+sed -n '/github/p' /etc/hosts
+curl -I --connect-timeout 10 --max-time 20 https://raw.githubusercontent.com
+```
+
+若 hosts 中存在确认错误的 GitHub 映射，先备份 `/etc/hosts`，只移除对应域名的错误记录，让系统重新通过 DNS 解析；不要删除其他主机条目。不要使用 `curl -k` 跳过证书校验，也不要将网上某个 GitHub IP 长期写死。
+
+root 用户可在修复解析后执行：
+
+```bash
+script="$(curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-frps.sh)" && bash -c "$script"
+```
+
+客户端将 `install-frps.sh` 改为 `install-frpc.sh`。其中 `&&` 保证下载失败时不启动安装；证书错误也不能通过已经下载不到的安装脚本自修复。
+
+若 Raw 域名仍无法访问，而官方 Codeload 可正常验证 HTTPS，可下载完整仓库后安装：
+
+```bash
+curl -fL --connect-timeout 10 --max-time 120 https://codeload.github.com/1911981822/frp-simple-bash/tar.gz/refs/heads/main -o frp-simple-bash-main.tar.gz && tar -xzf frp-simple-bash-main.tar.gz && sudo bash frp-simple-bash-main/install-frps.sh
+```
+
+下载和解压到新目录，已有同名目录时先检查内容；客户端替换末尾脚本名。此方式仍保留证书校验，后续原生 frp 安装包仍验证固定 SHA256。
 
 ## 数据与路径
 

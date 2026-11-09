@@ -596,11 +596,48 @@ def status(role):
     if role == 'frpc' and active(): result.update({'active_profile': load_profile(active()), 'connection': connection(active()), 'pending': state().get('pending', False)})
     return result
 
+def show_status(role):
+    data = status(role)
+    states = {'active': '运行中', 'running': '运行中', 'started': '运行中', 'stopped': '已停止', 'inactive': '已停止', 'failed': '异常', 'unknown': '未知', 'activating': '启动中'}
+    print('\n' + ('frps 服务端管理' if role == 'frps' else 'frpc 客户端管理'))
+    print('─' * 42)
+    print('运行状态：' + states.get(data['service_state'].lower(), data['service_state']))
+    print('frp 版本：' + data['version'])
+    print('配置路径：' + data['config_path'])
+    if role == 'frps':
+        path = ROOT / 'frps.toml'
+        if path.exists():
+            config = read_toml(path)
+            host = config.get('bindAddr', '0.0.0.0')
+            if ':' in host: host = '[' + host + ']'
+            print(f'业务监听：{host}:{config.get("bindPort", 7000)}')
+            web = config.get('webServer', {})
+            if web.get('port'):
+                addr = web.get('addr', '127.0.0.1')
+                if ':' in addr: addr = '[' + addr + ']'
+                scheme = 'https' if web.get('tls', {}).get('certFile') else 'http'
+                print(f'Dashboard：{scheme}://{addr}:{web["port"]}')
+                if web.get('addr', '127.0.0.1') in ('127.0.0.1', '::1'):
+                    print('管理访问：仅本机；终端菜单可正常查询客户端信息')
+            else: print('Dashboard：未启用')
+        else: print('配置状态：未配置')
+    else:
+        p = data.get('active_profile')
+        print('当前服务端：' + (label(p) if p else '未选择'))
+        if p:
+            translations = {'connected': '已连接', 'connecting': '连接中', 'stopped': '已停止', 'unknown': '待确认', 'proxy-error': '映射异常', 'auth-failed': '认证失败', 'tls-failed': 'TLS 失败', 'timeout': '连接超时'}
+            connection_data = data['connection']
+            print('连接状态：' + translations.get(connection_data['state'], connection_data['state']))
+            print('映射数量：' + str(len(mappings(p['id']))))
+            if data.get('pending'): print('配置生效：有修改等待重启')
+    print('─' * 42)
+    return data
+
 def main_menu(role):
     while True:
         try:
-            print('\n' + json.dumps(status(role), ensure_ascii=False, indent=2))
-            alias = load_profile(active())['name'] if active() else '未选择'
+            data = show_status(role)
+            alias = data.get('active_profile', {}).get('name', '未选择')
         except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError):
             print('配置无法读取；请检查配置文件或从 backups 恢复，服务管理仍可使用。')
             alias = '配置错误'
@@ -611,7 +648,7 @@ def main_menu(role):
         if not n: return
         try:
             if role == 'frpc':
-                if n == 1: print(json.dumps(status(role), ensure_ascii=False, indent=2))
+                if n == 1: continue  # The next menu frame refreshes status once.
                 elif n in (2, 3, 4):
                     require_active()
                     if n == 2 or confirm(items[n-1] + '？'):
@@ -629,7 +666,7 @@ def main_menu(role):
                 elif n == 12: uninstall(role)
                 elif n == 13: upgrade(role)
             else:
-                if n == 1: print(json.dumps(status(role), ensure_ascii=False, indent=2))
+                if n == 1: continue  # The next menu frame refreshes status once.
                 elif n == 2: print(VERSION)
                 elif n == 3: print(f'原生程序：{binary(role)}\n配置目录：{ROOT}')
                 elif n in (4,5,6):

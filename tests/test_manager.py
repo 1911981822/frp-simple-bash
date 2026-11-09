@@ -1,4 +1,7 @@
 import importlib.util
+import contextlib
+import io
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -21,6 +24,29 @@ class ManagerTests(unittest.TestCase):
         return m.create_profile({'name':name, 'server_addr':'::1', 'server_port':7000, 'dashboard_port':7500, 'tls_enable':True}, {'token':'token"\\&/', 'admin_password':'secret'})
     def mapping(self, name='ssh', port=6000):
         return {'name':name, 'type':'tcp', 'local_ip':'127.0.0.1', 'local_port':22, 'remote_port':port, 'enabled':True}
+    def test_server_menu_refreshes_once_and_hides_secrets(self):
+        m.atomic(m.ROOT / 'frps.toml', m.toml({'bindPort':7000,'auth.token':'do-not-print-token','webServer.addr':'127.0.0.1','webServer.port':7500,'webServer.user':'admin','webServer.password':'do-not-print-password'}))
+        output=io.StringIO()
+        with contextlib.redirect_stdout(output), patch('builtins.input', side_effect=['1','0']): m.main_menu('frps')
+        shown=output.getvalue()
+        self.assertEqual(shown.count('frps 服务端管理'), 2)
+        self.assertEqual(shown.count('运行状态：'), 2)
+        self.assertIn('业务监听：0.0.0.0:7000',shown)
+        self.assertIn('Dashboard：http://127.0.0.1:7500',shown)
+        for hidden in ('"component"','do-not-print-token','do-not-print-password'): self.assertNotIn(hidden,shown)
+    def test_frpc_menu_labels_and_json_status(self):
+        pid=self.create();m.set_current(pid)
+        output=io.StringIO()
+        with contextlib.redirect_stdout(output), patch('builtins.input', side_effect=['1','0']): m.main_menu('frpc')
+        shown=output.getvalue();self.assertEqual(shown.count('frpc 客户端管理'),2)
+        self.assertIn('生产服务器（[::1]:7000）',shown)
+        self.assertIn('连接状态：已停止',shown);self.assertNotIn('"component"',shown)
+        output=io.StringIO()
+        with contextlib.redirect_stdout(output):m.run(['frpc','status','--json'])
+        self.assertEqual(json.loads(output.getvalue())['component'],'frpc')
+    def test_frps_status_independent_of_broken_client_profile(self):
+        m.save_json(m.ROOT/'state.json',{'active_profile_id':'invalid'})
+        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input',return_value='0'):m.main_menu('frps')
     def test_unicode_name_and_unique_rename(self):
         pid = self.create(); self.assertIn('[::1]:7000', m.label(m.load_profile(pid)))
         with self.assertRaises(ValueError): self.create()

@@ -24,6 +24,12 @@ class ManagerTests(unittest.TestCase):
         return m.create_profile({'name':name, 'server_addr':'::1', 'server_port':7000, 'dashboard_port':7500, 'tls_enable':True}, {'token':'token"\\&/', 'admin_password':'secret'})
     def mapping(self, name='ssh', port=6000):
         return {'name':name, 'type':'tcp', 'local_ip':'127.0.0.1', 'local_port':22, 'remote_port':port, 'enabled':True}
+    def test_server_clients_renders_human_readable_status(self):
+        m.atomic(m.ROOT / 'frps.toml', m.toml({'bindPort':7000,'webServer.addr':'127.0.0.1','webServer.port':7500,'webServer.user':'admin','webServer.password':'password'}))
+        clients={'total':1,'items':[{'hostname':'内网机器','clientID':'c1','version':'0.72.0','clientIP':'127.0.0.1','online':True,'status':{'proxyCount':2}}]}
+        proxies={'total':1,'items':[{'name':'web','spec':{'type':'tcp'},'status':{'phase':'online','todayTrafficIn':1,'todayTrafficOut':2,'curConns':3}}]}
+        with patch.object(m,'api',side_effect=[clients,proxies]), contextlib.redirect_stdout(io.StringIO()) as output: m.server_clients()
+        shown=output.getvalue();self.assertIn('内网机器 [在线]',shown);self.assertIn('代理数量=2',shown);self.assertIn('web [online]',shown);self.assertNotIn('password',shown)
     def test_server_menu_refreshes_once_and_hides_secrets(self):
         m.atomic(m.ROOT / 'frps.toml', m.toml({'bindPort':7000,'auth.token':'do-not-print-token','webServer.addr':'127.0.0.1','webServer.port':7500,'webServer.user':'admin','webServer.password':'do-not-print-password'}))
         output=io.StringIO()

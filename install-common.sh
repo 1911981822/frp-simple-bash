@@ -3,12 +3,51 @@
 set -Eeuo pipefail
 component="${1:?需要 frps 或 frpc}"
 [[ "$component" == frps || "$component" == frpc ]] || exit 2
+shift
+version='0.72.0'; install_root='/opt/frp-simple-bash'; config_root='/etc/frp'; archive_path=''; mirror=''; yes=0; start=1; autostart=1; non_interactive=0
+usage() { cat <<'EOF'
+用法: install-frps.sh|install-frpc.sh [选项]
+  --version VERSION       版本（当前仅支持已核验的 0.72.0）
+  --install-dir DIR       安装目录（默认 /opt/frp-simple-bash）
+  --config-dir DIR        配置目录（默认 /etc/frp）
+  --archive-path FILE     使用本地已下载包并校验 SHA256
+  --mirror URL            使用 HTTPS 国内镜像
+  --yes                   自动确认依赖和危险操作
+  --no-start              注册服务但不启动
+  --no-autostart          不设置开机自启动
+  --non-interactive       缺少配置时停止，不进入向导
+  --list-versions         列出已核验版本
+  --help                  显示帮助
+EOF
+}
+while (($#)); do case "$1" in
+  --version) version="${2:?--version 需要值}"; shift 2;;
+  --install-dir) install_root="${2:?--install-dir 需要值}"; shift 2;;
+  --config-dir) config_root="${2:?--config-dir 需要值}"; shift 2;;
+  --archive-path|--local-archive) archive_path="${2:?--archive-path 需要值}"; shift 2;;
+  --mirror) mirror="${2:?--mirror 需要值}"; shift 2;;
+  --yes) yes=1; shift;;
+  --no-start) start=0; shift;;
+  --no-autostart) autostart=0; shift;;
+  --non-interactive) non_interactive=1; shift;;
+  --list-versions) printf '0.72.0\n'; exit 0;;
+  --help|-h) usage; exit 0;;
+  *) echo "未知参数：$1" >&2; usage >&2; exit 2;;
+esac; done
+[[ "$version" == '0.72.0' ]] || { echo "版本 $version 尚未完成配置与 SHA256 验证，拒绝安装/升级。已核验：0.72.0" >&2; exit 1; }
+if [[ "$install_root" != /opt/frp-simple-bash || "$config_root" != /etc/frp ]]; then
+  echo '自定义安装/配置目录当前尚未接入 systemd、命令入口和 manager 环境，请使用默认目录 /opt/frp-simple-bash 与 /etc/frp。' >&2
+  exit 2
+fi
 [[ "$(uname -s)" == Linux ]] || { echo '此安装器仅支持 Linux；Windows 请使用 PowerShell 安装器。' >&2; exit 1; }
 [[ "${EUID}" == 0 ]] || { echo '请使用 root/sudo 安装。' >&2; exit 1; }
 source_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$source_root/lib/download.sh"
-install_root="/opt/frp-simple-bash"
-config_root="/etc/frp"
+[[ -n "$mirror" ]] && export FRP_MIRROR_URL="$mirror"
+[[ "$install_root" = /* && "$config_root" = /* ]] || { echo '安装目录和配置目录必须是绝对路径。' >&2; exit 2; }
+if [[ "$install_root" != /opt/frp-simple-bash && "$install_root" == /opt ]]; then echo '拒绝使用系统根目录作为安装目录。' >&2; exit 2; fi
+if [[ "$config_root" != /etc/frp && "$config_root" == /etc ]]; then echo '拒绝使用系统根目录作为配置目录。' >&2; exit 2; fi
+[[ "$install_root" != / && "$config_root" != / ]] || { echo '拒绝使用 / 作为目录。' >&2; exit 2; }
 for role in frps frpc; do
   if [[ -e "/usr/local/bin/$role" && ! -L "/usr/local/bin/$role" ]]; then
     echo "已有 /usr/local/bin/$role，请先手动迁移，未修改现有安装。" >&2; exit 1
@@ -27,8 +66,7 @@ missing=()
 for tool in curl tar sha256sum python3; do command -v "$tool" >/dev/null || missing+=("$tool"); done
 if ((${#missing[@]})); then
   printf '缺少依赖：%s。将通过系统包管理器安装 curl tar coreutils python3。\n' "${missing[*]}"
-  read -r -p '确认安装依赖？[y/N] ' answer
-  [[ "$answer" =~ ^[Yy]$ ]] || exit 1
+  if ((yes == 0)); then read -r -p '确认安装依赖？[y/N] ' answer; [[ "$answer" =~ ^[Yy]$ ]] || exit 1; fi
   if command -v apt-get >/dev/null; then apt-get update; apt-get install -y curl tar coreutils python3
   elif command -v dnf >/dev/null; then dnf install -y curl tar coreutils python3
   elif command -v yum >/dev/null; then yum install -y curl tar coreutils python3
@@ -39,8 +77,7 @@ python3 -c 'import sys; assert sys.version_info >= (3,9), "需要 Python 3.9+，
 if ! python3 -c 'try: import tomllib
 except ImportError: import tomli' 2>/dev/null; then
   echo 'Python 低于 3.11，需要发行版 TOML 解析包 python3-tomli。'
-  read -r -p '确认通过包管理器安装 TOML 依赖？[y/N] ' answer
-  [[ "$answer" =~ ^[Yy]$ ]] || exit 1
+  if ((yes == 0)); then read -r -p '确认通过包管理器安装 TOML 依赖？[y/N] ' answer; [[ "$answer" =~ ^[Yy]$ ]] || exit 1; fi
   if command -v apt-get >/dev/null; then apt-get install -y python3-tomli
   elif command -v dnf >/dev/null; then dnf install -y python3-tomli
   elif command -v yum >/dev/null; then yum install -y python3-tomli
@@ -56,9 +93,9 @@ else echo '未检测到 systemd/OpenRC；不能完成后台与自启动安装。
 work="$(mktemp -d)"
 trap '[[ -n "${work:-}" && -d "$work" ]] && rm -rf -- "$work"' EXIT
 asset="frp_${version}_linux_${arch}.tar.gz"
-if [[ -n "${FRP_ARCHIVE_PATH:-}" ]]; then
-  [[ -f "$FRP_ARCHIVE_PATH" ]] || { echo '本地 frp 安装包不存在。' >&2; exit 1; }
-  cp -- "$FRP_ARCHIVE_PATH" "$work/$asset"
+if [[ -n "$archive_path" ]]; then
+  [[ -f "$archive_path" ]] || { echo '本地 frp 安装包不存在。' >&2; exit 1; }
+  cp -- "$archive_path" "$work/$asset"
 else
   case "$arch" in amd64) asset_id=710291514 ;; arm64) asset_id=710291691 ;; esac
   frp_download_asset "$work/$asset" "$expected" "frp/v${version}/$asset" "https://github.com/fatedier/frp/releases/download/v${version}/${asset}" "https://api.github.com/repos/fatedier/frp/releases/assets/$asset_id"
@@ -108,12 +145,14 @@ for role in frps frpc; do
 done
 if [[ "$manager" == systemd ]]; then
   install -m 644 "$source_root/templates/$component.service" "/etc/systemd/system/$component.service"
-  systemctl daemon-reload; systemctl enable "$component"
+  systemctl daemon-reload
+  ((autostart == 1)) && systemctl enable "$component" || systemctl disable "$component" || true
 else
   install -m 755 "$source_root/templates/$component.openrc" "/etc/init.d/$component"
-  rc-update add "$component" default
+  if ((autostart == 1)); then rc-update add "$component" default; else rc-update del "$component" default || true; fi
 fi
 if [[ ! -f "$config_root/$component.toml" ]]; then
+  if ((non_interactive == 1)); then echo "配置不存在，--non-interactive 不进入配置向导：$config_root/$component.toml" >&2; exit 2; fi
   FRP_CONFIG_DIR="$config_root" FRP_BINARY_DIR="$install_root/native" python3 "$install_root/lib/manager.py" "$component" configure
 fi
 if [[ -f "$config_root/$component.toml" ]]; then

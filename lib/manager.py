@@ -323,6 +323,9 @@ def connection(pid):
             for item in data.get('items', []):
                 if item.get('clientID') == pid and item.get('online'): return {'state': 'connected'}
         return {'state': 'unknown', 'detail': '无启用映射且无可访问服务端 API，无法确认登录状态'}
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403): return {'state': 'auth-failed', 'detail': f'管理 API 认证失败（HTTP {exc.code}）'}
+        return {'state': 'connecting', 'detail': f'管理 API 返回 HTTP {exc.code}'}
     except (OSError, ValueError): return {'state': 'connecting'}
 
 def wait_connection(pid):
@@ -511,17 +514,30 @@ def server_clients():
     p = read_toml(ROOT / 'frps.toml'); web = p.get('webServer', {})
     if not web.get('port'): raise ValueError('Dashboard/API 未启用，请先配置')
     host = web.get('addr', '127.0.0.1')
-    if host == '0.0.0.0': host = '127.0.0.1'
-    if host == '::': host = '::1'
+    if host in ('0.0.0.0', '::'): host = '127.0.0.1' if host == '0.0.0.0' else '::1'
     if ':' in host: host = '[' + host + ']'
-    for endpoint in ('clients', 'proxies'):
-        page = 1
-        scheme = 'https' if web.get('tls', {}).get('certFile') else 'http'
+    scheme = 'https' if web.get('tls', {}).get('certFile') else 'http'
+    def paged(endpoint):
+        page, rows = 1, []
         while True:
             data = api(f'{scheme}://{host}:{web["port"]}/api/v2/{endpoint}?page={page}&pageSize=200', web.get('user', ''), web.get('password', ''))
-            print(endpoint + ': ' + json.dumps(data, ensure_ascii=False))
-            if page * 200 >= data.get('total', 0): break
+            rows.extend(data.get('items', []))
+            if page * 200 >= data.get('total', 0): return rows
             page += 1
+    clients, proxies = paged('clients'), paged('proxies')
+    print('\n在线客户端（Dashboard/API）')
+    if not clients: print('暂无客户端连接。')
+    for n, item in enumerate(clients, 1):
+        state = '在线' if item.get('online') else '离线'
+        print(f'{n}. {item.get("hostname") or item.get("clientID") or item.get("key", "未知")} [{state}]')
+        print(f'   clientID={item.get("clientID", "")} 版本={item.get("version", "")} IP={item.get("clientIP", "")}')
+        print(f'   代理数量={item.get("status", {}).get("proxyCount", "未知")}')
+    print('\n代理状态')
+    if not proxies: print('暂无代理统计。')
+    for n, item in enumerate(proxies, 1):
+        status = item.get('status', {})
+        print(f'{n}. {item.get("name", "未知")} [{status.get("phase", "未知")}] 类型={item.get("spec", {}).get("type", "未知")}')
+        print(f'   今日流量：入站 {status.get("todayTrafficIn", 0)} / 出站 {status.get("todayTrafficOut", 0)}，连接数 {status.get("curConns", 0)}')
 
 def import_external(role):
     path = ROOT / (role + '.toml'); s = state()
@@ -689,6 +705,45 @@ def autostart(role):
     n = choose(['启用开机自启动', '取消开机自启动'])
     if n: service(role, 'enable' if n == 1 else 'disable')
 
+def delete_profile_id(pid):
+    p = load_profile(pid)
+    if pid == active() and running('frpc'):
+        if not confirm('删除当前服务端将停止 frpc，确认继续？'): return
+        service('frpc', 'stop')
+    if not confirm('删除 ' + label(p) + ' 及其全部端口映射？'): return
+    with lock(), transaction():
+        folder = pdir(pid)
+        if folder.parent != ROOT / 'profiles': raise ValueError('删除路径错误')
+        shutil.rmtree(folder)
+        if pid == active():
+            set_current(''); (ROOT / 'frpc.toml').unlink(missing_ok=True)
+        rebuild_index(); audit('profile-deleted')
+    print('服务端 profile 及其映射已删除。')
+
+def mapping_command(argv):
+    pid = require_active(); items = mappings(pid); action = argv[0] if argv else 'menu'
+    if action == 'list':
+        print(json.dumps(items, ensure_ascii=False, indent=2)); return
+    if action == 'add': items.append(mapping_wizard()); save_mappings(pid, items); return
+    if action in ('edit', 'enable', 'disable', 'delete'):
+        if len(argv) < 2: raise ValueError('需要映射名称：mapping ' + action + ' <name>')
+        name_arg = argv[1]; index = next((i for i, item in enumerate(items) if item['name'] == name_arg), None)
+        if index is None: raise ValueError('映射不存在：' + name_arg)
+        if action == 'edit': items[index] = mapping_wizard(items[index])
+        elif action == 'enable': items[index]['enabled'] = True
+        elif action == 'disable': items[index]['enabled'] = False
+        elif not confirm('确认删除映射 ' + name_arg + '？'): return
+        else: items.pop(index)
+        save_mappings(pid, items); return
+    if action == 'menu': mapping_menu(); return
+    raise ValueError('支持 mapping list/add/edit/enable/disable/delete')
+
+def install(role):
+    script = Path(__file__).resolve().parent.parent / ('install-' + role + ('.ps1' if os.name == 'nt' else '.sh'))
+    if not script.exists(): raise ValueError('安装脚本未安装')
+    args = ['powershell', '-File', str(script), '-Version', 'v' + VERSION] if os.name == 'nt' else ['bash', str(script), '--version', 'v' + VERSION]
+    subprocess.run(args, check=True)
+
 def uninstall(role):
     script = Path(__file__).resolve().parent.parent / ('uninstall-windows.ps1' if os.name == 'nt' else 'uninstall.sh')
     if not script.exists(): raise ValueError('卸载脚本未安装')
@@ -714,6 +769,7 @@ def run(argv=None):
         if role == 'frpc': require_active()
         service(role, cmd); return
     if cmd == 'logs': show_logs(role); return
+    if cmd == 'install': install(role); return
     if cmd == 'uninstall': uninstall(role); return
     if cmd in ('upgrade','update'): upgrade(role); return
     if cmd == 'configure': (configure_server if role == 'frps' else profile_wizard)(); return
@@ -728,12 +784,12 @@ def run(argv=None):
         if sub == 'list': print(json.dumps(profiles(), ensure_ascii=False, indent=2))
         elif sub == 'add': profile_wizard()
         elif sub == 'use' and argv: switch(argv[0])
-        elif sub == 'edit': edit_profile()
-        else: raise ValueError('支持 profile list/add/use <ID>/edit')
+        elif sub in ('edit', 'rename'): edit_profile()
+        elif sub == 'delete' and argv: delete_profile_id(argv[0])
+        else: raise ValueError('支持 profile list/add/use <ID>/edit/rename/delete <ID>')
         return
     if cmd == 'mapping' and role == 'frpc':
-        if argv and argv[0] == 'list': print(json.dumps(mappings(require_active()), ensure_ascii=False, indent=2))
-        else: mapping_menu()
+        mapping_command(argv)
         return
     raise ValueError('未知命令；无参数打开数字菜单')
 

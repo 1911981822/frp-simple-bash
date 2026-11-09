@@ -6,6 +6,7 @@ component="${1:?需要 frps 或 frpc}"
 [[ "$(uname -s)" == Linux ]] || { echo '此安装器仅支持 Linux；Windows 请使用 PowerShell 安装器。' >&2; exit 1; }
 [[ "${EUID}" == 0 ]] || { echo '请使用 root/sudo 安装。' >&2; exit 1; }
 source_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$source_root/lib/download.sh"
 install_root="/opt/frp-simple-bash"
 config_root="/etc/frp"
 for role in frps frpc; do
@@ -59,13 +60,10 @@ if [[ -n "${FRP_ARCHIVE_PATH:-}" ]]; then
   [[ -f "$FRP_ARCHIVE_PATH" ]] || { echo '本地 frp 安装包不存在。' >&2; exit 1; }
   cp -- "$FRP_ARCHIVE_PATH" "$work/$asset"
 else
-  if ! curl --fail --location --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 1200 --retry 2 "https://github.com/fatedier/frp/releases/download/v${version}/${asset}" -o "$work/$asset"; then
-    case "$arch" in amd64) asset_id=710291514 ;; arm64) asset_id=710291691 ;; esac
-    echo '直接下载失败，改用 GitHub 官方资产 API。'
-    curl --fail --location --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 1200 --retry 2 -H 'Accept: application/octet-stream' "https://api.github.com/repos/fatedier/frp/releases/assets/$asset_id" -o "$work/$asset"
-  fi
+  case "$arch" in amd64) asset_id=710291514 ;; arm64) asset_id=710291691 ;; esac
+  frp_download_asset "$work/$asset" "$expected" "frp/v${version}/$asset" "https://github.com/fatedier/frp/releases/download/v${version}/${asset}" "https://api.github.com/repos/fatedier/frp/releases/assets/$asset_id"
 fi
-if ! printf '%s  %s\n' "$expected" "$work/$asset" | sha256sum --check --status; then
+if ! printf '%s  %s\n' "$expected" "$work/$asset" | sha256sum -c - >/dev/null; then
   echo 'frp 安装包 SHA256 校验失败，未执行二进制、未修改现有服务。' >&2
   exit 1
 fi
@@ -98,6 +96,7 @@ mv -f "$install_root/native/$component.new" "$install_root/native/$component"
 if [[ "$source_root" != "$install_root" ]]; then
   for file in frps frpc; do install -m 755 "$source_root/bin/$file" "$install_root/bin/$file"; done
   install -m 644 "$source_root/lib/manager.py" "$install_root/lib/manager.py"
+  install -m 644 "$source_root/lib/download.sh" "$install_root/lib/download.sh"
   for file in install-common.sh install-frps.sh install-frpc.sh uninstall.sh; do install -m 755 "$source_root/$file" "$install_root/$file"; done
   cp "$source_root/templates/"* "$install_root/templates/"
 fi

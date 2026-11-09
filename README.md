@@ -11,13 +11,13 @@ frp v0.72.0 的终端数字菜单管理封装。Linux 使用 Bash 安装入口�
 ### Linux 服务端 frps
 
 ```bash
-script="$(curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-frps.sh)" && sudo bash -c "$script"
+script="$(curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 https://download.sueiyuan.top/frp-simple-bash/install-frps.sh)" && sudo bash -c "$script"
 ```
 
 ### Linux 客户端 frpc
 
 ```bash
-script="$(curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-frpc.sh)" && sudo bash -c "$script"
+script="$(curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 https://download.sueiyuan.top/frp-simple-bash/install-frpc.sh)" && sudo bash -c "$script"
 ```
 
 ### Windows 服务端 frps
@@ -25,7 +25,7 @@ script="$(curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 https://raw.gi
 以**管理员身份打开 PowerShell**，执行：
 
 ```powershell
-irm https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-frps.ps1 | iex
+irm https://download.sueiyuan.top/frp-simple-bash/install-frps.ps1 | iex
 ```
 
 ### Windows 客户端 frpc
@@ -33,7 +33,7 @@ irm https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-fr
 以**管理员身份打开 PowerShell**，执行：
 
 ```powershell
-irm https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-frpc.ps1 | iex
+irm https://download.sueiyuan.top/frp-simple-bash/install-frpc.ps1 | iex
 ```
 
 Windows 需要预先安装 Python 3.11+ 并加入 PATH。以上命令会下载并执行本仓库的安装脚本；如需先查看脚本，可使用后文的下载后安装方式。安装包下载受限时，参见 Linux 安装章节的本地包入口。
@@ -95,11 +95,11 @@ sudo bash install-frpc.sh
 下载脚本后安装（可先查看脚本内容）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-frps.sh -o install-frps.sh
+curl -fsSL https://download.sueiyuan.top/frp-simple-bash/install-frps.sh -o install-frps.sh
 sudo bash install-frps.sh
 ```
 
-客户端把脚本名改为 `install-frpc.sh`。单文件入口会下载仓库其余代码。上游原生二进制使用固定 SHA256 校验；管理脚本来自仓库 main，安装前应检查可信来源。
+客户端把脚本名改为 `install-frpc.sh`。单文件入口优先下载国内站点的固定管理器版本 `v0.1.0-mirror.1`，核对源码包 SHA256 后解压；国内源下载失败时回退 GitHub。原生 frp 与 WinSW 无论从何处下载，都必须符合内置的固定 SHA256。
 
 服务器下载受限时，可以先从官方渠道下载并上传对应的 0.72.0 安装包，再使用：
 
@@ -119,9 +119,27 @@ powershell -File .\install-frps.ps1
 powershell -File .\install-frpc.ps1
 ```
 
-安装器使用 WinSW v2.12.0 注册 Windows Service，原生 frp.exe 不直接当成 SCM 服务程序。WinSW 校验官方 metadata digest；旧资产缺少 digest 时，校验本次从官方固定 asset ID 93386820 下载登记的 SHA256：`05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da`。该值是官方下载资产的固定记录，不代表官方另行发布的签名。不会跳过校验运行下载程序。配置 ACL 只允许 SYSTEM 和 Administrators。
+安装器使用 WinSW v2.12.0 注册 Windows Service，原生 frp.exe 不直接当成 SCM 服务程序。WinSW 优先从国内站点下载，失败后回退官方地址，使用固定 SHA256：`05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da`。该值是从官方固定 asset ID 93386820 下载登记的校验记录，不代表官方另行发布的签名。国内源成功时无需查询 GitHub metadata，不会跳过校验运行下载程序。配置 ACL 只允许 SYSTEM 和 Administrators。
 
 在新终端输入 `frps`/`frpc`，CMD 包装器转发到 PowerShell，再调用共享核心。配置与中文输出使用 UTF-8 无 BOM。当前开发机没有 PowerShell/Windows，SCM、ACL 和终端编码尚待实机验证。
+
+## 下载源与版本
+
+默认国内源：`https://download.sueiyuan.top`，优先提供管理器源码、Linux/Windows frp 0.72.0 和 WinSW 2.12.0；下载失败后回退官方源。校验失败会立即停止，不会改用未经验证的包。
+
+- `FRP_MIRROR_URL`：自定义 HTTPS 镜像根地址；显式设置为空或 `off` 禁用镜像。
+- `FRP_ARCHIVE_PATH`：Linux 本地 frp 包，始终校验固定 SHA256。
+- 源码发布包路径：`/frp-simple-bash/releases/v0.1.0-mirror.1/source.tar.gz`。
+- 原生包路径：`/frp/v0.72.0/<官方文件名>`。
+- WinSW 路径：`/winsw/v2.12.0/WinSW-x64.exe`。
+
+完整部署、同步和 Cloudflare DNS 注意事项见[国内下载站部署与维护](<docs/国内下载站部署与维护.md>)。网站经过 Cloudflare 代理时，源站在国内不代表用户直连国内；要直连请在 Cloudflare 将下载域名设为“仅 DNS”（灰云），并确认源站 IP 和证书正常。
+
+禁用镜像示例（已经下载本地安装脚本时）：
+
+```bash
+sudo env FRP_MIRROR_URL=off bash install-frps.sh
+```
 
 ## 下载故障：证书域名不匹配
 
@@ -139,7 +157,7 @@ curl -I --connect-timeout 10 --max-time 20 https://raw.githubusercontent.com
 root 用户可在修复解析后执行：
 
 ```bash
-script="$(curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/1911981822/frp-simple-bash/main/install-frps.sh)" && bash -c "$script"
+script="$(curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 https://download.sueiyuan.top/frp-simple-bash/install-frps.sh)" && bash -c "$script"
 ```
 
 客户端将 `install-frps.sh` 改为 `install-frpc.sh`。其中 `&&` 保证下载失败时不启动安装；证书错误也不能通过已经下载不到的安装脚本自修复。
@@ -239,6 +257,8 @@ FRP_TEST_MODE=1 FRP_CONFIG_DIR=/tmp/frp-simple-demo bash bin/frpc
 
 ## 设计依据与验证记录
 
+- [国内下载站部署与维护](<docs/国内下载站部署与维护.md>)
+- [下载镜像部署验证记录](<docs/下载镜像部署验证记录.md>)
 - [项目结构与各文件功能说明](<docs/项目结构与功能说明.md>)
 - [需求文档](<docs/frp二次封装需求文档.md>)
 - [概要设计](<docs/frp二次封装概要设计文档.md>)

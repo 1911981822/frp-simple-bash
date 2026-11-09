@@ -7,3 +7,4 @@ __pycache__/
 .gopath/
 *.log
 .DS_Store
+dist/

@@ -17,7 +17,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          for path in bin/frps bin/frpc install-common.sh install-frps.sh install-frpc.sh uninstall.sh; do
+          for path in bin/frps bin/frpc lib/download.sh install-common.sh install-frps.sh install-frpc.sh uninstall.sh; do
             bash -n "$path" || exit 1
           done
       - name: Parse PowerShell without execution

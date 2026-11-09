@@ -22,6 +22,62 @@ $native = Join-Path $root 'native'
 $bin = Join-Path $root 'bin'
 $services = Join-Path $root 'services'
 $repo = 'https://raw.githubusercontent.com/1911981822/frp-simple-bash/main'
+$ManagerVersion = 'v0.1.0-mirror.1'
+$mirror = if (Test-Path Env:FRP_MIRROR_URL) { [string]$env:FRP_MIRROR_URL } else { 'https://download.sueiyuan.top' }
+if ($mirror -eq 'off') { $mirror = '' }
+if ($mirror -and $mirror -notmatch '^https://') { throw 'Mirror URL must use HTTPS, or be empty/off.' }
+$mirror = $mirror.TrimEnd('/')
+# Follow redirects explicitly so HTTPS can never downgrade to HTTP.
+function Get-HttpsFile([string]$Url, [string]$Destination) {
+    $uri = [Uri]$Url
+    for ($hop = 0; $hop -lt 10; $hop++) {
+        if ($uri.Scheme -ne 'https') { throw 'Refusing non-HTTPS source or redirect.' }
+        $request = [Net.HttpWebRequest]::Create($uri)
+        $request.AllowAutoRedirect = $false
+        $request.Timeout = 120000
+        $request.ReadWriteTimeout = 120000
+        $request.UserAgent = 'frp-simple-bash/v0.1.0-mirror.1'
+        $response = $request.GetResponse()
+        try {
+            $status = [int]$response.StatusCode
+            if ($status -in @(301,302,303,307,308)) {
+                $uri = [Uri]::new($uri, [string]$response.Headers['Location'])
+                continue
+            }
+            if ($status -ne 200) { throw ('Unexpected HTTP response: ' + $status) }
+            $output = [IO.File]::Create($Destination)
+            try { $response.GetResponseStream().CopyTo($output) } finally { $output.Dispose() }
+            return
+        } finally { $response.Close() }
+    }
+    throw 'Too many HTTPS redirects.'
+}
+function Save-Download([string[]]$Urls, [string]$Destination, [string]$ExpectedSha256 = '') {
+    $partial = $Destination + '.partial'
+    $ok = $false
+    foreach ($url in $Urls) {
+        if ($url -notmatch '^https://') { throw 'Refusing non-HTTPS source.' }
+        try {
+            Get-HttpsFile $url $partial
+            $ok = $true
+        } catch { Write-Warning ('Download failed: ' + $url); continue }
+        # Verification is outside catch: a mirror checksum mismatch NEVER falls back.
+        if ($ExpectedSha256 -and (Get-FileHash -Algorithm SHA256 $partial).Hash.ToLowerInvariant() -ne $ExpectedSha256) {
+            throw 'SHA256 mismatch; no source fallback after integrity failure.'
+        }
+        Move-Item -LiteralPath $partial -Destination $Destination -Force
+        return
+    }
+    throw 'All download sources failed; no partial file will be executed.'
+}
+function Download-Urls([string]$Relative, [string]$Official) {
+    if ($mirror) {
+        $mirrorSource = $mirror + '/' + $Relative
+        if ($Relative.StartsWith('frp/') -or $Relative.StartsWith('winsw/')) { $mirrorSource += '?mirror=' + $ManagerVersion }
+        Write-Output $mirrorSource
+    }
+    Write-Output $Official
+}
 $python = $null
 foreach ($candidate in @('python','python3','py')) {
     $found = Get-Command $candidate -ErrorAction SilentlyContinue
@@ -51,15 +107,17 @@ function Save-RepositoryFile([string]$relative) {
     if ((Test-Path $local) -and ([IO.Path]::GetFullPath($local) -ne [IO.Path]::GetFullPath($dest))) {
         Copy-Item -LiteralPath $local -Destination $dest -Force
     } elseif (-not (Test-Path $local)) {
-        Invoke-WebRequest -UseBasicParsing -Uri "$repo/$($relative.Replace('\','/'))" -OutFile $dest
+        $urls = @(Download-Urls "frp-simple-bash/releases/$ManagerVersion/$($relative.Replace('\','/'))" "$repo/$($relative.Replace('\','/'))")
+        Save-Download $urls $dest
     }
 }
 foreach ($relative in @('install-frps.ps1','install-frpc.ps1','install-windows.ps1','lib/manager.py','bin/frps.ps1','bin/frpc.ps1','bin/frps.cmd','bin/frpc.cmd','uninstall-frps.ps1','uninstall-frpc.ps1','uninstall-windows.ps1')) { Save-RepositoryFile $relative }
 $temp = Join-Path $env:TEMP ('frp-simple-bash-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $temp | Out-Null
+try {
 $zip = Join-Path $temp 'frp.zip'
-Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/fatedier/frp/releases/download/v0.72.0/frp_0.72.0_windows_amd64.zip' -OutFile $zip
-if ((Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant() -ne '5197c1b69564089cdc229fc1260a0e25db1e722b1b7db45fe1542c3c43edf9ae') { throw 'frp SHA256 mismatch.' }
+$frpUrls = @(Download-Urls 'frp/v0.72.0/frp_0.72.0_windows_amd64.zip' 'https://github.com/fatedier/frp/releases/download/v0.72.0/frp_0.72.0_windows_amd64.zip')
+Save-Download $frpUrls $zip '5197c1b69564089cdc229fc1260a0e25db1e722b1b7db45fe1542c3c43edf9ae'
 Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $temp 'frp')
 $frpExe = Join-Path $temp "frp/frp_0.72.0_windows_amd64/$Component.exe"
 if (-not (Test-Path $frpExe)) { throw 'Missing native binary in archive.' }
@@ -67,19 +125,12 @@ if (-not (Test-Path $frpExe)) { throw 'Missing native binary in archive.' }
 # SHA256 is pinned from that download; it is not an upstream signed checksum.
 $wrapperVersion = 'v2.12.0'
 $wrapperPin = '05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da'
-$release = Invoke-RestMethod -Uri "https://api.github.com/repos/winsw/winsw/releases/tags/$wrapperVersion" -Headers @{Accept='application/vnd.github+json'}
-$asset = @($release.assets | Where-Object { $_.name -eq 'WinSW-x64.exe' })
-if ($asset.Count -ne 1 -or $asset[0].id -ne 93386820) { throw 'Pinned WinSW asset is missing, changed or ambiguous.' }
-$expected = $WinSWSha256.ToLowerInvariant()
-if (-not $expected) {
-    $digestProperty = $asset[0].PSObject.Properties['digest']
-    if ($digestProperty -and ([string]$digestProperty.Value -match '^sha256:([a-fA-F0-9]{64})$')) { $expected = $Matches[1].ToLowerInvariant() }
-}
-if (-not $expected) { $expected = $wrapperPin }
-if ($expected -notmatch '^[a-f0-9]{64}$') { throw 'No valid WinSW SHA256 is available. Installation stopped without registering a service.' }
+if ($WinSWSha256 -and $WinSWSha256.ToLowerInvariant() -ne $wrapperPin) { throw 'WinSW checksum override does not match the pinned release.' }
+$expected = $wrapperPin
+if ($expected -notmatch '^[a-f0-9]{64}$') { throw 'Invalid WinSW SHA256.' }
 $wrapper = Join-Path $temp 'winsw.exe'
-Invoke-WebRequest -UseBasicParsing -Uri $asset[0].browser_download_url -OutFile $wrapper
-if ((Get-FileHash -Algorithm SHA256 $wrapper).Hash.ToLowerInvariant() -ne $expected) { throw 'WinSW SHA256 mismatch.' }
+$wrapperUrls = @(Download-Urls "winsw/$wrapperVersion/WinSW-x64.exe" "https://github.com/winsw/winsw/releases/download/$wrapperVersion/WinSW-x64.exe")
+Save-Download $wrapperUrls $wrapper $expected
 $serviceId = "frp-simple-bash-$Component"
 $serviceExe = Join-Path $services "$serviceId.exe"
 $existingService = Get-Service -Name $serviceId -ErrorAction SilentlyContinue
@@ -158,4 +209,10 @@ if (Test-Path $config) {
     throw $installError
 }
 Write-Host "Installed $Component. Open a new terminal and run $Component. Configuration: $data"
-Write-Host "Temporary download directory: $temp"
+} finally {
+    $resolved = [IO.Path]::GetFullPath($temp)
+    $prefix = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') + [IO.Path]::DirectorySeparatorChar
+    if ($resolved.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase) -and [IO.Path]::GetFileName($resolved).StartsWith('frp-simple-bash-')) {
+        if (Test-Path -LiteralPath $resolved) { Remove-Item -LiteralPath $resolved -Recurse -Force }
+    }
+}

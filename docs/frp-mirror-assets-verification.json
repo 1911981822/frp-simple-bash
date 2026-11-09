@@ -1,0 +1,67 @@
+{
+  "ok": true,
+  "verified_at": "2026-11-09T09:25:11.889135+00:00",
+  "worker_pid": 782546,
+  "worker_status": "completed",
+  "files": [
+    {
+      "remote_path": "/www/wwwroot/download.sueiyuan.top/frp/v0.72.0/frp_0.72.0_linux_amd64.tar.gz",
+      "size": 14564595,
+      "sha256": "daf719b32ca2778770bb92955e231a07414d754378b9af328aa2642862479804",
+      "source_url": "https://api.github.com/repos/fatedier/frp/releases/assets/710291514",
+      "mirror_url": "https://download.sueiyuan.top/frp/v0.72.0/frp_0.72.0_linux_amd64.tar.gz",
+      "origin_https_verified": true,
+      "http_body_sha256_verified": true
+    },
+    {
+      "remote_path": "/www/wwwroot/download.sueiyuan.top/frp/v0.72.0/frp_0.72.0_linux_arm64.tar.gz",
+      "size": 12925619,
+      "sha256": "02180b857480302fd934e9ddbd50fe2f73229f99062f88756abc6de9df5e95cf",
+      "source_url": "https://api.github.com/repos/fatedier/frp/releases/assets/710291691",
+      "mirror_url": "https://download.sueiyuan.top/frp/v0.72.0/frp_0.72.0_linux_arm64.tar.gz",
+      "origin_https_verified": true,
+      "http_body_sha256_verified": true
+    },
+    {
+      "remote_path": "/www/wwwroot/download.sueiyuan.top/frp/v0.72.0/frp_0.72.0_windows_amd64.zip",
+      "size": 14472216,
+      "sha256": "5197c1b69564089cdc229fc1260a0e25db1e722b1b7db45fe1542c3c43edf9ae",
+      "source_url": "https://api.github.com/repos/fatedier/frp/releases/assets/710291777",
+      "mirror_url": "https://download.sueiyuan.top/frp/v0.72.0/frp_0.72.0_windows_amd64.zip",
+      "origin_https_verified": true,
+      "http_body_sha256_verified": true
+    },
+    {
+      "remote_path": "/www/wwwroot/download.sueiyuan.top/winsw/v2.12.0/WinSW-x64.exe",
+      "size": 18243033,
+      "sha256": "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da",
+      "source_url": "https://api.github.com/repos/winsw/winsw/releases/assets/93386820",
+      "mirror_url": "https://download.sueiyuan.top/winsw/v2.12.0/WinSW-x64.exe",
+      "origin_https_verified": true,
+      "http_body_sha256_verified": true
+    },
+    {
+      "remote_path": "/www/wwwroot/download.sueiyuan.top/frp/v0.72.0/frp_sha256_checksums.txt",
+      "size": 528,
+      "sha256": "5d175683ccf6fd8dfe7ed7e3f5aadf0c0a961b9ccf7d51fad599501b8c003f4b",
+      "source_url": "local mirrored-three-platform manifest",
+      "mirror_url": "https://download.sueiyuan.top/frp/v0.72.0/frp_sha256_checksums.txt",
+      "origin_https_verified": true,
+      "http_body_sha256_verified": true
+    },
+    {
+      "remote_path": "/www/wwwroot/download.sueiyuan.top/winsw/v2.12.0/SHA256SUMS.txt",
+      "size": 289,
+      "sha256": "ace0b9e474f8c293139d136fb58a9298454dbb6d73046ac5a07d28fc4192a3e9",
+      "source_url": "local manifest from fixed official asset pin",
+      "mirror_url": "https://download.sueiyuan.top/winsw/v2.12.0/SHA256SUMS.txt",
+      "origin_https_verified": true,
+      "http_body_sha256_verified": true
+    }
+  ],
+  "notes": [
+    "Origin HTTPS verified with --resolve to 127.0.0.1; no certificate verification bypass.",
+    "frp manifest is a mirrored three-platform subset, not full upstream list.",
+    "WinSW hash is pinned from official HTTPS download, not upstream signed metadata."
+  ]
+}

@@ -1,0 +1,82 @@
+{
+  "run_id": "20261109-172440-2b6fafbb",
+  "environment": {
+    "platform": "Linux-6.1.0-54-amd64-x86_64-with-glibc2.36",
+    "python": "3.11.2"
+  },
+  "notes": [
+    "No OS reboot is performed. is-enabled proves registration only, not startup after a real reboot.",
+    "No firewall, nginx, Java or unrelated systemd service is modified.",
+    "Only localhost listeners and preflight-absent frp installation paths are used.",
+    "Mirror regression: actual bash -c bootstrap, no FRP_ARCHIVE_PATH. CURL_HOME pins only this mirror to origin loopback with full hostname certificate verification; public script/source requests are verified separately."
+  ],
+  "results": [
+    {
+      "name": "preflight-and-ownership",
+      "ok": true,
+      "seconds": 0.058
+    },
+    {
+      "name": "prepare-loopback-config",
+      "ok": true,
+      "seconds": 0.039
+    },
+    {
+      "name": "install-frps-active-enabled",
+      "ok": true,
+      "seconds": 1.246
+    },
+    {
+      "name": "prepare-profile-a",
+      "ok": true,
+      "seconds": 0.022
+    },
+    {
+      "name": "install-frpc-active-enabled",
+      "ok": true,
+      "seconds": 1.203
+    },
+    {
+      "name": "dashboard-admin-api-tcp-roundtrip",
+      "ok": true,
+      "seconds": 0.012
+    },
+    {
+      "name": "systemd-stop-start-restart-enable-disable",
+      "ok": true,
+      "seconds": 1.262
+    },
+    {
+      "name": "second-loopback-server-profile-b",
+      "ok": true,
+      "seconds": 0.218
+    },
+    {
+      "name": "number-selection-switch-and-isolation",
+      "ok": true,
+      "seconds": 2.393
+    },
+    {
+      "name": "mapping-disable-enable-restart",
+      "ok": true,
+      "seconds": 2.19
+    },
+    {
+      "name": "external-import-profile-delete-menu-smoke",
+      "ok": true,
+      "seconds": 0.993
+    },
+    {
+      "name": "uninstall-preserves-configuration",
+      "ok": true,
+      "seconds": 0.756
+    }
+  ],
+  "cleanup": [
+    {
+      "name": "owned-frp-resources",
+      "ok": true
+    }
+  ],
+  "ok": true
+}

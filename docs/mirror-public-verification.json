@@ -1,0 +1,23 @@
+[
+  {
+    "path": "/frp-simple-bash/install-frps.sh",
+    "ok": true,
+    "bytes": 2399,
+    "sha256": "af5ec80ec665a7ac7a9a0cbb76ae72a73169e2b37cc4c2382bac931364a7ea42",
+    "http_speed": "200 1411"
+  },
+  {
+    "path": "/frp-simple-bash/install-frpc.sh",
+    "ok": true,
+    "bytes": 2399,
+    "sha256": "5115e0565be1ed8202ace67d10dd179d419df69f6acd28f8dc15a3fcc23356f7",
+    "http_speed": "200 979"
+  },
+  {
+    "path": "/frp-simple-bash/releases/v0.1.0-mirror.1/source.tar.gz",
+    "ok": true,
+    "bytes": 105272,
+    "sha256": "e5dfc126b2c29e078ef9b1a9d69830256c46a77a5255c4994d7e8bceba3028bf",
+    "http_speed": "200 22022"
+  }
+]

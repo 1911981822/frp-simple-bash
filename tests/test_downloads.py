@@ -41,15 +41,15 @@ shutil.copyfile(fixtures[url],dest)
         return subprocess.run(['bash','-c', 'source "$1/lib/download.sh"; frp_download_asset "$2" "$3" frp/v0.72.0/test.tar.gz https://official.invalid/test.tar.gz', '_',str(ROOT),str(self.root/'asset'),checksum], env=self.env(),capture_output=True,text=True)
     def test_mirror_preferred(self):
         content=b'good'; checksum=hashlib.sha256(content).hexdigest()
-        self.fixtures['https://mirror.invalid/frp/v0.72.0/test.tar.gz?mirror=v0.1.4-ui.1']=self.file('good',content)
+        self.fixtures['https://mirror.invalid/frp/v0.72.0/test.tar.gz?mirror=v0.1.5-menu-merge.1']=self.file('good',content)
         r=self.asset_call(checksum); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual(len(self.requests()),1)
-        self.assertTrue(self.requests()[0].endswith('?mirror=v0.1.4-ui.1'))
+        self.assertTrue(self.requests()[0].endswith('?mirror=v0.1.5-menu-merge.1'))
     def test_unavailable_mirror_falls_back(self):
         content=b'official'; self.fixtures['https://official.invalid/test.tar.gz']=self.file('official',content)
         r=self.asset_call(hashlib.sha256(content).hexdigest()); self.assertEqual(r.returncode,0,r.stderr)
         self.assertEqual(len(self.requests()),2); self.assertEqual((self.root/'asset').read_bytes(),content)
     def test_checksum_mismatch_stops_without_fallback(self):
-        self.fixtures['https://mirror.invalid/frp/v0.72.0/test.tar.gz?mirror=v0.1.4-ui.1']=self.file('bad',b'tampered')
+        self.fixtures['https://mirror.invalid/frp/v0.72.0/test.tar.gz?mirror=v0.1.5-menu-merge.1']=self.file('bad',b'tampered')
         r=self.asset_call('0'*64); self.assertNotEqual(r.returncode,0); self.assertEqual(len(self.requests()),1)
     def make_bundle(self, layout):
         p=self.root/('bundle-'+layout+'.tar.gz')
@@ -61,7 +61,7 @@ shutil.copyfile(fixtures[url],dest)
         target=self.root/('install-'+role+'.sh'); target.write_bytes((ROOT/target.name).read_bytes())
         return subprocess.run(['bash',str(target)],input='interactive-answer\n',env=self.env(mirror),capture_output=True,text=True)
     def test_mirror_bundle_layout_and_terminal_input(self):
-        bundle=self.make_bundle('frp-simple-bash'); base='https://mirror.invalid/frp-simple-bash/releases/v0.1.4-ui.1/'
+        bundle=self.make_bundle('frp-simple-bash'); base='https://mirror.invalid/frp-simple-bash/releases/v0.1.5-menu-merge.1/'
         self.fixtures[base+'source.tar.gz']=str(bundle)
         self.fixtures[base+'SHA256SUMS.txt']=self.file('manifest',(hashlib.sha256(bundle.read_bytes()).hexdigest()+'  source.tar.gz\n').encode())
         result=self.bootstrap(); self.assertEqual(result.returncode,0,result.stderr); self.assertIn('role=frps input=interactive-answer',result.stdout)
@@ -78,7 +78,7 @@ shutil.copyfile(fixtures[url],dest)
             result=self.bootstrap(mirror=value); self.assertEqual(result.returncode,0,result.stderr)
             self.assertEqual(len(self.requests()),1); self.assertIn('codeload.github.com',self.requests()[0])
     def test_bad_manifest_never_executes_or_falls_back(self):
-        bundle=self.make_bundle('frp-simple-bash'); base='https://mirror.invalid/frp-simple-bash/releases/v0.1.4-ui.1/'
+        bundle=self.make_bundle('frp-simple-bash'); base='https://mirror.invalid/frp-simple-bash/releases/v0.1.5-menu-merge.1/'
         self.fixtures[base+'source.tar.gz']=str(bundle); self.fixtures[base+'SHA256SUMS.txt']=self.file('manifest',('0'*64+'  source.tar.gz\n').encode())
         result=self.bootstrap(); self.assertNotEqual(result.returncode,0); self.assertNotIn('role=',result.stdout)
         self.assertEqual(len(self.requests()),2)
@@ -98,7 +98,7 @@ shutil.copyfile(fixtures[url],dest)
         result=subprocess.run(['bash','-c','source "$1/lib/download.sh"; frp_mirror_url','_',str(ROOT)],env=env,capture_output=True,text=True)
         self.assertNotEqual(result.returncode,0)
     def test_missing_manifest_stops_without_official_execution(self):
-        bundle=self.make_bundle('frp-simple-bash'); base='https://mirror.invalid/frp-simple-bash/releases/v0.1.4-ui.1/'
+        bundle=self.make_bundle('frp-simple-bash'); base='https://mirror.invalid/frp-simple-bash/releases/v0.1.5-menu-merge.1/'
         self.fixtures[base+'source.tar.gz']=str(bundle)
         result=self.bootstrap(); self.assertNotEqual(result.returncode,0)
         self.assertEqual(len(self.requests()),2); self.assertNotIn('role=',result.stdout)
@@ -115,6 +115,6 @@ shutil.copyfile(fixtures[url],dest)
         self.assertIn('SHA256 mismatch; no source fallback',shared)
         self.assertIn("$mirrorSource += '?mirror=' + $ManagerVersion",shared)
         for path in [ROOT/'install-windows.ps1',ROOT/'install-frps.ps1',ROOT/'install-frpc.ps1']:
-            path.read_bytes().decode('ascii'); self.assertIn('v0.1.4-ui.1',path.read_text())
+            path.read_bytes().decode('ascii'); self.assertIn('v0.1.5-menu-merge.1',path.read_text())
 
 if __name__=='__main__': unittest.main()

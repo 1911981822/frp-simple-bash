@@ -1,0 +1,19 @@
+[Unit]
+Description=frp-simple-bash frps
+After=network-online.target
+Wants=network-online.target
+# Keep legitimate operator restarts from hitting the default burst limiter.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/opt/frp-simple-bash/native/frps -c /etc/frp/frps.toml
+Restart=on-failure
+RestartSec=5
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

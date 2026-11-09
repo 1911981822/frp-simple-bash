@@ -1,0 +1,81 @@
+{
+  "run_id": "20261109-161041-1e0b40f2",
+  "environment": {
+    "platform": "Linux-6.1.0-54-amd64-x86_64-with-glibc2.36",
+    "python": "3.11.2"
+  },
+  "notes": [
+    "No OS reboot is performed. is-enabled proves registration only, not startup after a real reboot.",
+    "No firewall, nginx, Java or unrelated systemd service is modified.",
+    "Only localhost listeners and preflight-absent frp installation paths are used."
+  ],
+  "results": [
+    {
+      "name": "preflight-and-ownership",
+      "ok": true,
+      "seconds": 0.059
+    },
+    {
+      "name": "prepare-loopback-config",
+      "ok": true,
+      "seconds": 0.024
+    },
+    {
+      "name": "install-frps-active-enabled",
+      "ok": true,
+      "seconds": 0.906
+    },
+    {
+      "name": "prepare-profile-a",
+      "ok": true,
+      "seconds": 0.019
+    },
+    {
+      "name": "install-frpc-active-enabled",
+      "ok": true,
+      "seconds": 0.92
+    },
+    {
+      "name": "dashboard-admin-api-tcp-roundtrip",
+      "ok": true,
+      "seconds": 0.012
+    },
+    {
+      "name": "systemd-stop-start-restart-enable-disable",
+      "ok": true,
+      "seconds": 1.272
+    },
+    {
+      "name": "second-loopback-server-profile-b",
+      "ok": true,
+      "seconds": 0.218
+    },
+    {
+      "name": "number-selection-switch-and-isolation",
+      "ok": true,
+      "seconds": 0.371
+    },
+    {
+      "name": "mapping-disable-enable-restart",
+      "ok": true,
+      "seconds": 4.162
+    },
+    {
+      "name": "external-import-profile-delete-menu-smoke",
+      "ok": true,
+      "seconds": 0.943
+    },
+    {
+      "name": "uninstall-preserves-configuration",
+      "ok": true,
+      "seconds": 0.786
+    }
+  ],
+  "cleanup": [
+    {
+      "name": "owned-frp-resources",
+      "ok": true
+    }
+  ],
+  "ok": true
+}

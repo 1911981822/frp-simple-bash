@@ -1,0 +1,96 @@
+test_cancel_configuration_preserves_disk (test_manager.ManagerTests.test_cancel_configuration_preserves_disk) ... ok
+test_choose_retries_invalid (test_manager.ManagerTests.test_choose_retries_invalid) ... ok
+test_connection_timeout_is_bounded (test_manager.ManagerTests.test_connection_timeout_is_bounded) ... ok
+test_duplicate_port_reject_and_restore (test_manager.ManagerTests.test_duplicate_port_reject_and_restore) ... ok
+test_external_import_and_disabled_preservation (test_manager.ManagerTests.test_external_import_and_disabled_preservation) ... ok
+test_external_unknown_rejected (test_manager.ManagerTests.test_external_unknown_rejected) ... ok
+test_foreign_profile_import_is_rejected (test_manager.ManagerTests.test_foreign_profile_import_is_rejected) ... ok
+test_frps_keep_restores_canonical (test_manager.ManagerTests.test_frps_keep_restores_canonical) ... ok
+test_http_requires_domain (test_manager.ManagerTests.test_http_requires_domain) ... ok
+test_late_failure_restores_all_files (test_manager.ManagerTests.test_late_failure_restores_all_files) ... ok
+test_lock_exclusion (test_manager.ManagerTests.test_lock_exclusion) ... ok
+test_path_traversal_rejected (test_manager.ManagerTests.test_path_traversal_rejected) ... ok
+test_profile_mapping_isolation_and_disable (test_manager.ManagerTests.test_profile_mapping_isolation_and_disable) ... ok
+test_secret_escaping_roundtrip (test_manager.ManagerTests.test_secret_escaping_roundtrip) ... ok
+test_service_process_alone_is_not_online (test_manager.ManagerTests.test_service_process_alone_is_not_online) ... ok
+test_switch_failure_restores_active_and_runtime (test_manager.ManagerTests.test_switch_failure_restores_active_and_runtime) ... ok
+test_unicode_name_and_unique_rename (test_manager.ManagerTests.test_unicode_name_and_unique_rename) ... ok
+test_unknown_log_import_is_not_dropped (test_manager.ManagerTests.test_unknown_log_import_is_not_dropped) ... ok
+test_verify_failure_does_not_overwrite (test_manager.ManagerTests.test_verify_failure_does_not_overwrite) ... ok
+test_generated_config_and_real_api (test_native.NativeTests.test_generated_config_and_real_api) ... ok
+test_ipv6_native_login (test_native.NativeTests.test_ipv6_native_login) ... ok
+test_verify_rejects_invalid_config_without_overwrite (test_native.NativeTests.test_verify_rejects_invalid_config_without_overwrite) ... ok
+
+----------------------------------------------------------------------
+Ran 22 tests in 5.345s
+
+OK
+
+生产服务器（[::1]:7000）
+1. 查看连接配置
+2. 修改服务端名称
+3. 修改服务器地址
+4. 修改服务器端口
+5. 修改 token
+6. 修改 TLS 配置
+7. 修改 Dashboard/API
+8. 保存并返回
+9. 删除当前服务端及全部映射
+0. 返回/退出
+
+新名称（[::1]:7000）
+1. 查看连接配置
+2. 修改服务端名称
+3. 修改服务器地址
+4. 修改服务器端口
+5. 修改 token
+6. 修改 TLS 配置
+7. 修改 Dashboard/API
+8. 保存并返回
+9. 删除当前服务端及全部映射
+0. 返回/退出
+
+请选择
+1. x
+0. 返回/退出
+无效编号，请重新输入。
+无效编号，请重新输入。
+无效编号，请重新输入。
+无效编号，请重新输入。
+连接检测超时（30 秒），保留新 profile；请检查认证、网络和日志。
+检测到外部运行配置修改。
+
+配置同步
+1. 导入外部修改
+2. 保留管理器配置
+3. 查看变更字段（隐藏敏感值）
+0. 返回/退出
+外部修改已导入当前 profile。
+检测到外部运行配置修改。
+
+配置同步
+1. 导入外部修改
+2. 保留管理器配置
+3. 查看变更字段（隐藏敏感值）
+0. 返回/退出
+检测到外部运行配置修改。
+
+配置同步
+1. 导入外部修改
+2. 保留管理器配置
+3. 查看变更字段（隐藏敏感值）
+0. 返回/退出
+检测到外部运行配置修改。
+
+配置同步
+1. 导入外部修改
+2. 保留管理器配置
+3. 查看变更字段（隐藏敏感值）
+0. 返回/退出
+检测到外部运行配置修改。
+
+配置同步
+1. 导入外部修改
+2. 保留管理器配置
+3. 查看变更字段（隐藏敏感值）
+0. 返回/退出

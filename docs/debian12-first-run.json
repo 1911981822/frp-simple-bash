@@ -1,0 +1,77 @@
+{
+  "run_id": "20261109-160838-63b4e8ad",
+  "environment": {
+    "platform": "Linux-6.1.0-54-amd64-x86_64-with-glibc2.36",
+    "python": "3.11.2"
+  },
+  "notes": [
+    "No OS reboot is performed. is-enabled proves registration only, not startup after a real reboot.",
+    "No firewall, nginx, Java or unrelated systemd service is modified.",
+    "Only localhost listeners and preflight-absent frp installation paths are used."
+  ],
+  "results": [
+    {
+      "name": "preflight-and-ownership",
+      "ok": true,
+      "seconds": 0.083
+    },
+    {
+      "name": "prepare-loopback-config",
+      "ok": true,
+      "seconds": 0.024
+    },
+    {
+      "name": "install-frps-active-enabled",
+      "ok": true,
+      "seconds": 1.643
+    },
+    {
+      "name": "prepare-profile-a",
+      "ok": true,
+      "seconds": 0.023
+    },
+    {
+      "name": "install-frpc-active-enabled",
+      "ok": true,
+      "seconds": 0.932
+    },
+    {
+      "name": "dashboard-admin-api-tcp-roundtrip",
+      "ok": true,
+      "seconds": 0.013
+    },
+    {
+      "name": "systemd-stop-start-restart-enable-disable",
+      "ok": true,
+      "seconds": 1.34
+    },
+    {
+      "name": "second-loopback-server-profile-b",
+      "ok": true,
+      "seconds": 0.22
+    },
+    {
+      "name": "number-selection-switch-and-isolation",
+      "ok": true,
+      "seconds": 2.385
+    },
+    {
+      "name": "mapping-disable-enable-restart",
+      "ok": false,
+      "error_type": "ValueError",
+      "error": "服务操作失败：Job for frpc.service failed because start of the service was attempted too often.\nSee \"systemctl status frpc.service\" and \"journalctl -xeu frpc.service\" for details.\nTo force a start use \"systemctl reset-failed frpc.service\"\nfollowed by \"systemctl start frpc.service\" again.",
+      "seconds": 2.108
+    }
+  ],
+  "cleanup": [
+    {
+      "name": "owned-frp-resources",
+      "ok": true
+    }
+  ],
+  "ok": false,
+  "fatal_error": {
+    "type": "ValueError",
+    "message": "服务操作失败：Job for frpc.service failed because start of the service was attempted too often.\nSee \"systemctl status frpc.service\" and \"journalctl -xeu frpc.service\" for details.\nTo force a start use \"systemctl reset-failed frpc.service\"\nfollowed by \"systemctl start frpc.service\" again."
+  }
+}

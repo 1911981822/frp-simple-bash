@@ -1,0 +1,12 @@
+#!/sbin/openrc-run
+name="frpc"
+description="frp-simple-bash frpc"
+command="/opt/frp-simple-bash/native/frpc"
+command_args="-c /etc/frp/frpc.toml"
+command_user="root:root"
+command_background=true
+pidfile="/run/frpc.pid"
+output_log="/etc/frp/logs/frpc.log"
+error_log="/etc/frp/logs/frpc.log"
+depend() { need net; }
+start_pre() { checkpath --directory --mode 0700 /etc/frp/logs; }

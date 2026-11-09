@@ -1,0 +1,19 @@
+[Unit]
+Description=frp-simple-bash frpc
+After=network-online.target
+Wants=network-online.target
+# Menu actions may deliberately restart several times within systemd's default burst window.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/opt/frp-simple-bash/native/frpc -c /etc/frp/frpc.toml
+Restart=on-failure
+RestartSec=5
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

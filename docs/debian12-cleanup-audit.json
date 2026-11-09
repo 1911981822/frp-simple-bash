@@ -1,0 +1,16 @@
+{
+  "test_installation_paths_removed": {
+    "/opt/frp-simple-bash": true,
+    "/etc/frp": true,
+    "/usr/local/bin/frps": true,
+    "/usr/local/bin/frpc": true,
+    "/etc/systemd/system/frps.service": true,
+    "/etc/systemd/system/frpc.service": true
+  },
+  "original_running_services_missing": [],
+  "running_services_added": [],
+  "original_nginx_and_java_pids_still_alive": true,
+  "failed_unit_names_after": [
+    "spring_fabric-server-mc.service"
+  ]
+}

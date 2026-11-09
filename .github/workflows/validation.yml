@@ -1,0 +1,32 @@
+name: validation
+on: [push, pull_request]
+jobs:
+  core:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m unittest discover -s tests -v
+      - run: python -m py_compile lib/manager.py
+      - name: Check Bash syntax
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          for path in bin/frps bin/frpc install-common.sh install-frps.sh install-frpc.sh uninstall.sh; do
+            bash -n "$path" || exit 1
+          done
+      - name: Parse PowerShell without execution
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { throw ($errors | Out-String) }
+          }

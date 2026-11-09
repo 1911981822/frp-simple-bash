@@ -415,6 +415,7 @@ def save_mappings(pid, items):
         try: mappings(pid); apply(pid)
         except Exception: atomic(path, old); raise
         s = state(); s['pending'] = True; save_json(ROOT / 'state.json', s); audit('mappings-saved', pid)
+    print('端口映射配置已保存。' + ('当前 frpc 运行中，请按提示重启后生效。' if running('frpc') else '当前 frpc 未运行，下次启动时生效。'))
     if running('frpc') and confirm('配置已保存，立即重启 frpc 生效？'):
         service('frpc', 'restart'); wait_connection(pid)
         s = state(); s['pending'] = False; save_json(ROOT / 'state.json', s)
@@ -508,7 +509,10 @@ def configure_server():
         if value: data[key] = port(value)
     content = toml(data); verify('frps', content)
     with lock(), transaction(): backup([ROOT / 'frps.toml']); atomic(ROOT / 'frps.toml', content); mark_hash('frps')
-    if running('frps') and confirm('立即重启 frps？'): service('frps', 'restart')
+    if running('frps') and confirm('立即重启 frps？'):
+        service_feedback('frps', 'restart')
+    else:
+        print('frps 配置已保存；当前运行服务将在下次重启后使用新配置。')
 
 def server_clients():
     p = read_toml(ROOT / 'frps.toml'); web = p.get('webServer', {})
@@ -538,6 +542,7 @@ def server_clients():
         status = item.get('status', {})
         print(f'{n}. {item.get("name", "未知")} [{status.get("phase", "未知")}] 类型={item.get("spec", {}).get("type", "未知")}')
         print(f'   今日流量：入站 {status.get("todayTrafficIn", 0)} / 出站 {status.get("todayTrafficOut", 0)}，连接数 {status.get("curConns", 0)}')
+    print(f'客户端连接查询完成：{len(clients)} 个客户端，{len(proxies)} 个代理。')
 
 def import_external(role):
     path = ROOT / (role + '.toml'); s = state()
@@ -649,6 +654,16 @@ def show_status(role):
     print('─' * 42)
     return data
 
+def service_feedback(role, action):
+    labels = {'start': '启动', 'stop': '停止', 'restart': '重启'}
+    state_value = service(role, 'status').strip().lower()
+    expected = {'start': ('active', 'started', 'running'), 'stop': ('inactive', 'stopped', 'dead'), 'restart': ('active', 'started', 'running')}[action]
+    if state_value in expected:
+        print(f'{labels[action]}成功：当前状态为 {"运行中" if action != "stop" else "已停止"}。')
+    else:
+        print(f'{labels[action]}请求已发送，但当前服务状态为：{state_value or "未知"}。请查看日志。')
+    return state_value
+
 def main_menu(role):
     while True:
         try:
@@ -668,8 +683,10 @@ def main_menu(role):
                 elif n in (2, 3, 4):
                     require_active()
                     if n == 2 or confirm(items[n-1] + '？'):
-                        service(role, {2:'start', 3:'stop', 4:'restart'}[n])
+                        action = {2:'start', 3:'stop', 4:'restart'}[n]
+                        service_feedback(role, action)
                         if n != 3: wait_connection(active())
+                        else: print('frpc 已停止，当前配置和 profile 保留。')
                 elif n == 5: profile_wizard()
                 elif n == 6: select_profile()
                 elif n == 7:
@@ -686,7 +703,8 @@ def main_menu(role):
                 elif n == 2: print(VERSION)
                 elif n == 3: print(f'原生程序：{binary(role)}\n配置目录：{ROOT}')
                 elif n in (4,5,6):
-                    if n == 4 or confirm(items[n-1] + '？'): service(role, {4:'start',5:'stop',6:'restart'}[n])
+                    if n == 4 or confirm(items[n-1] + '？'):
+                        service_feedback(role, {4:'start',5:'stop',6:'restart'}[n])
                 elif n == 7: server_clients()
                 elif n == 8: configure_server()
                 elif n == 9: show_logs(role)
@@ -700,10 +718,15 @@ def show_logs(role):
     if path.exists(): print('\n'.join(path.read_text(encoding='utf-8', errors='replace').splitlines()[-50:]))
     elif os.name != 'nt' and shutil.which('journalctl'): subprocess.run(['journalctl','-u',role,'-n','50','--no-pager'])
     else: print('暂无文件日志；请查看平台服务日志。')
+    print(f'{role} 日志读取完成；以上为最近 50 行。')
 
 def autostart(role):
     n = choose(['启用开机自启动', '取消开机自启动'])
-    if n: service(role, 'enable' if n == 1 else 'disable')
+    if n:
+        action = 'enable' if n == 1 else 'disable'
+        service(role, action)
+        current = service(role, 'status')
+        print(('已启用' if n == 1 else '已取消') + f' {role} 开机自启动；当前运行状态：{current or "未知"}。')
 
 def delete_profile_id(pid):
     p = load_profile(pid)

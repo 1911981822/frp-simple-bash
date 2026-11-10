@@ -22,7 +22,7 @@ $native = Join-Path $root 'native'
 $bin = Join-Path $root 'bin'
 $services = Join-Path $root 'services'
 $repo = 'https://raw.githubusercontent.com/1911981822/frp-simple-bash/main'
-$ManagerVersion = 'v0.1.13-py36.1'
+$ManagerVersion = 'v0.1.14-ui.1'
 $mirror = if (Test-Path Env:FRP_MIRROR_URL) { [string]$env:FRP_MIRROR_URL } else { 'https://download.sueiyuan.top' }
 if ($mirror -eq 'off') { $mirror = '' }
 if ($mirror -and $mirror -notmatch '^https://') { throw 'Mirror URL must use HTTPS, or be empty/off.' }

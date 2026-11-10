@@ -438,7 +438,7 @@ def switch(pid):
             if was_running: service('frpc', 'start')
             raise
         if was_running: service('frpc', 'start'); wait_connection(pid)
-        else: print('已切换当前配置，frpc 保持停止。')
+        else: result_info('已切换当前配置，frpc 保持停止。')
 
 RULE = '━' * 46
 CANCEL_KEYS = ('q', 'Q')
@@ -481,25 +481,41 @@ def section(title):
     print(' ' + title)
     print(RULE)
 
+def _display_width(text):
+    """Approximate terminal width: CJK/fullwidth chars count as 2."""
+    width = 0
+    for ch in text:
+        width += 2 if ord(ch) > 0x2E7F else 1
+    return width
+
+def _pad_line(text, width):
+    pad = max(0, width - _display_width(text))
+    return text + ' ' * pad
+
+def _box(kind, message, detail=None):
+    """Render a result inside a frame so it stands out from plain menus."""
+    inner = 44
+    print()
+    print('┌' + '─' * inner + '┐')
+    print('│' + _pad_line(' ' + kind + ' ' + message, inner) + '│')
+    if detail:
+        for line in str(detail).splitlines():
+            print('│' + _pad_line('   ' + line, inner) + '│')
+    print('└' + '─' * inner + '┘')
+
 def pause(message='按回车返回上一级菜单'):
     if sys.stdin.isatty():
         try: input(f'  {message} … ')
         except EOFError: pass
 
 def result_ok(message, detail=None):
-    print(f'\n[成功] {message}')
-    if detail:
-        for line in str(detail).splitlines(): print('       ' + line)
+    _box('[成功]', message, detail)
 
 def result_info(message, detail=None):
-    print(f'\n[提示] {message}')
-    if detail:
-        for line in str(detail).splitlines(): print('       ' + line)
+    _box('[提示]', message, detail)
 
 def result_error(message, hint=None):
-    print(f'\n[失败] {message}')
-    if hint:
-        for line in str(hint).splitlines(): print('       建议：' + line)
+    _box('[失败]', message, hint)
 
 def choose(items, title='请选择', back_label='返回上一级'):
     section(title)
@@ -521,6 +537,18 @@ def select_profile():
     n = choose([label(p) + (' [当前]' if p['id'] == active() else '') + f' [{len(mappings(p["id"]))} 个映射]' for p in ps], '服务端列表')
     return ps[n-1]['id'] if n else None
 
+def list_profiles():
+    """Read-only view of all configured servers; no selection forced."""
+    ps = profiles()
+    section('服务端列表')
+    if not ps:
+        print('  暂无服务端，请从主菜单「新建 frps 服务端」添加。')
+    else:
+        for p in ps:
+            mark = ' [当前]' if p['id'] == active() else ''
+            print(f'  • {label(p)}{mark}  [{len(mappings(p["id"]))} 个映射]')
+    print(RULE)
+
 def profile_wizard():
     p = {'name': ask('服务端名称'), 'server_addr': ask('服务端 IP/IPv6/域名'), 'server_port': port(ask('frps 业务端口', '7000')), 'dashboard_port': port(ask('Dashboard/API 管理端口', '7500')), 'tls_enable': ask('启用 TLS？[Y/n]', 'y').lower() != 'n', 'admin_port': 7400}
     unique_name(p['name']); validate_profile(p)
@@ -533,7 +561,7 @@ def profile_wizard():
     if not confirm('确认创建 ' + label(p) + '？'): return
     pid = create_profile(p, s)
     if not active() or confirm('设为当前服务端？'): switch(pid)
-    print('创建成功；端口映射请从主菜单第 9 项单独设置。')
+    result_ok('服务端已创建。端口映射请从主菜单「修改端口映射」单独设置。')
     if active() == pid and not running('frpc') and confirm('立即启动 frpc 并检查连接？'):
         service('frpc', 'start'); wait_connection(pid)
 
@@ -869,7 +897,7 @@ def configure_server():
     if running('frps') and confirm('立即重启 frps？'):
         service_feedback('frps', 'restart')
     else:
-        print('frps 配置已保存；当前运行服务将在下次重启后使用新配置。')
+        result_info('frps 配置已保存；当前运行服务将在下次重启后使用新配置。')
 
 def check_port_conflict(host, port_value, exclude_pid=None):
     """Return True when another local process already listens on host:port."""
@@ -1126,7 +1154,7 @@ def import_external(role):
         except Exception:
             for dest, value in zip(paths, old): atomic(dest, value)
             raise
-    print('外部修改已导入当前 profile。')
+    result_ok('外部修改已导入当前 profile。')
 
 def status(role):
     result = {'component': role, 'version': VERSION, 'service_state': service(role, 'status'), 'config_path': str(ROOT / (role + '.toml'))}
@@ -1216,7 +1244,7 @@ def main_menu(role):
             alias = '配置错误'
         if role == 'frpc':
             items = ['查看当前状态', '启动 frpc', '停止 frpc', '重启 frpc', '新建 frps 服务端', '查看服务端列表', '切换当前 frps 服务端', '修改当前 frps 配置', f'修改当前 frps（{alias}）端口映射', '查看日志与连接诊断', '备份与恢复配置', '设置/取消开机自启动', '卸载 frpc', '升级 frpc']
-        else: items = ['查看服务信息（状态、版本、路径）', '启动 frps', '停止 frps', '重启 frps', '查看客户端连接信息', '修改服务端配置', '查看日志', '连接诊断', '备份与恢复配置', '设置/取消开机自启动', '卸载 frps', '升级 frps']
+        else: items = ['查看服务信息（状态、版本、路径）', '启动 frps', '停止 frps', '重启 frps', '查看客户端连接信息', '修改服务端配置', '查看日志与连接诊断', '备份与恢复配置', '设置/取消开机自启动', '卸载 frps', '升级 frps']
         status_bar(role, data)
         n = choose(items, '请选择操作' if role == 'frps' else 'frpc 客户端操作', '退出')
         if not n: return
@@ -1229,16 +1257,15 @@ def main_menu(role):
                         action = {2:'start', 3:'stop', 4:'restart'}[n]
                         service_feedback(role, action)
                         if n != 3: wait_connection(active())
-                        else: print('frpc 已停止，当前配置和 profile 保留。')
+                        else: result_info('frpc 已停止，当前配置和 profile 保留。')
                 elif n == 5: profile_wizard()
-                elif n == 6: select_profile()
+                elif n == 6: list_profiles()
                 elif n == 7:
                     pid = select_profile()
                     if pid: switch(pid)
                 elif n == 8: edit_profile()
                 elif n == 9: mapping_menu()
-                elif n == 10:
-                    logs_menu(role); diagnostics(role)
+                elif n == 10: logs_and_diagnostics_menu(role)
                 elif n == 11: backup_menu()
                 elif n == 12: autostart(role)
                 elif n == 13: uninstall(role)
@@ -1252,12 +1279,11 @@ def main_menu(role):
                         service_feedback(role, {2:'start',3:'stop',4:'restart'}[n])
                 elif n == 5: server_clients()
                 elif n == 6: frps_config_menu()
-                elif n == 7: logs_menu(role)
-                elif n == 8: diagnostics(role)
-                elif n == 9: backup_menu()
-                elif n == 10: autostart(role)
-                elif n == 11: uninstall(role)
-                elif n == 12: upgrade(role)
+                elif n == 7: logs_and_diagnostics_menu(role)
+                elif n == 8: backup_menu()
+                elif n == 9: autostart(role)
+                elif n == 10: uninstall(role)
+                elif n == 11: upgrade(role)
         except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as e: result_error(str(e))
         if n != 1:
             pause()
@@ -1272,46 +1298,37 @@ def show_logs(role, lines=50):
     if path.exists():
         content = path.read_text(encoding='utf-8', errors='replace').splitlines()
         print('\n'.join(content[-lines:]))
-        print(f'[日志] {path} 共 {len(content)} 行，已显示最近 {min(lines, len(content))} 行。')
+        result_info(f'{path} 共 {len(content)} 行，已显示最近 {min(lines, len(content))} 行。')
         return
     if os.name != 'nt' and shutil.which('journalctl'):
         run_cmd(['journalctl', '-u', role, '-n', str(lines), '--no-pager'])
-        print(f'[日志] 已从 journalctl 读取最近 {lines} 行。')
+        result_info(f'已从 journalctl 读取最近 {lines} 行。')
         return
     print('暂无文件日志；请查看平台服务日志。')
 
-def logs_menu(role):
+def logs_and_diagnostics_menu(role):
+    """Combined, single sub-menu for logs and connection diagnostics."""
     while True:
         clear_screen()
         files = log_files(role)
-        print('\n[菜单] 日志管理')
-        print('  ' + '─' * 38)
-        if files:
-            for n, item in enumerate(files[:10], 1):
-                size = item.stat().st_size
-                print(f'  {n}. {item.name}  {size} 字节')
-        else: print('  暂无日志文件')
-        print('  1. 查看最近 50 行')
-        print('  2. 查看最近 200 行')
-        print('  3. 清理轮转归档（保留当前日志）')
-        print('  4. 查看日志目录')
-        print('  0. 返回上一级')
-        n = ask('请输入编号 > ')
-        if not n.isdecimal(): result_error('请输入数字编号。'); continue
-        n = int(n)
-        if n == 0: return
+        lines = [f'{f.name}  {f.stat().st_size} 字节' for f in files[:10]]
+        n = choose(['查看最近 50 行日志', '查看最近 200 行日志', '查看日志目录与轮转策略', '清理轮转归档（保留当前日志）', '运行连接诊断', '导出诊断报告（JSON）'], '日志与连接诊断', '返回上一级')
+        if not n: return
         if n == 1: show_logs(role, 50); pause()
         elif n == 2: show_logs(role, 200); pause()
         elif n == 3:
+            print(f'\n  日志目录：{ROOT / "logs"}')
+            print('  轮转策略：单文件超过 50MB 自动归档；保留 30 天；总量上限 500MB。'); pause()
+        elif n == 4:
             removed = 0
             for item in files:
                 if item.name == role + '.log': continue
                 unlink_quiet(item); removed += 1
             result_ok(f'已清理 {removed} 个轮转归档，当前日志保留。'); pause()
-        elif n == 4:
-            print(f'日志目录：{ROOT / "logs"}')
-            print('轮转策略：单文件超过 50MB 自动归档；保留 30 天；总量上限 500MB。'); pause()
-        else: result_error('编号超出范围。')
+        elif n == 5: diagnostics(role); pause()
+        elif n == 6:
+            report = diagnostics_report(role)
+            print('\n' + json.dumps(report, ensure_ascii=False, indent=2)); pause()
 
 def autostart(role):
     n = choose(['启用开机自启动', '取消开机自启动'])
@@ -1334,7 +1351,7 @@ def delete_profile_id(pid):
         if pid == active():
             set_current(''); (unlink_quiet(ROOT / 'frpc.toml'))
         rebuild_index(); audit('profile-deleted')
-    print('服务端 profile 及其映射已删除。')
+    result_ok('服务端 profile 及其映射已删除。')
 
 def mapping_command(argv):
     pid = require_active(); items = mappings(pid); action = argv[0] if argv else 'menu'
@@ -1446,7 +1463,7 @@ def run(argv=None):
     if cmd == 'menu':
         try: import_external(role)
         except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError):
-            print('外部配置未同步，原文件已保留；请使用 import 命令排查或从备份恢复。')
+            result_error('外部配置未同步，原文件已保留；请使用 import 命令排查或从备份恢复。')
         main_menu(role); return
     if cmd == 'profile' and role == 'frpc':
         sub = argv.pop(0) if argv else 'list'

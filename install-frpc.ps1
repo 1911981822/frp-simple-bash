@@ -49,12 +49,18 @@ try {
             try {
                 Get-HttpsFile $url ($installer+'.partial')
                 Move-Item -LiteralPath ($installer+'.partial') -Destination $installer -Force
+                # Clear the Internet Zone marker so the host policy cannot block it.
+                try { Unblock-File -LiteralPath $installer -ErrorAction SilentlyContinue } catch {}
                 $ok=$true; break
             } catch { Write-Warning ('Download failed: '+$url) }
         }
         if (-not $ok) { throw 'All installer download sources failed.' }
     }
-    & $installer -Component 'frpc' -Version $Version -WinSWSha256 $WinSWSha256
+    # The downloaded installer is a .ps1 on disk, which the host execution policy
+    # (Restricted/RemoteSigned) may block. Spawn a child PowerShell that bypasses
+    # the policy for this file only, mirroring the .cmd launcher.
+    & powershell.exe -ExecutionPolicy Bypass -NoProfile -NoLogo -File $installer -Component 'frpc' -Version $Version -WinSWSha256 $WinSWSha256
+    if ($LASTEXITCODE -ne 0) { throw ('Installer exited with code ' + $LASTEXITCODE) }
 } finally {
     if ($temporary) {
         $resolved=[IO.Path]::GetFullPath($temporary)

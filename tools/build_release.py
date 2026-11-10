@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Build a deterministic manager source bundle without native binaries or local data."""
-from __future__ import annotations
 import argparse
 import gzip
 import hashlib

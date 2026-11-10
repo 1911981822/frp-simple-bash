@@ -9,7 +9,6 @@ Uses an already downloaded, SHA256-verified archive; never downloads, changes
 firewalls, reboots the OS, or accesses SSH. All FRP listeners bind to loopback.
 This script itself must not be run as part of unittest discovery or CI.
 """
-from __future__ import annotations
 
 import argparse
 import contextlib

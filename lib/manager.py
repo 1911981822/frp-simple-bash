@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """frp-simple-bash shared management engine; requires Python >= 3.11."""
-from __future__ import annotations
 import contextlib
 import datetime as dt
 import hashlib

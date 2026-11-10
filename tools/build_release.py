@@ -10,7 +10,7 @@ import subprocess
 import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_VERSION = 'v0.1.6-depth.1'
+DEFAULT_VERSION = 'v0.1.7-profile.1'
 
 def build(version=DEFAULT_VERSION):
     if not version.startswith('v') or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-' for c in version):

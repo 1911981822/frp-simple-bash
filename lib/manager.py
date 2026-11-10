@@ -242,8 +242,14 @@ def render(pid):
     p = load_profile(pid); s = secrets_for(pid); items = mappings(pid)
     lines = [f'serverAddr = {text(p["server_addr"])}', f'serverPort = {p["server_port"]}',
              f'transport.tls.enable = {str(p.get("tls_enable", True)).lower()}',
+             f'transport.protocol = {text(p.get("transport_protocol", "tcp"))}',
              'loginFailExit = false', f'clientID = {text(pid)}',
-             f'log.to = {text(str(ROOT / "logs" / "frpc.log"))}', 'log.maxDays = 30', 'log.disablePrintColor = true']
+             f'log.to = {text(str(ROOT / "logs" / "frpc.log"))}',
+             f'log.level = {text(p.get("log_level", "info"))}',
+             f'log.maxDays = {int(p.get("log_max_days", 30))}', 'log.disablePrintColor = true']
+    if p.get('tls_use_system_ca'): lines.append('transport.tls.useSystemCa = true')
+    if p.get('transport_use_encryption'): lines.append('transport.useEncryption = true')
+    if p.get('transport_use_compression'): lines.append('transport.useCompression = true')
     for key in ('certFile', 'keyFile', 'trustedCaFile'):
         if s.get('tls_' + key): lines.append(f'transport.tls.{key} = {text(s["tls_" + key])}')
     if s.get('token'): lines += ['auth.method = "token"', f'auth.token = {text(s["token"])}']
@@ -684,7 +690,7 @@ def edit_profile():
     version = hashlib.sha256((pdir(pid) / 'profile.toml').read_bytes() + (pdir(pid) / 'secrets.toml').read_bytes()).hexdigest()
     while True:
         clear_screen()
-        n = choose(['查看连接配置', '修改服务端名称', '修改服务器地址', '修改服务器端口', '修改 token', '修改 TLS 配置', '修改 Dashboard/API', '保存并返回', '删除当前服务端及全部映射'], label(p))
+        n = choose(['查看连接配置', '修改服务端名称', '修改服务器地址', '修改服务器端口', '修改 token', '修改 TLS 配置', '修改 Dashboard/API', '修改传输协议', '修改日志级别与保留天数', '保存并返回', '删除当前服务端及全部映射'], label(p))
         if n == 0: return
         if n == 1: profile_summary(p, s)
         elif n == 2: v = ask('新名称'); unique_name(v, pid); p['name'] = v
@@ -697,7 +703,20 @@ def edit_profile():
         elif n == 7:
             p['dashboard_port'] = port(ask('Dashboard/API 端口', '7500')); p['dashboard_addr'] = ask('Dashboard 主机', p['server_addr'])
             s['dashboard_username'] = ask('Dashboard 用户名（留空关闭）'); s['dashboard_password'] = ask('密码', secret=True) if s['dashboard_username'] else ''
+        elif n == 8:
+            protocol = ask('传输协议 tcp/kcp/quic/websocket/wss', p.get('transport_protocol', 'tcp')).lower()
+            if protocol not in ('tcp', 'kcp', 'quic', 'websocket', 'wss'): raise ValueError('不支持的传输协议：' + protocol)
+            p['transport_protocol'] = protocol
+            p['transport_use_encryption'] = ask('启用传输加密？[y/N]', 'y' if p.get('transport_use_encryption') else 'n').lower() == 'y'
+            p['transport_use_compression'] = ask('启用传输压缩？[y/N]', 'y' if p.get('transport_use_compression') else 'n').lower() == 'y'
         elif n == 9:
+            level = ask('日志级别 trace/debug/info/warn/error', p.get('log_level', 'info')).lower()
+            if level not in ('trace', 'debug', 'info', 'warn', 'error'): raise ValueError('不支持的日志级别：' + level)
+            p['log_level'] = level
+            days = ask('日志保留天数（1-365）', str(p.get('log_max_days', 30)))
+            if not days.isdigit() or not 1 <= int(days) <= 365: raise ValueError('日志保留天数必须为 1-365')
+            p['log_max_days'] = int(days)
+        elif n == 11:
             if confirm('删除此服务端及全部映射？不额外备份。'):
                 with lock(), transaction():
                     if running('frpc'): service('frpc', 'stop')
@@ -946,11 +965,25 @@ def import_external(role):
     if config.get('clientID', pid) != pid: raise ValueError('来源 profile 不一致，拒绝跨服务端导入')
     p = load_profile(pid); sec = secrets_for(pid); rows = []
     canonical = tomllib.loads(render(pid))
-    if config.get('log', {}) != canonical.get('log', {}) or config.get('loginFailExit', False) is not False:
-        raise ValueError('日志/登录重试策略变更尚不支持反向导入，原文件保留')
+    external_log = config.get('log', {})
+    canonical_log = canonical.get('log', {})
+    if set(external_log) - {'to', 'level', 'maxDays', 'disablePrintColor'}:
+        raise ValueError('日志高级字段无法无损导入，原文件保留')
+    if external_log.get('to', canonical_log.get('to')) != canonical_log.get('to') or external_log.get('disablePrintColor', True) is not True:
+        raise ValueError('日志路径/颜色变更需手工协调，原文件保留')
+    if config.get('loginFailExit', False) is not False:
+        raise ValueError('登录失败退出策略变更尚不支持反向导入，原文件保留')
     transport = config.get('transport', {})
-    if set(transport) - {'tls'} or set(transport.get('tls', {})) - {'enable', 'certFile', 'keyFile', 'trustedCaFile'}:
+    if set(transport) - {'tls', 'protocol', 'useEncryption', 'useCompression'} or set(transport.get('tls', {})) - {'enable', 'certFile', 'keyFile', 'trustedCaFile', 'useSystemCa'}:
         raise ValueError('高级传输字段无法无损导入，原文件保留')
+    if transport.get('protocol', 'tcp') not in ('tcp', 'kcp', 'quic', 'websocket', 'wss'):
+        raise ValueError('不支持的传输协议：' + str(transport.get('protocol')))
+    p_transport = {'transport_protocol': transport.get('protocol', 'tcp'),
+                   'transport_use_encryption': bool(transport.get('useEncryption', False)),
+                   'transport_use_compression': bool(transport.get('useCompression', False)),
+                   'tls_use_system_ca': bool(transport.get('tls', {}).get('useSystemCa', False)),
+                   'log_level': external_log.get('level', canonical_log.get('level', 'info')),
+                   'log_max_days': int(external_log.get('maxDays', canonical_log.get('maxDays', 30)))}
     for key in ('certFile', 'keyFile', 'trustedCaFile'): sec['tls_' + key] = transport.get('tls', {}).get(key, '')
     web = config.get('webServer', {})
     if set(web) - {'addr', 'port', 'user', 'password'} or web.get('addr', '127.0.0.1') != '127.0.0.1' or web.get('user', 'frp-simple-bash') != 'frp-simple-bash':
@@ -967,6 +1000,7 @@ def import_external(role):
         validate_mapping(m); rows.append(m)
     p['server_addr'] = address(config['serverAddr']); p['server_port'] = port(config['serverPort'])
     p['tls_enable'] = config.get('transport', {}).get('tls', {}).get('enable', True)
+    p.update(p_transport)
     auth = config.get('auth', {})
     if set(auth) - {'method', 'token'} or auth.get('method', 'token') != 'token': raise ValueError('认证方式不支持自动导入')
     sec['token'] = auth.get('token', '')
@@ -1068,7 +1102,7 @@ def main_menu(role):
                 elif n == 8: edit_profile()
                 elif n == 9: mapping_menu()
                 elif n == 10:
-                    show_logs(role); diagnostics(role)
+                    logs_menu(role); diagnostics(role)
                 elif n == 11: backup_menu()
                 elif n == 12: autostart(role)
                 elif n == 13: uninstall(role)
@@ -1082,7 +1116,7 @@ def main_menu(role):
                         service_feedback(role, {2:'start',3:'stop',4:'restart'}[n])
                 elif n == 5: server_clients()
                 elif n == 6: frps_config_menu()
-                elif n == 7: show_logs(role)
+                elif n == 7: logs_menu(role)
                 elif n == 8: diagnostics(role)
                 elif n == 9: backup_menu()
                 elif n == 10: autostart(role)
@@ -1092,12 +1126,56 @@ def main_menu(role):
         if n != 1:
             pause()
 
-def show_logs(role):
+def log_files(role):
+    base = ROOT / 'logs'
+    if not base.exists(): return []
+    return sorted([p for p in base.iterdir() if p.is_file() and not p.is_symlink() and (p.name == role + '.log' or p.name.startswith(role + '.log.'))], key=lambda p: p.stat().st_mtime, reverse=True)
+
+def show_logs(role, lines=50):
     path = ROOT / 'logs' / (role + '.log')
-    if path.exists(): print('\n'.join(path.read_text(encoding='utf-8', errors='replace').splitlines()[-50:]))
-    elif os.name != 'nt' and shutil.which('journalctl'): subprocess.run(['journalctl','-u',role,'-n','50','--no-pager'])
-    else: print('暂无文件日志；请查看平台服务日志。')
-    print(f'{role} 日志读取完成；以上为最近 50 行。')
+    if path.exists():
+        content = path.read_text(encoding='utf-8', errors='replace').splitlines()
+        print('\n'.join(content[-lines:]))
+        print(f'[日志] {path} 共 {len(content)} 行，已显示最近 {min(lines, len(content))} 行。')
+        return
+    if os.name != 'nt' and shutil.which('journalctl'):
+        subprocess.run(['journalctl', '-u', role, '-n', str(lines), '--no-pager'])
+        print(f'[日志] 已从 journalctl 读取最近 {lines} 行。')
+        return
+    print('暂无文件日志；请查看平台服务日志。')
+
+def logs_menu(role):
+    while True:
+        clear_screen()
+        files = log_files(role)
+        print('\n[菜单] 日志管理')
+        print('  ' + '─' * 38)
+        if files:
+            for n, item in enumerate(files[:10], 1):
+                size = item.stat().st_size
+                print(f'  {n}. {item.name}  {size} 字节')
+        else: print('  暂无日志文件')
+        print('  1. 查看最近 50 行')
+        print('  2. 查看最近 200 行')
+        print('  3. 清理轮转归档（保留当前日志）')
+        print('  4. 查看日志目录')
+        print('  0. 返回上一级')
+        n = ask('请输入编号 > ')
+        if not n.isdecimal(): result_error('请输入数字编号。'); continue
+        n = int(n)
+        if n == 0: return
+        if n == 1: show_logs(role, 50); pause()
+        elif n == 2: show_logs(role, 200); pause()
+        elif n == 3:
+            removed = 0
+            for item in files:
+                if item.name == role + '.log': continue
+                item.unlink(missing_ok=True); removed += 1
+            result_ok(f'已清理 {removed} 个轮转归档，当前日志保留。'); pause()
+        elif n == 4:
+            print(f'日志目录：{ROOT / "logs"}')
+            print('轮转策略：单文件超过 50MB 自动归档；保留 30 天；总量上限 500MB。'); pause()
+        else: result_error('编号超出范围。')
 
 def autostart(role):
     n = choose(['启用开机自启动', '取消开机自启动'])
@@ -1153,11 +1231,37 @@ def uninstall(role):
         args = ['powershell', '-File', str(script), '-Component', role, '-Yes'] if os.name == 'nt' else ['bash', str(script), role]
         subprocess.run(args, check=True)
 
-def upgrade(role):
-    print('当前版本：' + VERSION)
-    if confirm('重新下载并校验固定版本 0.72.0（保留配置）？'):
-        script = Path(__file__).resolve().parent.parent / ('install-' + role + ('.ps1' if os.name == 'nt' else '.sh'))
-        subprocess.run((['powershell','-File'] if os.name == 'nt' else ['bash']) + [str(script)], check=True)
+SUPPORTED_VERSIONS = ('0.72.0',)
+
+def installed_version(role):
+    try:
+        result = subprocess.run([str(binary(role)), '--version'], capture_output=True, text=True, timeout=10)
+        value = (result.stdout or result.stderr).strip().splitlines()
+        return value[0].strip() if value else 'unknown'
+    except (OSError, subprocess.SubprocessError): return 'unknown'
+
+def upgrade(role, target=None):
+    current = installed_version(role)
+    print('[升级] 当前 frp 版本：' + current)
+    print('[升级] 管理器支持版本：' + '、'.join(SUPPORTED_VERSIONS))
+    if target and target.lstrip('v') not in SUPPORTED_VERSIONS:
+        raise ValueError(f'版本 {target} 未经配置和 SHA256 验证，拒绝升级。已支持：{", ".join(SUPPORTED_VERSIONS)}')
+    if not confirm(f'重新安装并校验 frp {SUPPORTED_VERSIONS[-1]}（保留配置和备份）？'): return
+    script = Path(__file__).resolve().parent.parent / ('install-' + role + ('.ps1' if os.name == 'nt' else '.sh'))
+    if not script.exists(): raise ValueError('安装脚本未安装，无法升级')
+    before = installed_version(role)
+    backup_dir = backup([ROOT / (role + '.toml')], 'pre-upgrade')
+    args = ['powershell', '-File', str(script), '-Version', 'v' + SUPPORTED_VERSIONS[-1]] if os.name == 'nt' else ['bash', str(script), '--version', 'v' + SUPPORTED_VERSIONS[-1]]
+    result = subprocess.run(args, capture_output=True, text=True)
+    after = installed_version(role)
+    if result.returncode != 0:
+        result_error('升级失败，正在恢复配置备份。')
+        restore_backup(backup_dir)
+        if running(role): service(role, 'start')
+        raise ValueError('升级脚本失败；配置已从备份恢复。原始输出末尾：' + (result.stderr or result.stdout).strip()[-500:])
+    result_ok(f'升级完成：{before} → {after}；配置备份：{backup_dir.name}')
+    if running(role) and not service(role, 'status').lower() in ('active', 'started', 'running'):
+        result_error('服务未恢复运行，请检查日志。')
 
 def run(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -1165,12 +1269,21 @@ def run(argv=None):
     role = argv.pop(0); initialize()
     cmd = argv.pop(0) if argv else 'menu'
     if cmd == 'status': print(json.dumps(status(role), ensure_ascii=False, indent=2)); return
-    if cmd == 'version': print(VERSION); return
+    if cmd == 'version': print(json.dumps({'manager': VERSION, 'frp': installed_version(role), 'supported': list(SUPPORTED_VERSIONS)}, ensure_ascii=False)); return
     if cmd == 'path': print(f'{ROOT}\n{binary(role)}'); return
     if cmd in ('start','stop','restart'):
         if role == 'frpc': require_active()
         service(role, cmd); return
-    if cmd == 'logs': show_logs(role); return
+    if cmd == 'logs':
+        lines = 50
+        if argv and argv[0].isdigit(): lines = int(argv.pop(0))
+        show_logs(role, lines); return
+    if cmd == 'logs-clean':
+        removed = 0
+        for item in log_files(role):
+            if item.name == role + '.log': continue
+            item.unlink(missing_ok=True); removed += 1
+        print(json.dumps({'removed': removed}, ensure_ascii=False)); return
     if cmd == 'diagnose': print(json.dumps(diagnostics_report(role), ensure_ascii=False, indent=2)); return
     if cmd == 'backups': print(json.dumps([{k: str(v) if k == 'path' else v for k, v in item.items()} for item in list_backups()], ensure_ascii=False, indent=2)); return
     if cmd == 'restore':
@@ -1191,7 +1304,7 @@ def run(argv=None):
         return
     if cmd == 'install': install(role); return
     if cmd == 'uninstall': uninstall(role); return
-    if cmd in ('upgrade','update'): upgrade(role); return
+    if cmd in ('upgrade','update'): upgrade(role, argv[0] if argv else None); return
     if cmd == 'configure': (configure_server if role == 'frps' else profile_wizard)(); return
     if cmd == 'import': import_external(role); return
     if cmd == 'menu':

@@ -48,6 +48,37 @@ class ManagerTests(unittest.TestCase):
         with patch.object(m,'service',return_value='active'),patch.object(m,'firewall_hint',return_value=[]):
             report=m.diagnostics_report('frps')
         self.assertEqual(report['component'],'frps');self.assertTrue(report['checks'][0]['ok']);self.assertNotIn('token',json.dumps(report))
+    def test_upgrade_rejects_unsupported_version(self):
+        with self.assertRaises(ValueError): m.upgrade('frps', 'v9.9.9')
+    def test_upgrade_rollback_on_installer_failure(self):
+        m.atomic(m.ROOT/'frps.toml', m.toml({'bindPort':7000}))
+        with patch.object(m,'confirm',return_value=True), patch.object(m,'running',return_value=False), patch.object(m.subprocess,'run') as run, patch.object(m,'installed_version',return_value='0.72.0'):
+            run.return_value = type('R',(),{'returncode':1,'stdout':'','stderr':'boom'})()
+            with patch.object(Path,'exists',return_value=True):
+                with self.assertRaises(ValueError): m.upgrade('frps')
+        self.assertEqual(m.read_toml(m.ROOT/'frps.toml')['bindPort'], 7000)
+    def test_logs_menu_cleans_rotated_only(self):
+        (m.ROOT/'logs').mkdir(exist_ok=True)
+        current=m.ROOT/'logs'/'frps.log'; current.write_text('current\n')
+        rotated=m.ROOT/'logs'/'frps.log.123'; rotated.write_text('old\n')
+        with patch.object(m,'clear_screen'),patch.object(m,'pause'),patch('builtins.input',side_effect=['3','0']):
+            m.logs_menu('frps')
+        self.assertTrue(current.exists()); self.assertFalse(rotated.exists())
+    def test_show_logs_line_limit(self):
+        (m.ROOT/'logs').mkdir(exist_ok=True)
+        (m.ROOT/'logs'/'frpc.log').write_text('\n'.join(f'line{i}' for i in range(100)))
+        out=io.StringIO()
+        with contextlib.redirect_stdout(out): m.show_logs('frpc', 10)
+        shown=out.getvalue()
+        self.assertIn('line99', shown); self.assertNotIn('line80', shown)
+    def test_profile_transport_and_log_fields_render(self):
+        pid=self.create(); p=m.load_profile(pid); p.update({'transport_protocol':'kcp','log_level':'warn','log_max_days':7,'transport_use_encryption':True})
+        m.atomic(m.pdir(pid)/'profile.toml', m.toml(p))
+        rendered=m.render(pid)
+        self.assertIn('transport.protocol = "kcp"', rendered)
+        self.assertIn('log.level = "warn"', rendered)
+        self.assertIn('log.maxDays = 7', rendered)
+        self.assertIn('transport.useEncryption = true', rendered)
     def test_backup_captures_pre_change_state(self):
         pid=self.create();m.set_current(pid)
         m.save_mappings(pid,[self.mapping()])
@@ -185,11 +216,19 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(m.read_toml(m.ROOT / 'frps.toml')['bindPort'], 7000)
     def test_unknown_log_import_is_not_dropped(self):
         pid = self.create(); m.set_current(pid); m.apply(pid)
-        external = m.render(pid).replace('log.maxDays = 30', 'log.maxDays = 7')
+        external = m.render(pid).replace('log.maxDays = 30', 'log.maxDays = 7\nlog.timestampFormat = "2006"')
         m.atomic(m.ROOT / 'frpc.toml', external)
         with patch('builtins.input', return_value='1'):
             with self.assertRaises(ValueError): m.import_external('frpc')
         self.assertEqual((m.ROOT / 'frpc.toml').read_text(), external)
+    def test_log_and_transport_import_roundtrip(self):
+        pid = self.create(); m.set_current(pid); m.apply(pid)
+        external = m.render(pid).replace('log.maxDays = 30', 'log.maxDays = 7').replace('transport.protocol = "tcp"', 'transport.protocol = "kcp"')
+        m.atomic(m.ROOT / 'frpc.toml', external)
+        with patch('builtins.input', return_value='1'): m.import_external('frpc')
+        p = m.load_profile(pid)
+        self.assertEqual(p['log_max_days'], 7); self.assertEqual(p['transport_protocol'], 'kcp')
+        self.assertIn('transport.protocol = "kcp"', m.render(pid))
     def test_connection_timeout_is_bounded(self):
         pid = self.create()
         with patch.object(m, 'connection', return_value={'state':'connecting'}), patch.object(m.time, 'monotonic', side_effect=[0, 30]), patch.object(m.time, 'sleep') as sleeper:

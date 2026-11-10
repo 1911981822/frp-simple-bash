@@ -59,7 +59,9 @@ try {
     # The downloaded installer is a .ps1 on disk, which the host execution policy
     # (Restricted/RemoteSigned) may block. Spawn a child PowerShell that bypasses
     # the policy for this file only, mirroring the .cmd launcher.
-    & powershell.exe -ExecutionPolicy Bypass -NoProfile -NoLogo -File $installer -Component 'frps' -Version $Version -WinSWSha256 $WinSWSha256
+    $childArgs = @('-Component', 'frps', '-Version', $Version)
+    if ($WinSWSha256) { $childArgs += @('-WinSWSha256', $WinSWSha256) }
+    & powershell.exe -ExecutionPolicy Bypass -NoProfile -NoLogo -File $installer @childArgs
     if ($LASTEXITCODE -ne 0) { throw ('Installer exited with code ' + $LASTEXITCODE) }
 } finally {
     if ($temporary) {

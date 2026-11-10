@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""frp-simple-bash shared management engine; requires Python >= 3.11."""
+"""frp-simple-bash shared management engine; requires Python >= 3.6."""
 import contextlib
 import datetime as dt
 import hashlib
@@ -26,8 +26,12 @@ import base64
 import socket
 
 VERSION = '0.72.0'
+# Manager release version (the management scripts themselves, not the frp binary).
+# Bumped on every published release; upgrade() pulls exactly this bundle.
+MANAGER_RELEASE_VERSION = 'v0.1.14-ui.1'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
+INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
 TEST = os.environ.get('FRP_TEST_MODE') == '1'
 
 def unlink_quiet(path):
@@ -1386,35 +1390,99 @@ def uninstall(role):
 
 SUPPORTED_VERSIONS = ('0.72.0',)
 
-def installed_version(role):
+def installed_frp_version(role):
+    """Version of the frp native binary."""
     try:
         result = run_cmd([str(binary(role)), '--version'], capture_output=True, text=True, timeout=10)
         value = (result.stdout or result.stderr).strip().splitlines()
         return value[0].strip() if value else 'unknown'
     except (OSError, subprocess.SubprocessError): return 'unknown'
 
+def installed_manager_version():
+    """Version of the management scripts, read from the installed bootstrap."""
+    marker = INSTALL_ROOT / ('install-' + ('frpc' if os.name != 'nt' else 'frpc') + ('.sh' if os.name != 'nt' else '.ps1'))
+    try:
+        text = marker.read_text(encoding='utf-8')
+        for line in text.splitlines():
+            if 'FRP_MANAGER_VERSION' in line or 'ManagerVersion' in line:
+                parts = line.split("'")
+                if len(parts) >= 2 and parts[1].startswith('v'):
+                    return parts[1]
+    except (OSError, ValueError):
+        pass
+    return 'unknown'
+
+def _https_get(url, timeout=60):
+    req = urllib.request.Request(url, headers={'User-Agent': 'frp-simple-bash/' + MANAGER_RELEASE_VERSION})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
 def upgrade(role, target=None):
-    current = installed_version(role)
-    print('[升级] 当前 frp 版本：' + current)
-    print('[升级] 管理器支持版本：' + '、'.join(SUPPORTED_VERSIONS))
-    if target and target.lstrip('v') not in SUPPORTED_VERSIONS:
-        raise ValueError(f'版本 {target} 未经配置和 SHA256 验证，拒绝升级。已支持：{", ".join(SUPPORTED_VERSIONS)}')
-    if not confirm(f'重新安装并校验 frp {SUPPORTED_VERSIONS[-1]}（保留配置和备份）？'): return
-    script = Path(__file__).resolve().parent.parent / ('install-' + role + ('.ps1' if os.name == 'nt' else '.sh'))
-    if not script.exists(): raise ValueError('安装脚本未安装，无法升级')
-    before = installed_version(role)
-    backup_dir = backup([ROOT / (role + '.toml')], 'pre-upgrade')
-    args = ['powershell', '-File', str(script), '-Version', 'v' + SUPPORTED_VERSIONS[-1]] if os.name == 'nt' else ['bash', str(script), '--version', 'v' + SUPPORTED_VERSIONS[-1]]
-    result = run_cmd(args, capture_output=True, text=True)
-    after = installed_version(role)
-    if result.returncode != 0:
-        result_error('升级失败，正在恢复配置备份。')
-        restore_backup(backup_dir)
-        if running(role): service(role, 'start')
-        raise ValueError('升级脚本失败；配置已从备份恢复。原始输出末尾：' + (result.stderr or result.stdout).strip()[-500:])
-    result_ok(f'升级完成：{before} → {after}；配置备份：{backup_dir.name}')
-    if running(role) and not service(role, 'status').lower() in ('active', 'started', 'running'):
-        result_error('服务未恢复运行，请检查日志。')
+    """Update the management scripts (manager itself) from a published release bundle.
+
+    Preserves the frp native binary and the user configuration. Only manager files
+    are overwritten. The frp binary version stays at SUPPORTED_VERSIONS[-1].
+    """
+    before = installed_manager_version()
+    print('[升级] 当前管理器版本：' + before)
+    print('[升级] 当前 frp 二进制版本：' + installed_frp_version(role))
+    target = target or MANAGER_RELEASE_VERSION
+    if not target.startswith('v') or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-' for c in target):
+        raise ValueError('非法的管理器版本号：' + str(target))
+    print('[升级] 将更新管理器至：' + target)
+    if not confirm('更新管理器脚本（保留 frp 二进制与配置）？'): return
+    mirror = os.environ.get('FRP_MIRROR_URL', 'https://download.sueiyuan.top').rstrip('/')
+    if mirror in ('', 'off', 'OFF'):
+        mirror = 'https://download.sueiyuan.top'
+    try:
+        bundle_url = f'{mirror}/frp-simple-bash/releases/{target}/source.tar.gz'
+        sha_url = f'{mirror}/frp-simple-bash/releases/{target}/SHA256SUMS.txt'
+        bundle = _https_get(bundle_url)
+        manifest = _https_get(sha_url).decode('utf-8', 'replace')
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        raise ValueError('无法下载管理器发布包：' + str(exc))
+    expected = ''
+    for line in manifest.splitlines():
+        cols = line.split()
+        if len(cols) == 2 and cols[1] in ('source.tar.gz', '*source.tar.gz'):
+            expected = cols[0]
+            break
+    if not expected or len(expected) != 64:
+        raise ValueError('发布包清单中没有有效的 source.tar.gz SHA256。')
+    actual = hashlib.sha256(bundle).hexdigest()
+    if actual != expected:
+        raise ValueError('管理器发布包 SHA256 不匹配，已拒绝更新。')
+    # Extract manager files only; never touch the frp binary or config.
+    import tarfile, io as _io
+    manager_files = ('lib/manager.py', 'lib/download.sh', 'install-common.sh',
+                     'install-frps.sh', 'install-frpc.sh', 'install-frps.ps1', 'install-frpc.ps1',
+                     'uninstall.sh', 'uninstall-frps.ps1', 'uninstall-frpc.ps1', 'uninstall-windows.ps1')
+    with tarfile.open(fileobj=_io.BytesIO(bundle), mode='r:gz') as tar:
+        members = tar.getmembers()
+        if not any(m.name == 'frp-simple-bash/' + manager_files[0] for m in members):
+            raise ValueError('发布包结构异常，未找到 lib/manager.py。')
+        for m in members:
+            rel = m.name[len('frp-simple-bash/'):] if m.name.startswith('frp-simple-bash/') else m.name
+            dest = None
+            if rel in manager_files:
+                dest = INSTALL_ROOT / rel
+            elif rel.startswith('bin/'):
+                dest = INSTALL_ROOT / rel
+            elif rel.startswith('templates/'):
+                dest = INSTALL_ROOT / rel
+            if dest is None:
+                continue
+            if not str(dest.resolve()).startswith(str(INSTALL_ROOT.resolve()) + '/'):
+                raise ValueError('发布包路径越界：' + rel)
+            data = tar.extractfile(m).read() if m.isfile() else b''
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(str(dest) + '.new', 'wb') as fh:
+                fh.write(data)
+            os.replace(str(dest) + '.new', str(dest))
+            os.chmod(str(dest), 0o755 if rel.endswith('.sh') or rel.endswith('.ps1') else 0o644)
+    after = installed_manager_version()
+    result_ok(f'管理器已更新：{before} → {after}。配置与 frp 二进制「{installed_frp_version(role)}」保持不变；下次运行 {role} 即生效。')
+
 
 def run(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -1422,7 +1490,7 @@ def run(argv=None):
     role = argv.pop(0); initialize()
     cmd = argv.pop(0) if argv else 'menu'
     if cmd == 'status': print(json.dumps(status(role), ensure_ascii=False, indent=2)); return
-    if cmd == 'version': print(json.dumps({'manager': VERSION, 'frp': installed_version(role), 'supported': list(SUPPORTED_VERSIONS)}, ensure_ascii=False)); return
+    if cmd == 'version': print(json.dumps({'manager': installed_manager_version(), 'frp': installed_frp_version(role), 'supported_frp': list(SUPPORTED_VERSIONS)}, ensure_ascii=False)); return
     if cmd == 'path': print(f'{ROOT}\n{binary(role)}'); return
     if cmd in ('start','stop','restart'):
         if role == 'frpc': require_active()
@@ -1457,7 +1525,7 @@ def run(argv=None):
         return
     if cmd == 'install': install(role); return
     if cmd == 'uninstall': uninstall(role); return
-    if cmd in ('upgrade','update'): upgrade(role, argv[0] if argv else None); return
+    if cmd in ('upgrade','update'): upgrade(role); return
     if cmd == 'configure': (configure_server if role == 'frps' else profile_wizard)(); return
     if cmd == 'import': import_external(role); return
     if cmd == 'menu':

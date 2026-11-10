@@ -36,6 +36,16 @@ def build(version=DEFAULT_VERSION):
             with tarfile.open(fileobj=compressed, mode='w') as tar:
                 for name, path in files:
                     data=path.read_bytes()
+                    # Pin the manager release version so upgrade() pulls exactly this bundle.
+                    if name == 'lib/manager.py':
+                        pattern = b"MANAGER_RELEASE_VERSION = '"
+                        idx = data.find(pattern)
+                        if idx < 0:
+                            raise ValueError('Could not find MANAGER_RELEASE_VERSION in manager.py')
+                        end = data.find(b"'", idx + len(pattern))
+                        if end < 0:
+                            raise ValueError('Malformed MANAGER_RELEASE_VERSION line')
+                        data = data[:idx + len(pattern)] + version.encode('ascii') + data[end:]
                     entry=tarfile.TarInfo('frp-simple-bash/' + name)
                     entry.size=len(data); entry.mtime=int(time.time()); entry.uid=entry.gid=0
                     entry.mode=0o755 if path.stat().st_mode & 0o111 else 0o644

@@ -370,36 +370,76 @@ def switch(pid):
         if was_running: service('frpc', 'start'); wait_connection(pid)
         else: print('已切换当前配置，frpc 保持停止。')
 
-def ask(prompt, default=None, secret=False):
-    suffix = f'（直接回车使用 {default}）' if default is not None else ''
-    if secret:
-        import getpass
-        v = getpass.getpass(prompt + suffix + '：')
-    else: v = input(prompt + suffix + '：')
-    return default if not v and default is not None else v
+RULE = '━' * 46
+CANCEL_KEYS = ('q', 'Q')
+UI_CLEAR = os.environ.get('FRP_UI_CLEAR') == '1'
 
-def confirm(prompt): return ask(prompt + ' [y/N]').lower() in ('y', 'yes')
+def ask(prompt, default=None, secret=False, example=None):
+    """Prompt once. 'q' cancels the current operation and returns None."""
+    hint = ''
+    if example: hint += f'（例：{example}）'
+    if default is not None: hint += f'（回车使用 {default}）'
+    if secret: hint += '（输入不回显）'
+    while True:
+        try:
+            if secret:
+                import getpass
+                v = getpass.getpass(f'\n  {prompt}{hint}：')
+            else:
+                v = input(f'\n  {prompt}{hint}：')
+        except EOFError:
+            return None
+        v = v.strip()
+        if v in CANCEL_KEYS:
+            print('  [提示] 已取消当前操作。')
+            return None
+        if not v and default is not None: return default
+        if v or default is None: return v
+
+def confirm(prompt, danger=False):
+    if danger:
+        answer = ask(f'{prompt}（确认请输入 YES，其他内容取消）')
+        return (answer or '').strip() == 'YES'
+    return (ask(prompt + ' [y/N]') or '').lower() in ('y', 'yes')
 
 def clear_screen():
-    if sys.stdout.isatty(): print('\033[2J\033[H', end='')
+    if UI_CLEAR and sys.stdout.isatty(): print('\033[2J\033[H', end='')
+
+def section(title):
+    print()
+    print(RULE)
+    print(' ' + title)
+    print(RULE)
 
 def pause(message='按回车返回上一级菜单'):
     if sys.stdin.isatty():
-        print('\n' + '─' * 42)
-        input(message + '：')
+        try: input(f'  {message} … ')
+        except EOFError: pass
 
-def result_ok(message): print(f'\n[成功] {message}')
-def result_info(message): print(f'\n[提示] {message}')
-def result_error(message): print(f'\n[失败] {message}')
+def result_ok(message, detail=None):
+    print(f'\n[成功] {message}')
+    if detail:
+        for line in str(detail).splitlines(): print('       ' + line)
 
-def choose(items, title='请选择'):
-    print('\n[菜单] ' + title)
-    for n, item in enumerate(items, 1): print(f'  {n}. {item}')
-    print('  0. 返回上一级')
+def result_info(message, detail=None):
+    print(f'\n[提示] {message}')
+    if detail:
+        for line in str(detail).splitlines(): print('       ' + line)
+
+def result_error(message, hint=None):
+    print(f'\n[失败] {message}')
+    if hint:
+        for line in str(hint).splitlines(): print('       建议：' + line)
+
+def choose(items, title='请选择', back_label='返回上一级'):
+    section(title)
+    for n, item in enumerate(items, 1): print(f'  {n}) {item}')
+    print(f'  0) {back_label}')
     while True:
-        v = ask('请输入编号 > ')
+        v = ask(f'请选择 [0-{len(items)}]')
+        if v is None: return None
         if v.isdecimal() and 0 <= int(v) <= len(items): return int(v)
-        result_error('无效编号，请输入列表中的数字。')
+        result_error('无效编号', f'请输入 0 到 {len(items)} 之间的数字，输入 q 取消。')
 
 def require_active():
     pid = active()
@@ -1023,41 +1063,66 @@ def status(role):
     if role == 'frpc' and active(): result.update({'active_profile': load_profile(active()), 'connection': connection(active()), 'pending': state().get('pending', False)})
     return result
 
+def status_bar(role, data):
+    """One-line compact status shown above every menu."""
+    states = {'active': '运行中', 'running': '运行中', 'started': '运行中', 'stopped': '已停止', 'inactive': '已停止', 'failed': '异常', 'unknown': '未知'}
+    state_text = states.get(str(data.get('service_state', '')).lower(), data.get('service_state', '未知'))
+    parts = [role, state_text, str(data.get('version', ''))]
+    if role == 'frps':
+        try:
+            config = read_toml(ROOT / 'frps.toml')
+            parts.append('监听 ' + str(config.get('bindAddr', '0.0.0.0')) + ':' + str(config.get('bindPort', 7000)))
+            web = config.get('webServer', {})
+            if web.get('port'):
+                parts.append('Dashboard ' + str(web.get('addr', '127.0.0.1')) + ':' + str(web['port']))
+        except (ValueError, OSError):
+            parts.append('配置未就绪')
+    else:
+        profile = data.get('active_profile')
+        if profile:
+            translations = {'connected': '已连接', 'connecting': '连接中', 'stopped': '已停止', 'unknown': '待确认', 'proxy-error': '映射异常', 'auth-failed': '认证失败', 'tls-failed': 'TLS 失败'}
+            conn = data.get('connection', {}).get('state', '')
+            parts += [label(profile), translations.get(conn, conn), str(len(mappings(profile['id']))) + ' 个映射']
+        else:
+            parts.append('未选择服务端')
+    if data.get('pending'):
+        parts.append('有待重启修改')
+    print('  ' + ' | '.join(str(p) for p in parts if p))
+
 def show_status(role):
     data = status(role)
     states = {'active': '运行中', 'running': '运行中', 'started': '运行中', 'stopped': '已停止', 'inactive': '已停止', 'failed': '异常', 'unknown': '未知', 'activating': '启动中'}
-    print('\n' + ('frps 服务端管理' if role == 'frps' else 'frpc 客户端管理'))
-    print('─' * 42)
-    print('运行状态：' + states.get(data['service_state'].lower(), data['service_state']))
-    print('frp 版本：' + data['version'])
-    print('配置路径：' + data['config_path'])
+    section('frps 服务端管理' if role == 'frps' else 'frpc 客户端管理')
+    print('  ' + '状态'.ljust(10) + states.get(data['service_state'].lower(), data['service_state']))
+    print('  ' + '版本'.ljust(10) + data['version'])
+    print('  ' + '配置文件'.ljust(10) + data['config_path'])
     if role == 'frps':
         path = ROOT / 'frps.toml'
         if path.exists():
             config = read_toml(path)
             host = config.get('bindAddr', '0.0.0.0')
             if ':' in host: host = '[' + host + ']'
-            print(f'业务监听：{host}:{config.get("bindPort", 7000)}')
+            print('  ' + '监听'.ljust(10) + str(host) + ':' + str(config.get('bindPort', 7000)))
             web = config.get('webServer', {})
             if web.get('port'):
                 addr = web.get('addr', '127.0.0.1')
                 if ':' in addr: addr = '[' + addr + ']'
                 scheme = 'https' if web.get('tls', {}).get('certFile') else 'http'
-                print(f'Dashboard：{scheme}://{addr}:{web["port"]}')
+                print('  ' + 'Dashboard'.ljust(10) + scheme + '://' + str(addr) + ':' + str(web['port']))
                 if web.get('addr', '127.0.0.1') in ('127.0.0.1', '::1'):
-                    print('管理访问：仅本机；终端菜单可正常查询客户端信息')
-            else: print('Dashboard：未启用')
-        else: print('配置状态：未配置')
+                    print('  ' + '管理访问'.ljust(10) + '仅本机')
+            else: print('  ' + 'Dashboard'.ljust(10) + '未启用')
+        else: print('  ' + '状态说明'.ljust(10) + '尚未生成配置，请先修改服务端配置')
     else:
         p = data.get('active_profile')
-        print('当前服务端：' + (label(p) if p else '未选择'))
+        print('  ' + '服务端'.ljust(10) + (label(p) if p else '未选择'))
         if p:
             translations = {'connected': '已连接', 'connecting': '连接中', 'stopped': '已停止', 'unknown': '待确认', 'proxy-error': '映射异常', 'auth-failed': '认证失败', 'tls-failed': 'TLS 失败', 'timeout': '连接超时'}
             connection_data = data['connection']
-            print('连接状态：' + translations.get(connection_data['state'], connection_data['state']))
-            print('映射数量：' + str(len(mappings(p['id']))))
-            if data.get('pending'): print('配置生效：有修改等待重启')
-    print('─' * 42)
+            print('  ' + '连接状态'.ljust(10) + translations.get(connection_data['state'], connection_data['state']))
+            print('  ' + '映射数量'.ljust(10) + str(len(mappings(p['id']))))
+            if data.get('pending'): print('  ' + '生效'.ljust(10) + '有修改等待重启')
+    print(RULE)
     return data
 
 def service_feedback(role, action):
@@ -1082,7 +1147,8 @@ def main_menu(role):
         if role == 'frpc':
             items = ['查看当前状态', '启动 frpc', '停止 frpc', '重启 frpc', '新建 frps 服务端', '查看服务端列表', '切换当前 frps 服务端', '修改当前 frps 配置', f'修改当前 frps（{alias}）端口映射', '查看日志与连接诊断', '备份与恢复配置', '设置/取消开机自启动', '卸载 frpc', '升级 frpc']
         else: items = ['查看服务信息（状态、版本、路径）', '启动 frps', '停止 frps', '重启 frps', '查看客户端连接信息', '修改服务端配置', '查看日志', '连接诊断', '备份与恢复配置', '设置/取消开机自启动', '卸载 frps', '升级 frps']
-        n = choose(items)
+        status_bar(role, data)
+        n = choose(items, '请选择操作' if role == 'frps' else 'frpc 客户端操作', '退出')
         if not n: return
         try:
             if role == 'frpc':

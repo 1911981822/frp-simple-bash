@@ -22,7 +22,7 @@ $native = Join-Path $root 'native'
 $bin = Join-Path $root 'bin'
 $services = Join-Path $root 'services'
 $repo = 'https://raw.githubusercontent.com/1911981822/frp-simple-bash/main'
-$ManagerVersion = 'v0.1.7-profile.1'
+$ManagerVersion = 'v0.1.8-ux.1'
 $mirror = if (Test-Path Env:FRP_MIRROR_URL) { [string]$env:FRP_MIRROR_URL } else { 'https://download.sueiyuan.top' }
 if ($mirror -eq 'off') { $mirror = '' }
 if ($mirror -and $mirror -notmatch '^https://') { throw 'Mirror URL must use HTTPS, or be empty/off.' }
@@ -36,7 +36,7 @@ function Get-HttpsFile([string]$Url, [string]$Destination) {
         $request.AllowAutoRedirect = $false
         $request.Timeout = 120000
         $request.ReadWriteTimeout = 120000
-        $request.UserAgent = 'frp-simple-bash/v0.1.7-profile.1'
+        $request.UserAgent = 'frp-simple-bash/v0.1.8-ux.1'
         $response = $request.GetResponse()
         try {
             $status = [int]$response.StatusCode

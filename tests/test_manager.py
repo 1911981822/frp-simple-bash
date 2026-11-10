@@ -30,6 +30,58 @@ class ManagerTests(unittest.TestCase):
         proxies={'total':1,'items':[{'name':'web','spec':{'type':'tcp'},'status':{'phase':'online','todayTrafficIn':1,'todayTrafficOut':2,'curConns':3}}]}
         with patch.object(m,'api',side_effect=[clients,proxies]), contextlib.redirect_stdout(io.StringIO()) as output: m.server_clients()
         shown=output.getvalue();self.assertIn('内网机器 [在线]',shown);self.assertIn('代理数量=2',shown);self.assertIn('web [online]',shown);self.assertNotIn('password',shown)
+    def test_backup_and_restore_roundtrip(self):
+        pid=self.create();m.set_current(pid);m.save_mappings(pid,[self.mapping()])
+        directory=m.backup(m.managed_paths(),'test-snapshot')
+        self.assertTrue((directory/'manifest.json').exists())
+        m.save_mappings(pid,[])
+        self.assertEqual(m.mappings(pid),[])
+        restored=m.restore_backup(directory)
+        self.assertTrue(restored)
+        self.assertEqual([x['name'] for x in m.mappings(pid)],['ssh'])
+    def test_restore_rejects_tampered_manifest(self):
+        pid=self.create();directory=m.backup(m.managed_paths(),'test')
+        m.save_json(directory/'manifest.json',{'files':['../../escape']})
+        with self.assertRaises(ValueError):m.restore_backup(directory)
+    def test_diagnostics_report_machine_readable(self):
+        m.atomic(m.ROOT/'frps.toml',m.toml({'bindPort':7000}))
+        with patch.object(m,'service',return_value='active'),patch.object(m,'firewall_hint',return_value=[]):
+            report=m.diagnostics_report('frps')
+        self.assertEqual(report['component'],'frps');self.assertTrue(report['checks'][0]['ok']);self.assertNotIn('token',json.dumps(report))
+    def test_backup_captures_pre_change_state(self):
+        pid=self.create();m.set_current(pid)
+        m.save_mappings(pid,[self.mapping()])
+        # Backup is taken before writing, so newest backup holds the empty pre-change mappings.
+        newest=m.list_backups()[0]
+        self.assertIn(f'profiles/{pid}/mappings.toml',newest['files'])
+        self.assertEqual(tomllib.loads((newest['path']/f'profiles/{pid}/mappings.toml').read_text()).get('mappings',[]),[])
+        m.save_mappings(pid,[])
+        previous=m.list_backups()[0]
+        m.restore_backup(previous['path'])
+        self.assertEqual([x['name'] for x in m.mappings(pid)],['ssh'])
+    def test_backup_menu_lists_and_cancels(self):
+        pid=self.create();m.set_current(pid);m.save_mappings(pid,[self.mapping()])
+        with patch.object(m,'clear_screen'),patch.object(m,'pause'),patch.object(m,'confirm',return_value=False),patch('builtins.input',side_effect=['1','0']):
+            m.backup_menu()
+        self.assertEqual([x['name'] for x in m.mappings(pid)],['ssh'])
+    def test_nested_toml_roundtrip(self):
+        data={'bindPort':7000,'auth':{'method':'token','token':'abcdefgh'},'webServer':{'addr':'127.0.0.1','port':7500,'user':'admin','password':'pw'},'proxies':[{'name':'a','type':'tcp','localPort':80,'remotePort':6000}]}
+        parsed=tomllib.loads(m.toml(data));self.assertEqual(parsed,data)
+    def test_frps_config_validation_and_redaction(self):
+        m.atomic(m.ROOT/'frps.toml',m.toml({'bindPort':7000,'auth':{'method':'token','token':'supersecret'},'webServer':{'addr':'127.0.0.1','port':7500,'user':'admin','password':'pw'}}))
+        data=m.read_frps_config();m.validate_frps_config(data)
+        with self.assertRaises(ValueError):m.validate_frps_config({'bindPort':70000})
+        with self.assertRaises(ValueError):m.validate_frps_config({'bindPort':7000,'auth':{'method':'token','token':'short'}})
+        with self.assertRaises(ValueError):m.validate_frps_config({'bindPort':7000,'webServer':{'port':7500}})
+        out=io.StringIO()
+        with contextlib.redirect_stdout(out),patch('builtins.input',side_effect=['1','0']),patch.object(m,'clear_screen'),patch.object(m,'pause'):
+            m.frps_config_menu()
+        self.assertIn('******',out.getvalue());self.assertNotIn('supersecret',out.getvalue());self.assertNotIn('"pw"',out.getvalue())
+    def test_diagnostics_reports_unreachable(self):
+        m.atomic(m.ROOT/'frps.toml',m.toml({'bindPort':7000}))
+        with patch.object(m,'service',return_value='inactive'),patch.object(m,'firewall_hint',return_value=[]),contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertFalse(m.diagnostics('frps'))
+        self.assertIn('服务状态',out.getvalue())
     def test_server_menu_refreshes_once_and_hides_secrets(self):
         m.atomic(m.ROOT / 'frps.toml', m.toml({'bindPort':7000,'auth.token':'do-not-print-token','webServer.addr':'127.0.0.1','webServer.port':7500,'webServer.user':'admin','webServer.password':'do-not-print-password'}))
         output=io.StringIO()

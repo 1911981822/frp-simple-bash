@@ -99,7 +99,7 @@ curl -fsSL https://download.sueiyuan.top/frp-simple-bash/install-frps.sh -o inst
 sudo bash install-frps.sh
 ```
 
-客户端把脚本名改为 `install-frpc.sh`。单文件入口优先下载国内站点的固定管理器版本 `v0.1.5-menu-merge.1`，核对源码包 SHA256 后解压；国内源下载失败时回退 GitHub。原生 frp 与 WinSW 无论从何处下载，都必须符合内置的固定 SHA256。
+客户端把脚本名改为 `install-frpc.sh`。单文件入口优先下载国内站点的固定管理器版本 `v0.1.6-depth.1`，核对源码包 SHA256 后解压；国内源下载失败时回退 GitHub。原生 frp 与 WinSW 无论从何处下载，都必须符合内置的固定 SHA256。
 
 服务器下载受限时，可以先从官方渠道下载并上传对应的 0.72.0 安装包，再使用：
 
@@ -129,7 +129,7 @@ powershell -File .\install-frpc.ps1
 
 - `FRP_MIRROR_URL`：自定义 HTTPS 镜像根地址；显式设置为空或 `off` 禁用镜像。
 - `FRP_ARCHIVE_PATH`：Linux 本地 frp 包，始终校验固定 SHA256。
-- 源码发布包路径：`/frp-simple-bash/releases/v0.1.5-menu-merge.1/source.tar.gz`。
+- 源码发布包路径：`/frp-simple-bash/releases/v0.1.6-depth.1/source.tar.gz`。
 - 原生包路径：`/frp/v0.72.0/<官方文件名>`。
 - WinSW 路径：`/winsw/v2.12.0/WinSW-x64.exe`。
 
@@ -261,6 +261,7 @@ FRP_TEST_MODE=1 FRP_CONFIG_DIR=/tmp/frp-simple-demo bash bin/frpc
 - [下载镜像部署验证记录](<docs/下载镜像部署验证记录.md>)
 - [需求实现覆盖审计](<docs/需求实现覆盖审计.md>)
 - [终端交互界面设计](<docs/交互界面设计.md>)
+- [深度功能补齐记录](<docs/深度功能补齐记录.md>)
 - [项目结构与各文件功能说明](<docs/项目结构与功能说明.md>)
 - [需求文档](<docs/frp二次封装需求文档.md>)
 - [概要设计](<docs/frp二次封装概要设计文档.md>)

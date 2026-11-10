@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Download helpers: a successful HTTP transfer is not a successful checksum.
-FRP_MANAGER_VERSION='v0.1.9-ux2.1'
+FRP_MANAGER_VERSION='v0.1.15-ux.1'
 frp_mirror_url() {
   local value="${FRP_MIRROR_URL-https://download.sueiyuan.top}"
   case "$value" in ''|off|OFF) return 0 ;; esac
@@ -10,7 +10,7 @@ frp_mirror_url() {
 frp_fetch() {
   local url="$1" target="$2" partial="${2}.partial"
   case "$url" in https://*) ;; *) echo 'Refusing non-HTTPS download.' >&2; return 1 ;; esac
-  if curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 10 --max-time 1200 --retry 2 "$url" -o "$partial"; then
+  if curl --silent --show-error --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 10 --max-time 1200 --retry 2 "$url" -o "$partial"; then
     mv -f -- "$partial" "$target"
     return 0
   fi
@@ -24,7 +24,7 @@ frp_download_asset() {
     echo 'Downloaded from domestic mirror.' >&2
   elif frp_fetch "$official" "$target"; then
     echo 'Downloaded from official release.' >&2
-  elif [[ -n "$api_url" ]] && curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 10 --max-time 1200 --retry 2 -H 'Accept: application/octet-stream' "$api_url" -o "${target}.partial"; then
+  elif [[ -n "$api_url" ]] && curl --silent --show-error --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 10 --max-time 1200 --retry 2 -H 'Accept: application/octet-stream' "$api_url" -o "${target}.partial"; then
     mv -f -- "${target}.partial" "$target"
   else
     echo 'All download sources failed; no archive will be extracted.' >&2

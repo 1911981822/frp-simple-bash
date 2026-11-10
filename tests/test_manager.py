@@ -48,21 +48,20 @@ class ManagerTests(unittest.TestCase):
         with patch.object(m,'service',return_value='active'),patch.object(m,'firewall_hint',return_value=[]):
             report=m.diagnostics_report('frps')
         self.assertEqual(report['component'],'frps');self.assertTrue(report['checks'][0]['ok']);self.assertNotIn('token',json.dumps(report))
-    def test_upgrade_rejects_unsupported_version(self):
-        with self.assertRaises(ValueError): m.upgrade('frps', 'v9.9.9')
-    def test_upgrade_rollback_on_installer_failure(self):
+    def test_upgrade_rejects_malformed_version(self):
+        with patch.object(m,'confirm',return_value=True):
+            with self.assertRaises(ValueError): m.upgrade('frps', 'not-a-version!')
+    def test_upgrade_keeps_config_when_download_fails(self):
         m.atomic(m.ROOT/'frps.toml', m.toml({'bindPort':7000}))
-        with patch.object(m,'confirm',return_value=True), patch.object(m,'running',return_value=False), patch.object(m.subprocess,'run') as run, patch.object(m,'installed_version',return_value='0.72.0'):
-            run.return_value = type('R',(),{'returncode':1,'stdout':'','stderr':'boom'})()
-            with patch.object(Path,'exists',return_value=True):
-                with self.assertRaises(ValueError): m.upgrade('frps')
+        with patch.object(m,'confirm',return_value=True), patch.object(m,'_https_get',side_effect=OSError('offline')):
+            with self.assertRaises(ValueError): m.upgrade('frps')
         self.assertEqual(m.read_toml(m.ROOT/'frps.toml')['bindPort'], 7000)
     def test_logs_menu_cleans_rotated_only(self):
         (m.ROOT/'logs').mkdir(exist_ok=True)
         current=m.ROOT/'logs'/'frps.log'; current.write_text('current\n')
         rotated=m.ROOT/'logs'/'frps.log.123'; rotated.write_text('old\n')
-        with patch.object(m,'clear_screen'),patch.object(m,'pause'),patch('builtins.input',side_effect=['3','0']):
-            m.logs_menu('frps')
+        with patch.object(m,'clear_screen'),patch.object(m,'pause'),patch('builtins.input',side_effect=['4','0']):
+            m.logs_and_diagnostics_menu('frps')
         self.assertTrue(current.exists()); self.assertFalse(rotated.exists())
     def test_show_logs_line_limit(self):
         (m.ROOT/'logs').mkdir(exist_ok=True)

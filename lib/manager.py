@@ -28,7 +28,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v0.1.14-ui.1'
+MANAGER_RELEASE_VERSION = 'v0.1.15-ux.1'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -418,18 +418,36 @@ def connection(pid):
         return {'state': 'connecting', 'detail': f'管理 API 返回 HTTP {exc.code}'}
     except (OSError, ValueError): return {'state': 'connecting'}
 
-def wait_connection(pid):
-    deadline = time.monotonic() + 30
+def wait_connection(pid, timeout=30):
+    """Poll connection state with a visible countdown and actionable next steps."""
+    deadline = time.monotonic() + timeout
+    last = ''
     while True:
         result = connection(pid)
-        if result['state'] == 'connected': print('连接成功'); return True
-        if result['state'] in ('auth-failed', 'tls-failed'):
-            print('连接失败：' + result.get('detail', result['state']) + '；保留当前 profile。'); return False
-        if time.monotonic() >= deadline: print('连接检测超时（30 秒），保留新 profile；请检查认证、网络和日志。'); return False
-        time.sleep(min(2, deadline - time.monotonic()))
+        state = result['state']
+        if state == 'connected':
+            result_ok('已连接服务端。')
+            return True
+        if state in ('auth-failed', 'tls-failed'):
+            result_error('连接失败：' + result.get('detail', state) + '；保留当前 profile。',
+                         hint='排查：服务端的 token / TLS 配置；菜单「日志与连接诊断」→ 运行连接诊断。')
+            return False
+        remaining = max(0, int(deadline - time.monotonic()))
+        if remaining == 0:
+            result_error(f'连接检测超时（{timeout} 秒），保留新 profile。',
+                         hint=f'下一步：菜单「日志与连接诊断」→ 运行连接诊断 / 查看最近 50 行日志；检查服务端防火墙、安全组与地址端口。')
+            return False
+        if state != last:
+            print(f'  {_tag("[提示]")} 正在连接…（{state}），剩余 {remaining} 秒。')
+            last = state
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
 
 def switch(pid):
     with lock(), transaction():
+        previous = active()
+        try: old_label = label(load_profile(previous)) if previous else '（无）'
+        except (ValueError, OSError, KeyError, TypeError): old_label = '（无）'
+        new_label = label(load_profile(pid))
         load_profile(pid); content = render(pid); verify('frpc', content)
         was_running = running('frpc')
         if was_running and not confirm('切换将中断当前连接，确认继续？'): return
@@ -442,18 +460,104 @@ def switch(pid):
             if was_running: service('frpc', 'start')
             raise
         if was_running: service('frpc', 'start'); wait_connection(pid)
-        else: result_info('已切换当前配置，frpc 保持停止。')
+        else: result_info('已切换当前配置，frpc 保持停止。', detail=f'当前服务端：{old_label} → {new_label}')
 
-RULE = '━' * 46
 CANCEL_KEYS = ('q', 'Q')
-UI_CLEAR = os.environ.get('FRP_UI_CLEAR') == '1'
+BACK_KEYS = ('b', 'B')
 
-def ask(prompt, default=None, secret=False, example=None):
-    """Prompt once. 'q' cancels the current operation and returns None."""
+def _is_tty():
+    try: return sys.stdout.isatty()
+    except (AttributeError, ValueError): return False
+
+def _ui_width():
+    """Frame width follows the terminal; keeps narrow SSH sessions from wrapping."""
+    try: cols = shutil.get_terminal_size((80, 24)).columns
+    except (AttributeError, ValueError, OSError): cols = 80
+    cols = max(40, min(100, cols))
+    return max(28, cols - 6)
+
+RULE = '━' * _ui_width()
+# Colors only on a real terminal, and never when NO_COLOR is set (pipes/redirects).
+UI_COLOR = _is_tty() and not os.environ.get('NO_COLOR')
+# Clear by default on a terminal; FRP_UI_CLEAR=0 disables it.
+UI_CLEAR = _is_tty() and os.environ.get('FRP_UI_CLEAR') != '0'
+
+_COLORS = {'[成功]': '32', '[提示]': '36', '[失败]': '31'}
+
+def _tag(kind):
+    if UI_COLOR and kind in _COLORS:
+        return '\033[1;' + _COLORS[kind] + 'm' + kind + '\033[0m'
+    return kind
+
+def _display_width(text):
+    """Approximate terminal width: CJK/fullwidth count as 2; ANSI escapes as 0."""
+    width = 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == '\033' and i + 1 < len(text) and text[i + 1] == '[':
+            end = text.find('m', i + 2)
+            if end >= 0:
+                i = end + 1
+                continue
+        width += 2 if ord(ch) > 0x2E7F else 1
+        i += 1
+    return width
+
+def _wrap_text(text, width):
+    """Wrap by display width. Prefer breaking after whitespace/punctuation."""
+    import unicodedata
+    lines = []
+    for raw in str(text).splitlines() or ['']:
+        if not raw:
+            lines.append('')
+            continue
+        buf = ''
+        used = 0
+        last_break = -1  # index in buf of the last good break point
+        for ch in raw:
+            w = 2 if ord(ch) > 0x2E7F else 1
+            if used + w > width and buf:
+                cut = last_break + 1 if last_break >= 0 else len(buf)
+                lines.append(buf[:cut])
+                buf = buf[cut:]
+                used = _display_width(buf)
+                last_break = -1
+            buf += ch
+            used += w
+            if ch.isspace() or unicodedata.category(ch).startswith('P'):
+                last_break = len(buf) - 1
+        lines.append(buf)
+    return lines
+
+def _pad_line(text, width):
+    return text + ' ' * max(0, width - _display_width(text))
+
+def _box(kind, message, detail=None):
+    """Render a result inside a frame; long text wraps instead of overflowing."""
+    inner = _ui_width()
+    print()
+    print('┌' + '─' * inner + '┐')
+    wrapped = _wrap_text(kind + ' ' + message, inner - 2)
+    for pos, line in enumerate(wrapped):
+        shown = _tag(kind) + line[len(kind):] if pos == 0 and line.startswith(kind) else line
+        print('│' + _pad_line(' ' + shown, inner) + '│')
+    if detail:
+        for line in _wrap_text(str(detail), inner - 4):
+            print('│' + _pad_line('   ' + line, inner) + '│')
+    print('└' + '─' * inner + '┘')
+
+def ask(prompt, default=None, secret=False, example=None, allow_back=False):
+    """Prompt once. 'q' cancels the operation; 'b' (when allowed) goes one step back.
+
+    A required field (no default) can no longer be submitted empty.
+    """
     hint = ''
     if example: hint += f'（例：{example}）'
-    if default is not None: hint += f'（回车使用 {default}）'
-    if secret: hint += '（输入不回显）'
+    if default: hint += f'（回车使用 {default}）'
+    if secret: hint += '（输入不回显，留空请直接回车）'
+    if allow_back: hint += '（b 上一步）'
+    hint += '（q 取消）'
     while True:
         try:
             if secret:
@@ -465,47 +569,30 @@ def ask(prompt, default=None, secret=False, example=None):
             return None
         v = v.strip()
         if v in CANCEL_KEYS:
-            print('  [提示] 已取消当前操作。')
+            print('  ' + _tag('[提示]') + ' 已取消当前操作。')
             return None
+        if allow_back and v in BACK_KEYS:
+            return '__BACK__'
         if not v and default is not None: return default
-        if v or default is None: return v
+        if not v:
+            print('  ' + _tag('[提示]') + ' 此项不能为空，请重新输入。')
+            continue
+        return v
 
 def confirm(prompt, danger=False):
     if danger:
-        answer = ask(f'{prompt}（确认请输入 YES，其他内容取消）')
+        answer = ask(f'{prompt}（确认请输入 YES，其他内容或回车取消）')
         return (answer or '').strip() == 'YES'
-    return (ask(prompt + ' [y/N]') or '').lower() in ('y', 'yes')
+    return (ask(prompt + ' [y/N]（回车＝否）') or '').lower() in ('y', 'yes')
 
 def clear_screen():
-    if UI_CLEAR and sys.stdout.isatty(): print('\033[2J\033[H', end='')
+    if UI_CLEAR and _is_tty(): print('\033[2J\033[H', end='')
 
 def section(title):
     print()
     print(RULE)
     print(' ' + title)
     print(RULE)
-
-def _display_width(text):
-    """Approximate terminal width: CJK/fullwidth chars count as 2."""
-    width = 0
-    for ch in text:
-        width += 2 if ord(ch) > 0x2E7F else 1
-    return width
-
-def _pad_line(text, width):
-    pad = max(0, width - _display_width(text))
-    return text + ' ' * pad
-
-def _box(kind, message, detail=None):
-    """Render a result inside a frame so it stands out from plain menus."""
-    inner = 44
-    print()
-    print('┌' + '─' * inner + '┐')
-    print('│' + _pad_line(' ' + kind + ' ' + message, inner) + '│')
-    if detail:
-        for line in str(detail).splitlines():
-            print('│' + _pad_line('   ' + line, inner) + '│')
-    print('└' + '─' * inner + '┘')
 
 def pause(message='按回车返回上一级菜单'):
     if sys.stdin.isatty():
@@ -521,15 +608,22 @@ def result_info(message, detail=None):
 def result_error(message, hint=None):
     _box('[失败]', message, hint)
 
-def choose(items, title='请选择', back_label='返回上一级'):
+def choose(items, title='请选择', back_label='返回上一级', groups=None):
+    """Numbered menu with optional visual group headers (numbering stays continuous)."""
     section(title)
-    for n, item in enumerate(items, 1): print(f'  {n}) {item}')
+    idx = 0
+    for n, item in enumerate(items, 1):
+        if groups and (n - 1) in groups:
+            print()
+            print('  ' + groups[n - 1])
+        print(f'  {n}) {item}')
+        idx = n
     print(f'  0) {back_label}')
     while True:
-        v = ask(f'请选择 [0-{len(items)}]')
+        v = ask(f'请选择 [0-{idx}]')
         if v is None: return None
-        if v.isdecimal() and 0 <= int(v) <= len(items): return int(v)
-        result_error('无效编号', f'请输入 0 到 {len(items)} 之间的数字，输入 q 取消。')
+        if v.isdecimal() and 0 <= int(v) <= idx: return int(v)
+        result_error('无效编号', f'请输入 0 到 {idx} 之间的数字，输入 q 取消。')
 
 def require_active():
     pid = active()
@@ -554,18 +648,80 @@ def list_profiles():
     print(RULE)
 
 def profile_wizard():
-    p = {'name': ask('服务端名称'), 'server_addr': ask('服务端 IP/IPv6/域名'), 'server_port': port(ask('frps 业务端口', '7000')), 'dashboard_port': port(ask('Dashboard/API 管理端口', '7500')), 'tls_enable': ask('启用 TLS？[Y/n]', 'y').lower() != 'n', 'admin_port': 7400}
-    unique_name(p['name']); validate_profile(p)
-    s = {'token': ask('token（不使用时留空）', secret=True), 'admin_password': secrets.token_urlsafe(32), 'dashboard_username': ask('Dashboard 用户名（留空关闭远程查询）')}
-    s['dashboard_password'] = ask('Dashboard 密码', secret=True) if s['dashboard_username'] else ''
-    p['dashboard_addr'] = ask('Dashboard 主机地址', p['server_addr']) if s['dashboard_username'] else ''
+    """Step-by-step wizard with 'b' to go back and a review screen before commit."""
+    p = {'admin_port': 7400}
+    s = {'admin_password': secrets.token_urlsafe(32)}
+    # (key, prompt, default, secret, post-processor)
+    def checked_name(v):
+        unique_name(v)
+        return v
+    steps = [
+        ('name', '服务端名称', None, False, checked_name),
+        ('server_addr', '服务端 IP/IPv6/域名', None, False, address),
+        ('server_port', 'frps 业务端口', '7000', False, port),
+        ('dashboard_port', 'Dashboard/API 管理端口', '7500', False, port),
+        ('tls_enable', '启用 TLS？[Y/n]', 'y', False, lambda v: v.lower() != 'n'),
+        ('token', 'token（不使用时留空）', '', True, lambda v: v),
+        ('dashboard_username', 'Dashboard 用户名（留空关闭远程查询）', '', False, lambda v: v),
+    ]
+    i = 0
+    while i < len(steps):
+        key, prompt, default, secret, convert = steps[i]
+        value = ask(prompt, default=default, secret=secret, allow_back=(i > 0))
+        if value is None: return
+        if value == '__BACK__':
+            i -= 1
+            continue
+        try:
+            if key == 'token': s[key] = convert(value)
+            elif key == 'dashboard_username': s[key] = convert(value)
+            else: p[key] = convert(value)
+        except ValueError as exc:
+            result_error(str(exc))
+            continue
+        i += 1
+    # Dashboard sub-steps (only when a username was provided), also back-navigable.
+    dash_steps = [
+        ('dashboard_password', 'Dashboard 密码', '', True, lambda v: v),
+        ('dashboard_addr', 'Dashboard 主机地址', p['server_addr'], False, lambda v: v),
+        ('dashboard_scheme', 'Dashboard 协议 http/https', 'https', False, lambda v: v),
+    ]
     if s['dashboard_username']:
-        p['dashboard_scheme'] = ask('Dashboard 协议 http/https', 'https')
-        if p['dashboard_scheme'] == 'http' and not confirm('HTTP 会明文传输管理凭据，请使用可信网络或隧道，仍继续？'): return
-    if not confirm('确认创建 ' + label(p) + '？'): return
+        i = 0
+        while i < len(dash_steps):
+            key, prompt, default, secret, convert = dash_steps[i]
+            value = ask(prompt, default=default, secret=secret, allow_back=True)
+            if value is None: return
+            if value == '__BACK__':
+                if i == 0:
+                    # Step back into the main wizard's last field.
+                    back = ask('Dashboard 用户名（留空关闭远程查询）', default=s['dashboard_username'], allow_back=True)
+                    if back is None: return
+                    s['dashboard_username'] = back
+                    if not s['dashboard_username']:
+                        p.pop('dashboard_addr', None); p.pop('dashboard_scheme', None)
+                        break
+                    continue
+                i -= 1
+                continue
+            if key == 'dashboard_password': s[key] = convert(value)
+            else: p[key] = convert(value)
+            i += 1
+        if p.get('dashboard_scheme') == 'http' and not confirm('HTTP 会明文传输管理凭据，请使用可信网络或隧道，仍继续？'):
+            return
+    else:
+        p['dashboard_addr'] = ''
+        s['dashboard_password'] = ''
+    validate_profile(p)
+    section('确认创建')
+    profile_summary(p, s)
+    print('  0) 取消创建，返回修改')
+    if not confirm('以上信息确认无误，创建服务端？'):
+        result_info('已取消，未创建服务端。')
+        return
     pid = create_profile(p, s)
     if not active() or confirm('设为当前服务端？'): switch(pid)
-    result_ok('服务端已创建。端口映射请从主菜单「修改端口映射」单独设置。')
+    result_ok('服务端已创建。', detail=f'名称：{p["name"]}；地址：{p["server_addr"]}:{p["server_port"]}；端口映射请从主菜单「修改端口映射」单独设置。')
     if active() == pid and not running('frpc') and confirm('立即启动 frpc 并检查连接？'):
         service('frpc', 'start'); wait_connection(pid)
 
@@ -632,7 +788,7 @@ def backup_menu():
     while True:
         clear_screen()
         print('\n[菜单] 配置备份与恢复')
-        print('  ' + '─' * 38)
+        print('  ' + '─' * _ui_width())
         if items:
             for n, item in enumerate(items[:20], 1):
                 print(f'  {n}. {item["time"]}  {item["reason"]}  文件 {len(item["files"])} 个')
@@ -743,7 +899,7 @@ def diagnostics(role):
                 if m.get('type') in ('tcp', 'udp') and m.get('remote_port'):
                     if check_port_conflict('0.0.0.0', m['remote_port']): lines.append(f'  注意：远程端口 {m["remote_port"]} 在本机被占用（若服务端与本机不同可忽略）。')
     print('\n' + '\n'.join(lines))
-    print('  ' + '─' * 38)
+    print('  ' + '─' * _ui_width())
     if ok: result_ok('诊断通过。')
     else: result_error('诊断发现问题，请按建议处理。')
     return ok
@@ -758,6 +914,7 @@ def api_host(host): return '[' + host + ']' if ':' in host else host
 
 def save_mappings(pid, items):
     if pid != require_active(): raise ValueError('只能管理当前 profile 的映射')
+    before_count = len(mappings(pid))
     with lock(), transaction():
         if pid != active(): raise ValueError('当前服务端已在另一终端切换，请重新打开映射菜单')
         for m in items: validate_mapping(m)
@@ -766,21 +923,48 @@ def save_mappings(pid, items):
         try: mappings(pid); apply(pid)
         except Exception: atomic(path, old); raise
         s = state(); s['pending'] = True; save_json(ROOT / 'state.json', s); audit('mappings-saved', pid)
-    result_ok('端口映射配置已保存。' + ('当前 frpc 运行中，请按提示重启后生效。' if running('frpc') else '当前 frpc 未运行，下次启动时生效。'))
+    result_ok('端口映射配置已保存。',
+              detail=(f'映射数量：{before_count} → {len(items)}；'
+                      + ('当前 frpc 运行中，请按提示重启后生效。' if running('frpc') else '当前 frpc 未运行，下次启动时生效。')))
     if running('frpc') and confirm('配置已保存，立即重启 frpc 生效？'):
         service('frpc', 'restart'); wait_connection(pid)
         s = state(); s['pending'] = False; save_json(ROOT / 'state.json', s)
 
 def mapping_wizard(old=None):
+    """Step-by-step mapping wizard; returns None when cancelled with q."""
     m = dict(old or {})
-    m['name'] = ask('映射名称', m.get('name'))
-    m['type'] = ask('类型 tcp/udp/http/https', m.get('type', 'tcp'))
-    m['local_ip'] = ask('本地地址', m.get('local_ip', '127.0.0.1'))
-    m['local_port'] = port(ask('本地端口', str(m.get('local_port', ''))))
-    if m['type'] in ('tcp', 'udp'): m['remote_port'] = port(ask('远程端口', str(m.get('remote_port', '')))); m.pop('domain', None)
-    else: m['domain'] = ask('域名', m.get('domain')); m.pop('remote_port', None)
-    m['enabled'] = ask('启用？[Y/n]', 'y' if m.get('enabled', True) else 'n').lower() != 'n'
-    validate_mapping(m); return m
+    fields = [
+        ('name', '映射名称', None, lambda v: v),
+        ('type', '类型 tcp/udp/http/https', 'tcp', lambda v: v.lower()),
+        ('local_ip', '本地地址', '127.0.0.1', lambda v: v),
+        ('local_port', '本地端口', None, port),
+        ('remote_or_domain', '远程端口/域名', None, lambda v: v),
+        ('enabled', '启用？[Y/n]', 'y', lambda v: v.lower() != 'n'),
+    ]
+    i = 0
+    while i < len(fields):
+        key, prompt, default, convert = fields[i]
+        value = ask(prompt, default=default if default is not None else m.get(key),
+                    allow_back=(i > 0))
+        if value is None: return None
+        if value == '__BACK__':
+            i -= 1
+            continue
+        if key == 'remote_or_domain':
+            if m['type'] in ('tcp', 'udp'):
+                m['remote_port'] = port(value); m.pop('domain', None)
+            else:
+                m['domain'] = value; m.pop('remote_port', None)
+        else:
+            try: m[key] = convert(value)
+            except ValueError as exc:
+                result_error(str(exc)); continue
+        i += 1
+    try: validate_mapping(m)
+    except ValueError as exc:
+        result_error(str(exc))
+        return None
+    return m
 
 def show_mappings(items):
     if not items:
@@ -801,16 +985,30 @@ def mapping_menu():
         if not n: return
         try:
             items = mappings(pid)
-            if n == 1: items.append(mapping_wizard()); save_mappings(pid, items)
-            elif n == 2: show_mappings(items)
+            before_count = len(items)
+            if n == 1:
+                created = mapping_wizard()
+                if created is None: continue
+                items.append(created); save_mappings(pid, items); pause(); continue
+            elif n == 2: show_mappings(items); pause(); continue
             else:
                 index = choose([m['name'] + (' [启用]' if m.get('enabled', True) else ' [停用]') for m in items], '选择映射')
                 if not index: continue
-                if n == 3: items[index-1] = mapping_wizard(items[index-1])
-                elif n == 4: items[index-1]['enabled'] = not items[index-1].get('enabled', True)
-                elif not confirm('确认删除映射 ' + items[index-1]['name'] + '？'): result_info('已取消删除。'); continue
-                else: items.pop(index-1)
-                save_mappings(pid, items); result_ok('端口映射操作已完成。')
+                if n == 3:
+                    edited = mapping_wizard(items[index-1])
+                    if edited is None: continue
+                    items[index-1] = edited
+                elif n == 4:
+                    old_state = items[index-1].get('enabled', True)
+                    items[index-1]['enabled'] = not old_state
+                    result_info('已切换映射状态：' + ('启用 → 停用' if old_state else '停用 → 启用') + '。')
+                elif n == 5:
+                    name = items[index-1]['name']
+                    if not confirm('确认删除映射 ' + name + '？此操作不可撤销', danger=True):
+                        result_info('已取消删除。'); continue
+                    items.pop(index-1)
+                    result_info(f'已删除映射 {name}；映射数量：{before_count} → {len(items)}。')
+                save_mappings(pid, items); result_ok('端口映射操作已完成。', detail=f'映射数量：{before_count} → {len(items)}')
                 pause()
         except (ValueError, OSError, KeyError) as e: result_error(str(e)); pause()
 
@@ -824,7 +1022,7 @@ def profile_summary(p, s):
     print('  TLS：' + ('已启用' if p.get('tls_enable', True) else '未启用'))
     print('  token：' + ('已设置' if s.get('token') else '未设置'))
     print('  本地管理端口：' + str(p.get('admin_port', 7400)))
-    print('  映射数量：' + str(len(mappings(p['id']))))
+    print('  映射数量：' + str(len(mappings(p['id'])) if p.get('id') else 0))
 
 def edit_profile():
     clear_screen()
@@ -977,7 +1175,7 @@ def frps_config_menu():
         except (ValueError, OSError) as exc: result_error(str(exc)); pause(); return
         web = data.get('webServer', {})
         print('\n[菜单] frps 服务端配置')
-        print('  ' + '─' * 38)
+        print('  ' + '─' * _ui_width())
         print('  1. 查看当前配置（脱敏）')
         print('  2. 修改业务监听地址/端口')
         print('  3. 修改 token')
@@ -1224,6 +1422,22 @@ def show_status(role):
             print('  ' + '连接状态'.ljust(10) + translations.get(connection_data['state'], connection_data['state']))
             print('  ' + '映射数量'.ljust(10) + str(len(mappings(p['id']))))
             if data.get('pending'): print('  ' + '生效'.ljust(10) + '有修改等待重启')
+    # Surface only what needs attention; normal details stay compact.
+    concerns = []
+    state = str(data['service_state']).lower()
+    if state in ('failed', 'inactive', 'stopped'):
+        concerns.append('服务未运行，可先用「启动」或查看日志排查')
+    if role == 'frpc':
+        conn = data.get('connection', {}).get('state', '')
+        if conn in ('auth-failed', 'tls-failed', 'proxy-error', 'timeout', 'connecting'):
+            conn_labels = {'auth-failed': '认证失败', 'tls-failed': 'TLS 失败', 'proxy-error': '映射异常', 'timeout': '连接超时', 'connecting': '连接中'}
+            concerns.append('连接未就绪（' + conn_labels.get(conn, conn) + '）：检查 token / TLS / 服务端可达性')
+        if data.get('pending'):
+            concerns.append('有配置修改等待重启后生效')
+    if concerns:
+        print()
+        print('  ' + _tag('[提示]') + ' 需关注：')
+        for c in concerns: print('    - ' + c)
     print(RULE)
     return data
 
@@ -1248,9 +1462,12 @@ def main_menu(role):
             alias = '配置错误'
         if role == 'frpc':
             items = ['查看当前状态', '启动 frpc', '停止 frpc', '重启 frpc', '新建 frps 服务端', '查看服务端列表', '切换当前 frps 服务端', '修改当前 frps 配置', f'修改当前 frps（{alias}）端口映射', '查看日志与连接诊断', '备份与恢复配置', '设置/取消开机自启动', '卸载 frpc', '升级 frpc']
-        else: items = ['查看服务信息（状态、版本、路径）', '启动 frps', '停止 frps', '重启 frps', '查看客户端连接信息', '修改服务端配置', '查看日志与连接诊断', '备份与恢复配置', '设置/取消开机自启动', '卸载 frps', '升级 frps']
+            groups = {0: '── 服务控制 ──', 4: '── 服务端与映射 ──', 9: '── 运维 ──', 12: '── 危险操作 ──'}
+        else:
+            items = ['查看服务信息（状态、版本、路径）', '启动 frps', '停止 frps', '重启 frps', '查看客户端连接信息', '修改服务端配置', '查看日志与连接诊断', '备份与恢复配置', '设置/取消开机自启动', '卸载 frps', '升级 frps']
+            groups = {0: '── 服务控制 ──', 4: '── 配置与连接 ──', 6: '── 运维 ──', 9: '── 危险操作 ──'}
         status_bar(role, data)
-        n = choose(items, '请选择操作' if role == 'frps' else 'frpc 客户端操作', '退出')
+        n = choose(items, '请选择操作' if role == 'frps' else 'frpc 客户端操作', '退出', groups=groups)
         if not n: return
         try:
             if role == 'frpc':
@@ -1315,7 +1532,6 @@ def logs_and_diagnostics_menu(role):
     while True:
         clear_screen()
         files = log_files(role)
-        lines = [f'{f.name}  {f.stat().st_size} 字节' for f in files[:10]]
         n = choose(['查看最近 50 行日志', '查看最近 200 行日志', '查看日志目录与轮转策略', '清理轮转归档（保留当前日志）', '运行连接诊断', '导出诊断报告（JSON）'], '日志与连接诊断', '返回上一级')
         if not n: return
         if n == 1: show_logs(role, 50); pause()
@@ -1361,12 +1577,18 @@ def mapping_command(argv):
     pid = require_active(); items = mappings(pid); action = argv[0] if argv else 'menu'
     if action == 'list':
         print(json.dumps(items, ensure_ascii=False, indent=2)); return
-    if action == 'add': items.append(mapping_wizard()); save_mappings(pid, items); return
+    if action == 'add':
+        created = mapping_wizard()
+        if created is None: return
+        items.append(created); save_mappings(pid, items); return
     if action in ('edit', 'enable', 'disable', 'delete'):
         if len(argv) < 2: raise ValueError('需要映射名称：mapping ' + action + ' <name>')
         name_arg = argv[1]; index = next((i for i, item in enumerate(items) if item['name'] == name_arg), None)
         if index is None: raise ValueError('映射不存在：' + name_arg)
-        if action == 'edit': items[index] = mapping_wizard(items[index])
+        if action == 'edit':
+            edited = mapping_wizard(items[index])
+            if edited is None: return
+            items[index] = edited
         elif action == 'enable': items[index]['enabled'] = True
         elif action == 'disable': items[index]['enabled'] = False
         elif not confirm('确认删除映射 ' + name_arg + '？'): return

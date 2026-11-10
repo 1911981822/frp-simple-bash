@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-FRP_MANAGER_VERSION='v0.1.14-ui.1'
+FRP_MANAGER_VERSION='v0.1.15-ux.1'
 base="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
 if [[ -f "$base/install-common.sh" && -f "$base/lib/manager.py" && -f "$base/lib/download.sh" ]]; then
   exec bash "$base/install-common.sh" frps "$@"
@@ -10,7 +10,7 @@ work="$(mktemp -d)"
 cleanup() { [[ -n "${work:-}" && "$work" != / && -d "$work" ]] && rm -rf -- "$work"; }
 trap cleanup EXIT
 fetch() {
-  if curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 10 --max-time 120 --retry 2 "$1" -o "$2.partial"; then mv -f -- "$2.partial" "$2"; else return 1; fi
+  if curl --silent --show-error --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 10 --max-time 120 --retry 2 "$1" -o "$2.partial"; then mv -f -- "$2.partial" "$2"; else return 1; fi
 }
 mirror="${FRP_MIRROR_URL-https://download.sueiyuan.top}"
 case "$mirror" in ''|off|OFF) mirror='' ;; https://*) mirror="${mirror%/}" ;; *) echo 'Mirror URL must use HTTPS, or be empty/off.' >&2; exit 1 ;; esac

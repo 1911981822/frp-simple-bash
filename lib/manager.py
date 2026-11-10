@@ -1139,7 +1139,7 @@ def main_menu(role):
     while True:
         clear_screen()
         try:
-            data = show_status(role)
+            data = status(role)
             alias = data.get('active_profile', {}).get('name', '未选择')
         except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError):
             print('配置无法读取；请检查配置文件或从 backups 恢复，服务管理仍可使用。')
@@ -1152,7 +1152,7 @@ def main_menu(role):
         if not n: return
         try:
             if role == 'frpc':
-                if n == 1: continue  # The next menu frame refreshes status once.
+                if n == 1: show_status(role)
                 elif n in (2, 3, 4):
                     require_active()
                     if n == 2 or confirm(items[n-1] + '？'):

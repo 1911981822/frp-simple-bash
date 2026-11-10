@@ -28,7 +28,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v0.1.16-flow.1'
+MANAGER_RELEASE_VERSION = 'v0.1.17-ui.1'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -489,6 +489,14 @@ def _tag(kind):
         return '\033[1;' + _COLORS[kind] + 'm' + kind + '\033[0m'
     return kind
 
+def _state_color(text, good=None):
+    """Color a short state label; no-op when colors are off."""
+    if not UI_COLOR:
+        return text
+    if good is None:
+        good = text in ('运行中', '已连接', '运行中')
+    return '\033[1;' + ('32' if good else '31') + 'm' + text + '\033[0m'
+
 def _display_width(text):
     """Approximate terminal width: CJK/fullwidth count as 2; ANSI escapes as 0."""
     width = 0
@@ -599,6 +607,17 @@ def pause(message='按回车返回上一级菜单'):
         try: input(f'  {message} … ')
         except EOFError: pass
 
+def _report(title, lines):
+    """Frame a multi-line report; keeps every original line intact."""
+    inner = _ui_width()
+    print()
+    print('┌' + '─' * inner + '┐')
+    print('│' + _pad_line(' ' + _tag('[提示]') + ' ' + title, inner) + '│')
+    for raw in lines:
+        for line in _wrap_text(str(raw), inner - 2):
+            print('│' + _pad_line(' ' + line, inner) + '│')
+    print('└' + '─' * inner + '┘')
+
 def result_ok(message, detail=None):
     _box('[成功]', message, detail)
 
@@ -606,7 +625,7 @@ def result_info(message, detail=None):
     _box('[提示]', message, detail)
 
 def result_error(message, hint=None):
-    _box('[失败]', message, hint)
+    _box('[失败]', message, ('建议：' + str(hint)) if hint else None)
 
 def choose(items, title='请选择', back_label='返回上一级', groups=None):
     """Numbered menu with optional visual group headers (numbering stays continuous)."""
@@ -640,7 +659,7 @@ def list_profiles():
     ps = profiles()
     section('服务端列表')
     if not ps:
-        print('  暂无服务端，请从主菜单「新建 frps 服务端」添加。')
+        result_info('暂无服务端，请从主菜单「新建 frps 服务端」添加。')
     else:
         for p in ps:
             mark = ' [当前]' if p['id'] == active() else ''
@@ -715,7 +734,8 @@ def profile_wizard():
     validate_profile(p)
     section('确认创建')
     profile_summary(p, s)
-    print('  0) 取消创建，返回修改')
+    print(RULE)
+    result_info('确认无误请输入 y 创建；直接回车或输入其他内容则取消。')
     if not confirm('以上信息确认无误，创建服务端？'):
         result_info('已取消，未创建服务端。')
         return
@@ -784,24 +804,18 @@ def restore_backup(directory):
     return restored
 
 def backup_menu():
-    items = list_backups()
     while True:
         clear_screen()
-        print('\n[菜单] 配置备份与恢复')
-        print('  ' + '─' * _ui_width())
-        if items:
-            for n, item in enumerate(items[:20], 1):
-                print(f'  {n}. {item["time"]}  {item["reason"]}  文件 {len(item["files"])} 个')
-        else: print('  暂无备份')
-        print('  0. 返回上一级')
-        n = ask('请输入编号 > ')
-        if not n.isdecimal(): result_error('请输入数字编号。'); continue
-        n = int(n)
-        if n == 0: return
-        if not 1 <= n <= min(len(items), 20): result_error('编号超出范围。'); continue
+        items = list_backups()[:20]
+        labels = [f'{item["time"]}  {item["reason"]}  文件 {len(item["files"])} 个' for item in items]
+        if not items:
+            result_info('暂无备份可恢复。')
+            pause()
+            return
+        n = choose(labels, '配置备份与恢复')
+        if not n: return
         chosen = items[n-1]
-        result_info('将恢复：' + str(chosen['path']))
-        for relative in chosen['files'][:20]: print('    - ' + relative)
+        result_info('将恢复：' + str(chosen['path']), detail='\n'.join('• ' + r for r in chosen['files'][:20]))
         if not confirm('确认用此备份覆盖当前配置？当前文件会先再次备份'):
             result_info('已取消恢复。'); continue
         try:
@@ -898,8 +912,7 @@ def diagnostics(role):
             for m in mappings(pid):
                 if m.get('type') in ('tcp', 'udp') and m.get('remote_port'):
                     if check_port_conflict('0.0.0.0', m['remote_port']): lines.append(f'  注意：远程端口 {m["remote_port"]} 在本机被占用（若服务端与本机不同可忽略）。')
-    print('\n' + '\n'.join(lines))
-    print('  ' + '─' * _ui_width())
+    _report('连接诊断报告' if role == 'frpc' else '服务端诊断报告', lines[1:])
     if ok: result_ok('诊断通过。')
     else: result_error('诊断发现问题，请按建议处理。')
     return ok
@@ -968,19 +981,21 @@ def mapping_wizard(old=None):
 
 def show_mappings(items):
     if not items:
-        print('当前服务端暂无端口映射。'); return
-    print(f'{"序号":<4}{"名称":<16}{"类型":<6}{"本地":<22}{"远端":<20}{"状态"}')
+        result_info('当前服务端暂无端口映射。'); return
+    section('当前服务端端口映射')
+    print('  ' + f'{"序号":<4}{"名称":<16}{"类型":<6}{"本地":<22}{"远端":<20}{"状态"}')
     for n, m in enumerate(items, 1):
         local = f'{m.get("local_ip", "127.0.0.1")}:{m["local_port"]}'
         if m['type'] in ('tcp', 'udp'): remote = str(m.get('remote_port', '-'))
         else: remote = m.get('domain', '-')
         enabled = '启用' if m.get('enabled', True) else '停用'
-        print(f'{n:<4}{m["name"]:<16}{m["type"]:<6}{local:<22}{remote:<20}{enabled}')
+        print('  ' + f'{n:<4}{m["name"]:<16}{m["type"]:<6}{local:<22}{remote:<20}{enabled}')
+    print(RULE)
 
 def mapping_menu():
     while True:
         clear_screen()
-        pid = require_active(); print('\n当前 frps：' + label(load_profile(pid)))
+        pid = require_active(); result_info('当前 frps：' + label(load_profile(pid)))
         n = choose(['新增端口映射', '查看当前服务端映射', '修改端口映射', '启用/停用端口映射', '删除端口映射'])
         if not n: return
         try:
@@ -1032,7 +1047,11 @@ def edit_profile():
         clear_screen()
         n = choose(['查看连接配置', '修改服务端名称', '修改服务器地址', '修改服务器端口', '修改 token', '修改 TLS 配置', '修改 Dashboard/API', '修改传输协议', '修改日志级别与保留天数', '保存并返回', '删除当前服务端及全部映射'], label(p))
         if n == 0: return
-        if n == 1: profile_summary(p, s)
+        if n == 1:
+            section('连接配置')
+            profile_summary(p, s)
+            print(RULE)
+            pause()
         elif n == 2: v = ask('新名称'); unique_name(v, pid); p['name'] = v
         elif n == 3: p['server_addr'] = address(ask('新地址'))
         elif n == 4: p['server_port'] = port(ask('业务端口'))
@@ -1184,7 +1203,9 @@ def frps_config_menu():
                 redacted = json.loads(json.dumps(data))
                 if redacted.get('auth', {}).get('token'): redacted['auth']['token'] = '******'
                 if redacted.get('webServer', {}).get('password'): redacted['webServer']['password'] = '******'
+                section('当前配置（脱敏）')
                 print(json.dumps(redacted, ensure_ascii=False, indent=2))
+                print(RULE)
                 pause()
             elif n == 2:
                 data['bindAddr'] = address(ask('业务监听地址', data.get('bindAddr', '0.0.0.0')))
@@ -1251,33 +1272,34 @@ def server_clients():
             if page * 200 >= data.get('total', 0): return rows
             page += 1
     clients, proxies = paged('clients'), paged('proxies')
-    print('\n在线客户端（Dashboard/API）')
-    if not clients: print('暂无客户端连接。')
+    lines = ['在线客户端（Dashboard/API）']
+    if not clients: lines.append('暂无客户端连接。')
     for n, item in enumerate(clients, 1):
         state = '在线' if item.get('online') else '离线'
-        print(f'{n}. {item.get("hostname") or item.get("clientID") or item.get("key", "未知")} [{state}]')
-        print(f'   clientID={item.get("clientID", "")} 版本={item.get("version", "")} IP={item.get("clientIP", "")}')
-        print(f'   代理数量={item.get("status", {}).get("proxyCount", "未知")}')
-    print('\n代理状态')
-    if not proxies: print('暂无代理统计。')
+        lines.append(f'{n}. {item.get("hostname") or item.get("clientID") or item.get("key", "未知")} [{state}]')
+        lines.append(f'   clientID={item.get("clientID", "")} 版本={item.get("version", "")} IP={item.get("clientIP", "")}')
+        lines.append(f'   代理数量={item.get("status", {}).get("proxyCount", "未知")}')
+    lines.append('代理状态')
+    if not proxies: lines.append('暂无代理统计。')
     for n, item in enumerate(proxies, 1):
         status = item.get('status', {})
-        print(f'{n}. {item.get("name", "未知")} [{status.get("phase", "未知")}] 类型={item.get("spec", {}).get("type", "未知")}')
-        print(f'   今日流量：入站 {status.get("todayTrafficIn", 0)} / 出站 {status.get("todayTrafficOut", 0)}，连接数 {status.get("curConns", 0)}')
-    print(f'客户端连接查询完成：{len(clients)} 个客户端，{len(proxies)} 个代理。')
+        lines.append(f'{n}. {item.get("name", "未知")} [{status.get("phase", "未知")}] 类型={item.get("spec", {}).get("type", "未知")}')
+        lines.append(f'   今日流量：入站 {status.get("todayTrafficIn", 0)} / 出站 {status.get("todayTrafficOut", 0)}，连接数 {status.get("curConns", 0)}')
+    _report('客户端连接信息', lines)
+    result_info(f'客户端连接查询完成：{len(clients)} 个客户端，{len(proxies)} 个代理。')
 
 def import_external(role):
     path = ROOT / (role + '.toml'); s = state()
     if not path.exists(): return
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     if s.get(role + '_hash') == digest: return
-    print('检测到外部运行配置修改。')
+    result_info('检测到外部运行配置修改。')
     n = choose(['导入外部修改', '保留管理器配置', '查看变更字段（隐藏敏感值）'], '配置同步')
     if n is None: raise ValueError('已取消；外部文件保持原样')
     if n == 0: return
     config = read_toml(path) if n != 2 else {}
     if n == 3:
-        print('字段：' + ', '.join(config)); return import_external(role)
+        result_info('外部配置字段（仅字段名）：' + ', '.join(config)); return import_external(role)
     if role == 'frps':
         with lock(), transaction():
             if n == 2:
@@ -1359,7 +1381,7 @@ def status_bar(role, data):
     """One-line compact status shown above every menu."""
     states = {'active': '运行中', 'running': '运行中', 'started': '运行中', 'stopped': '已停止', 'inactive': '已停止', 'failed': '异常', 'unknown': '未知'}
     state_text = states.get(str(data.get('service_state', '')).lower(), data.get('service_state', '未知'))
-    parts = [role, state_text, str(data.get('version', ''))]
+    parts = [role, _state_color(state_text, state_text == '运行中'), str(data.get('version', ''))]
     if role == 'frps':
         try:
             config = read_toml(ROOT / 'frps.toml')
@@ -1374,7 +1396,7 @@ def status_bar(role, data):
         if profile:
             translations = {'connected': '已连接', 'connecting': '连接中', 'stopped': '已停止', 'unknown': '待确认', 'proxy-error': '映射异常', 'auth-failed': '认证失败', 'tls-failed': 'TLS 失败'}
             conn = data.get('connection', {}).get('state', '')
-            parts += [label(profile), translations.get(conn, conn), str(len(mappings(profile['id']))) + ' 个映射']
+            parts += [label(profile), _state_color(translations.get(conn, conn), conn == 'connected'), str(len(mappings(profile['id']))) + ' 个映射']
         else:
             parts.append('未选择服务端')
     if data.get('pending'):
@@ -1450,7 +1472,7 @@ def main_menu(role):
             data = status(role)
             alias = data.get('active_profile', {}).get('name', '未选择')
         except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError):
-            print('配置无法读取；请检查配置文件或从 backups 恢复，服务管理仍可使用。')
+            result_error('配置无法读取；请检查配置文件或从 backups 恢复，服务管理仍可使用。')
             alias = '配置错误'
         if role == 'frpc':
             items = ['查看当前状态', '启动 frpc', '停止 frpc', '重启 frpc', '新建 frps 服务端', '查看服务端列表', '切换服务端', '修改当前 frps 配置', f'修改当前 frps（{alias}）端口映射', '查看日志与连接诊断', '备份与恢复配置', '设置/取消开机自启动', '卸载 frpc', '升级 frpc']
@@ -1519,14 +1541,16 @@ def show_logs(role, lines=50):
     path = ROOT / 'logs' / (role + '.log')
     if path.exists():
         content = path.read_text(encoding='utf-8', errors='replace').splitlines()
+        section(f'{role} 日志（最近 {min(lines, len(content))} 行）')
         print('\n'.join(content[-lines:]))
+        print(RULE)
         result_info(f'{path} 共 {len(content)} 行，已显示最近 {min(lines, len(content))} 行。')
         return
     if os.name != 'nt' and shutil.which('journalctl'):
         run_cmd(['journalctl', '-u', role, '-n', str(lines), '--no-pager'])
         result_info(f'已从 journalctl 读取最近 {lines} 行。')
         return
-    print('暂无文件日志；请查看平台服务日志。')
+    result_info('暂无文件日志；请查看平台服务日志。')
 
 def logs_and_diagnostics_menu(role):
     """Combined, single sub-menu for logs and connection diagnostics."""
@@ -1538,8 +1562,7 @@ def logs_and_diagnostics_menu(role):
         if n == 1: show_logs(role, 50); pause()
         elif n == 2: show_logs(role, 200); pause()
         elif n == 3:
-            print(f'\n  日志目录：{ROOT / "logs"}')
-            print('  轮转策略：单文件超过 50MB 自动归档；保留 30 天；总量上限 500MB。'); pause()
+            result_info('日志目录：' + str(ROOT / 'logs'), detail='轮转策略：单文件超过 50MB 自动归档；保留 30 天；总量上限 500MB。'); pause()
         elif n == 4:
             removed = 0
             for item in files:
@@ -1549,7 +1572,10 @@ def logs_and_diagnostics_menu(role):
         elif n == 5: diagnostics(role); pause()
         elif n == 6:
             report = diagnostics_report(role)
-            print('\n' + json.dumps(report, ensure_ascii=False, indent=2)); pause()
+            section('诊断报告（JSON）')
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            print(RULE)
+            pause()
 
 def autostart(role):
     n = choose(['启用开机自启动', '取消开机自启动'])
@@ -1648,12 +1674,11 @@ def upgrade(role, target=None):
     are overwritten. The frp binary version stays at SUPPORTED_VERSIONS[-1].
     """
     before = installed_manager_version()
-    print('[升级] 当前管理器版本：' + before)
-    print('[升级] 当前 frp 二进制版本：' + installed_frp_version(role))
+    result_info('准备更新管理器', detail='当前管理器版本：' + before + '\n当前 frp 二进制版本：' + installed_frp_version(role))
     target = target or MANAGER_RELEASE_VERSION
     if not target.startswith('v') or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-' for c in target):
         raise ValueError('非法的管理器版本号：' + str(target))
-    print('[升级] 将更新管理器至：' + target)
+    result_info('将更新管理器至：' + target)
     if not confirm('更新管理器脚本（保留 frp 二进制与配置）？'): return
     mirror = os.environ.get('FRP_MIRROR_URL', 'https://download.sueiyuan.top').rstrip('/')
     if mirror in ('', 'off', 'OFF'):

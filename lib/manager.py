@@ -28,7 +28,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v0.1.15-ux.2'
+MANAGER_RELEASE_VERSION = 'v0.1.16-flow.1'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -1169,33 +1169,23 @@ def save_frps_config(data, restart=True):
         result_ok('frps 配置已保存；下次重启后生效。')
 
 def frps_config_menu():
+    items = ['查看当前配置（脱敏）', '修改业务监听地址/端口', '修改 token', '修改 Dashboard/API',
+             '修改 HTTP/HTTPS vhost 端口', '修改 KCP/QUIC/TCPMUX 端口', '校验配置并检测端口冲突',
+             '查看防火墙放行提示', '备份与恢复配置']
     while True:
         clear_screen()
         try: data = read_frps_config()
         except (ValueError, OSError) as exc: result_error(str(exc)); pause(); return
         web = data.get('webServer', {})
-        print('\n[菜单] frps 服务端配置')
-        print('  ' + '─' * _ui_width())
-        print('  1. 查看当前配置（脱敏）')
-        print('  2. 修改业务监听地址/端口')
-        print('  3. 修改 token')
-        print('  4. 修改 Dashboard/API')
-        print('  5. 修改 HTTP/HTTPS vhost 端口')
-        print('  6. 修改 KCP/QUIC/TCPMUX 端口')
-        print('  7. 校验配置并检测端口冲突')
-        print('  8. 查看防火墙放行提示')
-        print('  9. 备份与恢复配置')
-        print('  0. 返回上一级')
-        n = ask('请输入编号 > ')
-        if not n.isdecimal(): result_error('请输入数字编号。'); continue
-        n = int(n)
-        if n == 0: return
+        n = choose(items, 'frps 服务端配置')
+        if not n: return
         try:
             if n == 1:
                 redacted = json.loads(json.dumps(data))
                 if redacted.get('auth', {}).get('token'): redacted['auth']['token'] = '******'
                 if redacted.get('webServer', {}).get('password'): redacted['webServer']['password'] = '******'
                 print(json.dumps(redacted, ensure_ascii=False, indent=2))
+                pause()
             elif n == 2:
                 data['bindAddr'] = address(ask('业务监听地址', data.get('bindAddr', '0.0.0.0')))
                 data['bindPort'] = port(ask('业务端口', str(data.get('bindPort', 7000))))
@@ -1234,6 +1224,7 @@ def frps_config_menu():
                 for key in ('bindPort', 'vhostHTTPPort', 'vhostHTTPSPort', 'kcpBindPort', 'quicBindPort', 'tcpmuxHTTPConnectPort'):
                     if data.get(key) and check_port_conflict('0.0.0.0', data[key]): result_error(f'{key}={data[key]} 已被其他进程监听。')
                 if web.get('port') and check_port_conflict('127.0.0.1', web['port']): result_error(f'Dashboard 端口 {web["port"]} 已被占用。')
+                pause()
             elif n == 8:
                 ports = [('bindPort', 'tcp')] + [('vhostHTTPPort', 'tcp'), ('vhostHTTPSPort', 'tcp')]
                 found = False
@@ -1241,9 +1232,9 @@ def frps_config_menu():
                     if data.get(key):
                         for hint in firewall_hint(data[key], proto): result_info(hint); found = True
                 if not found: result_info('未发现需要处理的常见防火墙规则提示；云安全组请自行确认。')
+                pause()
             elif n == 9: backup_menu()
-        except (ValueError, OSError, subprocess.SubprocessError) as exc: result_error(str(exc))
-        if n not in (9,): pause()
+        except (ValueError, OSError, subprocess.SubprocessError) as exc: result_error(str(exc)); pause()
 
 def server_clients():
     p = read_toml(ROOT / 'frps.toml'); web = p.get('webServer', {})
@@ -1282,7 +1273,8 @@ def import_external(role):
     if s.get(role + '_hash') == digest: return
     print('检测到外部运行配置修改。')
     n = choose(['导入外部修改', '保留管理器配置', '查看变更字段（隐藏敏感值）'], '配置同步')
-    if n == 0: raise ValueError('已取消；外部文件保持原样')
+    if n is None: raise ValueError('已取消；外部文件保持原样')
+    if n == 0: return
     config = read_toml(path) if n != 2 else {}
     if n == 3:
         print('字段：' + ', '.join(config)); return import_external(role)
@@ -1469,6 +1461,10 @@ def main_menu(role):
         status_bar(role, data)
         n = choose(items, '请选择操作' if role == 'frps' else 'frpc 客户端操作', '退出', groups=groups)
         if not n: return
+        # Sub-menus pause themselves; one-shot results get exactly one pause here.
+        # Terminal operations (uninstall/upgrade) leave the menu entirely.
+        needs_pause = n != 1
+        terminal = False
         try:
             if role == 'frpc':
                 if n == 1: show_status(role)
@@ -1484,13 +1480,15 @@ def main_menu(role):
                 elif n == 7:
                     pid = select_profile()
                     if pid: switch(pid)
-                elif n == 8: edit_profile()
-                elif n == 9: mapping_menu()
-                elif n == 10: logs_and_diagnostics_menu(role)
-                elif n == 11: backup_menu()
-                elif n == 12: autostart(role)
-                elif n == 13: uninstall(role)
-                elif n == 14: upgrade(role)
+                    else: needs_pause = False  # user pressed 0 to go back; don't ask again
+                elif n == 8: edit_profile(); needs_pause = False
+                elif n == 9: mapping_menu(); needs_pause = False
+                elif n == 10: logs_and_diagnostics_menu(role); needs_pause = False
+                elif n == 11: backup_menu(); needs_pause = False
+                elif n == 12:
+                    if not autostart(role): needs_pause = False
+                elif n == 13: uninstall(role); terminal = True
+                elif n == 14: upgrade(role); terminal = True
             else:
                 if n == 1:
                     result_info('正在刷新服务信息。')
@@ -1499,14 +1497,17 @@ def main_menu(role):
                     if n == 2 or confirm(items[n-1] + '？'):
                         service_feedback(role, {2:'start',3:'stop',4:'restart'}[n])
                 elif n == 5: server_clients()
-                elif n == 6: frps_config_menu()
-                elif n == 7: logs_and_diagnostics_menu(role)
-                elif n == 8: backup_menu()
-                elif n == 9: autostart(role)
-                elif n == 10: uninstall(role)
-                elif n == 11: upgrade(role)
+                elif n == 6: frps_config_menu(); needs_pause = False
+                elif n == 7: logs_and_diagnostics_menu(role); needs_pause = False
+                elif n == 8: backup_menu(); needs_pause = False
+                elif n == 9:
+                    if not autostart(role): needs_pause = False
+                elif n == 10: uninstall(role); terminal = True
+                elif n == 11: upgrade(role); terminal = True
         except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as e: result_error(str(e))
-        if n != 1:
+        if terminal:
+            return
+        if needs_pause:
             pause()
 
 def log_files(role):
@@ -1552,11 +1553,12 @@ def logs_and_diagnostics_menu(role):
 
 def autostart(role):
     n = choose(['启用开机自启动', '取消开机自启动'])
-    if n:
-        action = 'enable' if n == 1 else 'disable'
-        service(role, action)
-        current = service(role, 'status')
-        print(('已启用' if n == 1 else '已取消') + f' {role} 开机自启动；当前运行状态：{current or "未知"}。')
+    if not n: return False
+    action = 'enable' if n == 1 else 'disable'
+    service(role, action)
+    current = service(role, 'status')
+    result_ok(('已启用' if n == 1 else '已取消') + f' {role} 开机自启动；当前运行状态：{current or "未知"}。')
+    return True
 
 def delete_profile_id(pid):
     p = load_profile(pid)

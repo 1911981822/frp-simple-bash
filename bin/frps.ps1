@@ -12,11 +12,11 @@ $python=$null
 foreach ($name in @('python','python3','py')) {
     $found=Get-Command $name -ErrorAction SilentlyContinue
     if ($found) {
-        & $found.Source -c 'import sys;sys.exit(0 if sys.version_info >= (3,11) else 1)' 2>$null
+        & $found.Source -c 'import sys;sys.exit(0 if sys.version_info >= (3,6) else 1)' 2>$null
         if ($LASTEXITCODE -eq 0) { $python=$found.Source; break }
     }
 }
-if (-not $python) { throw 'Python 3.11+ is required.' }
+if (-not $python) { throw 'Python 3.6+ is required.' }
 $manager=Join-Path $root 'lib/manager.py'
 if (-not (Test-Path $manager)) { throw "Manager not found: $manager" }
 & $python $manager frps @args

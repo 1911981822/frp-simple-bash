@@ -5,6 +5,7 @@ import argparse
 import gzip
 import hashlib
 import io
+import time
 from pathlib import Path
 import subprocess
 import tarfile
@@ -27,17 +28,17 @@ def build(version=DEFAULT_VERSION):
         path = ROOT / name
         if name.startswith(blocked) or '__pycache__' in path.parts: continue
         if not path.is_file() or path.is_symlink(): raise ValueError('Expected a regular source file: ' + name)
-        if not path.resolve().is_relative_to(ROOT): raise ValueError('Source escapes repository')
+        if not str(path.resolve()).startswith(str(ROOT.resolve()) + '/'): raise ValueError('Source escapes repository')
         files.append((name, path))
     required = {'install-common.sh','lib/manager.py','install-windows.ps1','install-frps.sh','install-frpc.sh','lib/download.sh'}
     if not required.issubset({name for name, _ in files}): raise ValueError('Source bundle is missing runtime components')
     with archive.open('xb') as raw:
-        with gzip.GzipFile(fileobj=raw, mode='wb', filename='', mtime=0) as compressed:
+        with gzip.GzipFile(fileobj=raw, mode='wb', filename='', mtime=int(time.time())) as compressed:
             with tarfile.open(fileobj=compressed, mode='w') as tar:
                 for name, path in files:
                     data=path.read_bytes()
                     entry=tarfile.TarInfo('frp-simple-bash/' + name)
-                    entry.size=len(data); entry.mtime=0; entry.uid=entry.gid=0
+                    entry.size=len(data); entry.mtime=int(time.time()); entry.uid=entry.gid=0
                     entry.mode=0o755 if path.stat().st_mode & 0o111 else 0o644
                     tar.addfile(entry, io.BytesIO(data))
     digest=hashlib.sha256(archive.read_bytes()).hexdigest()

@@ -73,19 +73,18 @@ if ((${#missing[@]})); then
   elif command -v apk >/dev/null; then apk add curl tar coreutils python3
   else echo '无法识别包管理器，请手动安装。' >&2; exit 1; fi
 fi
-python3 -c 'import sys; assert sys.version_info >= (3,9), "需要 Python 3.9+，请安装后重试"'
-if ! python3 -c 'try: import tomllib
-except ImportError: import tomli' 2>/dev/null; then
-  echo 'Python 低于 3.11，需要发行版 TOML 解析包 python3-tomli。'
-  if ((yes == 0)); then read -r -p '确认通过包管理器安装 TOML 依赖？[y/N] ' answer; [[ "$answer" =~ ^[Yy]$ ]] || exit 1; fi
-  if command -v apt-get >/dev/null; then apt-get install -y python3-tomli
-  elif command -v dnf >/dev/null; then dnf install -y python3-tomli
-  elif command -v yum >/dev/null; then yum install -y python3-tomli
-  elif command -v apk >/dev/null; then apk add py3-tomli
-  else echo '请先安装 tomli。' >&2; exit 1; fi
+# Python 3.6+ is enough: the manager carries its own TOML fallback parser.
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,6) else 1)'; then
+  echo "检测到 $(python3 -V 2>&1)，本项目需要 Python 3.6 及以上。"
+  if ((yes == 0)); then read -r -p '确认通过包管理器安装 python3？[y/N] ' answer; [[ "$answer" =~ ^[Yy]$ ]] || exit 1; fi
+  if command -v apt-get >/dev/null; then apt-get update; apt-get install -y python3
+  elif command -v dnf >/dev/null; then dnf install -y python3
+  elif command -v yum >/dev/null; then yum install -y python3
+  elif command -v apk >/dev/null; then apk add python3
+  else echo '请先安装 Python 3.6+。' >&2; exit 1; fi
 fi
-python3 -c 'try: import tomllib
-except ImportError: import tomli'
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,6) else 1)' || { echo 'Python 版本仍不满足 3.6+。' >&2; exit 1; }
+python3 -c 'import json,hashlib,ipaddress,urllib.request' || { echo 'Python 标准库不完整。' >&2; exit 1; }
 manager=none
 if command -v systemctl >/dev/null && [[ -d /run/systemd/system ]]; then manager=systemd
 elif command -v rc-service >/dev/null && command -v rc-update >/dev/null; then manager=openrc
@@ -104,7 +103,7 @@ if ! printf '%s  %s\n' "$expected" "$work/$asset" | sha256sum -c - >/dev/null; t
   echo 'frp 安装包 SHA256 校验失败，未执行二进制、未修改现有服务。' >&2
   exit 1
 fi
-tar -xzf "$work/$asset" -C "$work"
+tar -xzf "$work/$asset" -C "$work" 2>/dev/null || tar -xzf "$work/$asset" -C "$work"
 "$work/frp_${version}_linux_${arch}/$component" --version
 mkdir -p "$install_root/native" "$install_root/bin" "$install_root/lib" "$install_root/templates" "$config_root" /usr/local/bin
 chmod 700 "$config_root"

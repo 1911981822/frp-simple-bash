@@ -15,9 +15,12 @@ import subprocess
 import sys
 import time
 try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib  # Python 3.9/3.10: install distribution package python3-tomli.
+    import tomllib as _toml_lib
+except ImportError:
+    try:
+        import tomli as _toml_lib
+    except ImportError:
+        _toml_lib = None
 import urllib.request
 import urllib.error
 import base64
@@ -27,6 +30,21 @@ VERSION = '0.72.0'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 TEST = os.environ.get('FRP_TEST_MODE') == '1'
+
+def unlink_quiet(path):
+    try: os.unlink(str(path))
+    except OSError: pass
+
+def run_cmd(args, **kwargs):
+    if 'capture_output' in kwargs:
+        capture = kwargs.pop('capture_output')
+        if capture:
+            kwargs.setdefault('stdout', subprocess.PIPE)
+            kwargs.setdefault('stderr', subprocess.PIPE)
+    if 'text' in kwargs:
+        yes = kwargs.pop('text')
+        if yes: kwargs.setdefault('universal_newlines', True)
+    return subprocess.run(args, **kwargs)
 
 def text(value):
     return json.dumps(value, ensure_ascii=False)
@@ -67,7 +85,7 @@ def atomic(path, content):
             f.write(content); f.flush(); os.fsync(f.fileno())
         os.replace(tmp, path)
     finally:
-        tmp.unlink(missing_ok=True)
+        unlink_quiet(tmp)
 
 def managed_paths():
     return set(ROOT.glob('*.json')) | set(ROOT.glob('*.toml')) | set((ROOT / 'profiles').glob('*/*.toml'))
@@ -78,12 +96,65 @@ def transaction():
     originals = {p: p.read_bytes() for p in managed_paths()}
     try: yield
     except Exception:
-        for p in managed_paths() - set(originals): p.unlink(missing_ok=True)
+        for p in managed_paths() - set(originals): unlink_quiet(p)
         for p, value in originals.items(): atomic(p, value.decode('utf-8-sig'))
         raise
 
+def _mini_toml(text):
+    """Dependency-free TOML subset parser (tables, arrays of tables, strings, ints, bools, arrays)."""
+    root, path = {}, []
+    def target():
+        node = root
+        for key in path:
+            node = node.setdefault(key, {})
+        # Inside an array of tables, assign to its newest element.
+        if isinstance(node, list): node = node[-1]
+        return node
+    def scalar(raw):
+        raw = raw.strip()
+        if raw[:1] in ('"', "'"):
+            quote = raw[0]
+            if len(raw) < 2 or not raw.endswith(quote): raise ValueError('字符串未闭合：' + raw)
+            body = raw[1:-1]
+            if quote == '"':
+                body = body.replace('\\"', '"').replace('\\n', '\n').replace('\\t', '\t').replace('\\\\', '\\')
+            return body
+        if raw in ('true', 'false'): return raw == 'true'
+        if raw.startswith('['):
+            if not raw.endswith(']'): raise ValueError('数组未闭合：' + raw)
+            inner = raw[1:-1].strip()
+            return [scalar(x) for x in inner.split(',')] if inner else []
+        try: return int(raw)
+        except ValueError:
+            try: return float(raw)
+            except ValueError: raise ValueError('无法解析的值：' + raw)
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith('#'): continue
+        if line.startswith('[['):
+            if not line.endswith(']]'): raise ValueError('表数组未闭合（第 %d 行）' % number)
+            parts = line[2:-2].strip().split('.')
+            parent = root
+            for part in parts[:-1]: parent = parent.setdefault(part, {})
+            parent.setdefault(parts[-1], []).append({})
+            path = parts
+            continue
+        if line.startswith('['):
+            if not line.endswith(']'): raise ValueError('表未闭合（第 %d 行）' % number)
+            path = line[1:-1].strip().split('.')
+            target()
+            continue
+        if '=' not in line: raise ValueError('缺少 =（第 %d 行）' % number)
+        key, value = line.split('=', 1)
+        target()[key.strip()] = scalar(value)
+    return root
+
+def _load_toml(text):
+    if _toml_lib is not None: return _toml_lib.loads(text)
+    return _mini_toml(text)
+
 def read_toml(path):
-    return tomllib.loads(Path(path).read_text(encoding='utf-8-sig'))
+    return _load_toml(Path(path).read_text(encoding='utf-8-sig'))
 
 def read_json(path, default=None):
     return json.loads(path.read_text(encoding='utf-8')) if path.exists() else ({} if default is None else default)
@@ -109,7 +180,7 @@ def rotate_logs():
     files = [p for p in (ROOT / 'logs').glob('*') if p.is_file() and not p.is_symlink()]
     cutoff = time.time() - 30 * 86400
     for p in files:
-        if p.stat().st_mtime < cutoff and p.suffix != '.log': p.unlink(missing_ok=True)
+        if p.stat().st_mtime < cutoff and p.suffix != '.log': unlink_quiet(p)
     files = [p for p in files if p.exists()]
     limit = 500 * 1024 * 1024
     # Never unlink a live log: truncate at a bounded size before reclaiming archives.
@@ -228,15 +299,15 @@ def rebuild_index():
 
 def binary(role): return BIN / (role + ('.exe' if os.name == 'nt' else ''))
 def verify(role, content):
-    tomllib.loads(content)
+    _load_toml(content)
     if TEST: return
     if not binary(role).exists(): raise ValueError('原生 frp 尚未安装；请先运行安装器')
     tmp = ROOT / ('.verify-' + secrets.token_hex(6) + '.toml')
     atomic(tmp, content)
     try:
-        r = subprocess.run([str(binary(role)), 'verify', '-c', str(tmp)], capture_output=True, timeout=15)
+        r = run_cmd([str(binary(role)), 'verify', '-c', str(tmp)], capture_output=True, timeout=15)
         if r.returncode: raise ValueError('frp 配置校验失败；原配置已保留（输出可能含敏感字段，未回显）')
-    finally: tmp.unlink(missing_ok=True)
+    finally: unlink_quiet(tmp)
 
 def render(pid):
     p = load_profile(pid); s = secrets_for(pid); items = mappings(pid)
@@ -285,15 +356,15 @@ def service(role, action):
         wrapper = BIN.parent / 'services' / ('frp-simple-bash-' + role + '.exe')
         if not wrapper.exists(): raise ValueError('Windows 服务包装器未安装')
         if action in ('enable', 'disable'):
-            result = subprocess.run(['sc.exe', 'config', 'frp-simple-bash-' + role, 'start=', 'auto' if action == 'enable' else 'demand'], capture_output=True, text=True, timeout=30)
-        else: result = subprocess.run([str(wrapper), action], capture_output=True, text=True, timeout=30)
+            result = run_cmd(['sc.exe', 'config', 'frp-simple-bash-' + role, 'start=', 'auto' if action == 'enable' else 'demand'], capture_output=True, text=True, timeout=30)
+        else: result = run_cmd([str(wrapper), action], capture_output=True, text=True, timeout=30)
     elif shutil.which('systemctl') and Path('/run/systemd/system').exists():
         args = ['systemctl', 'is-active' if action == 'status' else action, role]
-        result = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        result = run_cmd(args, capture_output=True, text=True, timeout=30)
     elif shutil.which('rc-service'):
         if action in ('enable', 'disable'):
-            result = subprocess.run(['rc-update', 'add' if action == 'enable' else 'del', role, 'default'], capture_output=True, text=True, timeout=30)
-        else: result = subprocess.run(['rc-service', role, action], capture_output=True, text=True, timeout=30)
+            result = run_cmd(['rc-update', 'add' if action == 'enable' else 'del', role, 'default'], capture_output=True, text=True, timeout=30)
+        else: result = run_cmd(['rc-service', role, action], capture_output=True, text=True, timeout=30)
     else: return 'unknown' if action == 'status' else fail('无支持的服务管理器，无法保证后台运行与自启动')
     if action == 'status': return result.stdout.strip() or 'stopped'
     if result.returncode: raise ValueError('服务操作失败：' + result.stderr.strip())
@@ -519,7 +590,7 @@ def restore_backup(directory):
             source = directory / relative
             if not source.is_file() or source.is_symlink(): raise ValueError('备份文件缺失：' + str(relative))
             target = ROOT / relative
-            if not target.resolve().is_relative_to(ROOT.resolve()): raise ValueError('目标路径非法')
+            if not str(target.resolve()).startswith(str(ROOT.resolve()) + '/'): raise ValueError('目标路径非法')
             atomic(target, source.read_text(encoding='utf-8'))
             restored.append(str(relative))
         rebuild_index(); audit('backup-restored')
@@ -762,7 +833,7 @@ def edit_profile():
                     if running('frpc'): service('frpc', 'stop')
                     folder = pdir(pid)
                     if folder.parent != ROOT / 'profiles': raise ValueError('删除路径错误')
-                    shutil.rmtree(folder); set_current(''); (ROOT / 'frpc.toml').unlink(missing_ok=True); rebuild_index()
+                    shutil.rmtree(folder); set_current(''); (unlink_quiet(ROOT / 'frpc.toml')); rebuild_index()
                 return
         else:
             validate_profile(p); unique_name(p['name'], pid)
@@ -804,7 +875,7 @@ def configure_server():
 def check_port_conflict(host, port_value, exclude_pid=None):
     """Return True when another local process already listens on host:port."""
     if not shutil.which('ss'): return None
-    result = subprocess.run(['ss', '-lntuH'], capture_output=True, text=True, timeout=10)
+    result = run_cmd(['ss', '-lntuH'], capture_output=True, text=True, timeout=10)
     needle = f':{port_value}'
     for line in result.stdout.splitlines():
         fields = line.split()
@@ -820,13 +891,13 @@ def firewall_hint(port_value, proto='tcp'):
     """Detect common firewall tools and return actionable hints; never modify rules."""
     hints = []
     if shutil.which('ufw'):
-        result = subprocess.run(['ufw', 'status'], capture_output=True, text=True, timeout=10)
+        result = run_cmd(['ufw', 'status'], capture_output=True, text=True, timeout=10)
         if 'Status: active' in result.stdout and str(port_value) not in result.stdout:
             hints.append(f'ufw 已启用，但未见 {port_value}/{proto} 放行规则')
     if shutil.which('firewall-cmd'):
-        result = subprocess.run(['firewall-cmd', '--state'], capture_output=True, text=True, timeout=10)
+        result = run_cmd(['firewall-cmd', '--state'], capture_output=True, text=True, timeout=10)
         if result.stdout.strip() == 'running':
-            check = subprocess.run(['firewall-cmd', f'--query-port={port_value}/{proto}'], capture_output=True, text=True, timeout=10)
+            check = run_cmd(['firewall-cmd', f'--query-port={port_value}/{proto}'], capture_output=True, text=True, timeout=10)
             if check.returncode != 0: hints.append(f'firewalld 正在运行，{port_value}/{proto} 未放行')
     if os.name == 'nt': hints.append('Windows 防火墙请在“高级安全防火墙”中确认入站规则')
     return hints
@@ -1004,7 +1075,7 @@ def import_external(role):
     if set(config) - permitted or 'includes' in config or 'store' in config: raise ValueError('包含未支持字段/includes/store，不能自动导入；原文件保留')
     if config.get('clientID', pid) != pid: raise ValueError('来源 profile 不一致，拒绝跨服务端导入')
     p = load_profile(pid); sec = secrets_for(pid); rows = []
-    canonical = tomllib.loads(render(pid))
+    canonical = _load_toml(render(pid))
     external_log = config.get('log', {})
     canonical_log = canonical.get('log', {})
     if set(external_log) - {'to', 'level', 'maxDays', 'disablePrintColor'}:
@@ -1205,7 +1276,7 @@ def show_logs(role, lines=50):
         print(f'[日志] {path} 共 {len(content)} 行，已显示最近 {min(lines, len(content))} 行。')
         return
     if os.name != 'nt' and shutil.which('journalctl'):
-        subprocess.run(['journalctl', '-u', role, '-n', str(lines), '--no-pager'])
+        run_cmd(['journalctl', '-u', role, '-n', str(lines), '--no-pager'])
         print(f'[日志] 已从 journalctl 读取最近 {lines} 行。')
         return
     print('暂无文件日志；请查看平台服务日志。')
@@ -1236,7 +1307,7 @@ def logs_menu(role):
             removed = 0
             for item in files:
                 if item.name == role + '.log': continue
-                item.unlink(missing_ok=True); removed += 1
+                unlink_quiet(item); removed += 1
             result_ok(f'已清理 {removed} 个轮转归档，当前日志保留。'); pause()
         elif n == 4:
             print(f'日志目录：{ROOT / "logs"}')
@@ -1262,7 +1333,7 @@ def delete_profile_id(pid):
         if folder.parent != ROOT / 'profiles': raise ValueError('删除路径错误')
         shutil.rmtree(folder)
         if pid == active():
-            set_current(''); (ROOT / 'frpc.toml').unlink(missing_ok=True)
+            set_current(''); (unlink_quiet(ROOT / 'frpc.toml'))
         rebuild_index(); audit('profile-deleted')
     print('服务端 profile 及其映射已删除。')
 
@@ -1288,20 +1359,20 @@ def install(role):
     script = Path(__file__).resolve().parent.parent / ('install-' + role + ('.ps1' if os.name == 'nt' else '.sh'))
     if not script.exists(): raise ValueError('安装脚本未安装')
     args = ['powershell', '-File', str(script), '-Version', 'v' + VERSION] if os.name == 'nt' else ['bash', str(script), '--version', 'v' + VERSION]
-    subprocess.run(args, check=True)
+    run_cmd(args, check=True)
 
 def uninstall(role):
     script = Path(__file__).resolve().parent.parent / ('uninstall-windows.ps1' if os.name == 'nt' else 'uninstall.sh')
     if not script.exists(): raise ValueError('卸载脚本未安装')
     if confirm('卸载 ' + role + '？默认保留配置和日志。'):
         args = ['powershell', '-File', str(script), '-Component', role, '-Yes'] if os.name == 'nt' else ['bash', str(script), role]
-        subprocess.run(args, check=True)
+        run_cmd(args, check=True)
 
 SUPPORTED_VERSIONS = ('0.72.0',)
 
 def installed_version(role):
     try:
-        result = subprocess.run([str(binary(role)), '--version'], capture_output=True, text=True, timeout=10)
+        result = run_cmd([str(binary(role)), '--version'], capture_output=True, text=True, timeout=10)
         value = (result.stdout or result.stderr).strip().splitlines()
         return value[0].strip() if value else 'unknown'
     except (OSError, subprocess.SubprocessError): return 'unknown'
@@ -1318,7 +1389,7 @@ def upgrade(role, target=None):
     before = installed_version(role)
     backup_dir = backup([ROOT / (role + '.toml')], 'pre-upgrade')
     args = ['powershell', '-File', str(script), '-Version', 'v' + SUPPORTED_VERSIONS[-1]] if os.name == 'nt' else ['bash', str(script), '--version', 'v' + SUPPORTED_VERSIONS[-1]]
-    result = subprocess.run(args, capture_output=True, text=True)
+    result = run_cmd(args, capture_output=True, text=True)
     after = installed_version(role)
     if result.returncode != 0:
         result_error('升级失败，正在恢复配置备份。')
@@ -1348,7 +1419,7 @@ def run(argv=None):
         removed = 0
         for item in log_files(role):
             if item.name == role + '.log': continue
-            item.unlink(missing_ok=True); removed += 1
+            unlink_quiet(item); removed += 1
         print(json.dumps({'removed': removed}, ensure_ascii=False)); return
     if cmd == 'diagnose': print(json.dumps(diagnostics_report(role), ensure_ascii=False, indent=2)); return
     if cmd == 'backups': print(json.dumps([{k: str(v) if k == 'path' else v for k, v in item.items()} for item in list_backups()], ensure_ascii=False, indent=2)); return

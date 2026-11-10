@@ -22,7 +22,7 @@ $native = Join-Path $root 'native'
 $bin = Join-Path $root 'bin'
 $services = Join-Path $root 'services'
 $repo = 'https://raw.githubusercontent.com/1911981822/frp-simple-bash/main'
-$ManagerVersion = 'v0.1.9-ux2.1'
+$ManagerVersion = 'v0.1.10-compat.1'
 $mirror = if (Test-Path Env:FRP_MIRROR_URL) { [string]$env:FRP_MIRROR_URL } else { 'https://download.sueiyuan.top' }
 if ($mirror -eq 'off') { $mirror = '' }
 if ($mirror -and $mirror -notmatch '^https://') { throw 'Mirror URL must use HTTPS, or be empty/off.' }
@@ -36,7 +36,7 @@ function Get-HttpsFile([string]$Url, [string]$Destination) {
         $request.AllowAutoRedirect = $false
         $request.Timeout = 120000
         $request.ReadWriteTimeout = 120000
-        $request.UserAgent = 'frp-simple-bash/v0.1.9-ux2.1'
+        $request.UserAgent = 'frp-simple-bash/v0.1.10-compat.1'
         $response = $request.GetResponse()
         try {
             $status = [int]$response.StatusCode
@@ -82,11 +82,11 @@ $python = $null
 foreach ($candidate in @('python','python3','py')) {
     $found = Get-Command $candidate -ErrorAction SilentlyContinue
     if ($found) {
-        & $found.Source -c 'import sys;sys.exit(0 if sys.version_info >= (3,11) else 1)' 2>$null
+        & $found.Source -c 'import sys;sys.exit(0 if sys.version_info >= (3,6) else 1)' 2>$null
         if ($LASTEXITCODE -eq 0) { $python = $found.Source; break }
     }
 }
-if (-not $python) { throw 'Python 3.11+ is required. Install Python and add it to PATH.' }
+if (-not $python) { throw 'Python 3.6+ is required. Install Python and add it to PATH.' }
 New-Item -ItemType Directory -Force -Path $root,$native,$bin,$services,$data,(Join-Path $data 'logs') | Out-Null
 # Remove inherited and explicit access rules; grant only SYSTEM and Administrators.
 $acl = New-Object Security.AccessControl.DirectorySecurity

@@ -107,7 +107,7 @@ class Validation:
         self.assert_true((self.root / 'source').is_dir() and not (self.root / 'source').is_symlink(), 'Missing local source checkout')
         for name in ('install-frps.sh', 'install-frpc.sh', 'uninstall.sh', 'lib/manager.py'):
             source = self.root / 'source' / name
-            self.assert_true(source.is_file() and source.resolve().is_relative_to(self.root / 'source'), 'Missing/escaped source file')
+            self.assert_true(source.is_file() and str(source.resolve()).startswith(str((self.root / 'source').resolve()) + '/'), 'Missing/escaped source file')
         self.assert_true(self.root.joinpath('frp-linux.tar.gz').is_file(), 'Missing predownloaded archive')
         digest = hashlib.sha256(self.root.joinpath('frp-linux.tar.gz').read_bytes()).hexdigest()
         self.assert_true(digest == CHECKSUM, 'Archive SHA256 mismatch')

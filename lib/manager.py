@@ -28,11 +28,14 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v0.1.25-dashboard.1'
+MANAGER_RELEASE_VERSION = 'v0.1.26-portconflict.1'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
 TEST = os.environ.get('FRP_TEST_MODE') == '1'
+# Current interactive menu role ('frps'/'frpc'); set at main_menu entry so
+# result_error can quote the correct log even in frps sub-menus.
+_CURRENT_ROLE = 'frps'
 
 # Single source of truth for state labels (详细设计 §10.2 / §10.3).
 # Keys include both the documented enum values and the engine's own aliases.
@@ -931,15 +934,20 @@ def result_ok(message, detail=None):
 def result_info(message, detail=None):
     _box('[提示]', message, detail)
 
-def result_error(message, hint=None):
+def result_error(message, hint=None, role=None):
     """Render a failure with the four elements of 需求 §11.
 
     reason (message) + suggestion (hint) + log path; impact is conveyed by the
     wording of each call site. The log path is appended once, automatically.
+    role selects the log file to quote; when omitted it is derived from the
+    current menu context (active() only concerns frpc, never frps).
     """
     lines = []
     if hint: lines.append('建议：' + str(hint))
-    try: lines.append('日志：' + error_log_path('frpc' if active() else 'frps'))
+    if role is None:
+        # active() is frpc-only; frps menus must never quote frpc.log.
+        role = 'frps' if _CURRENT_ROLE == 'frps' else ('frpc' if active() else 'frps')
+    try: lines.append('日志：' + error_log_path(role))
     except (ValueError, OSError): pass
     _box('[失败]', message, '\n'.join(lines) if lines else None)
 
@@ -1550,20 +1558,37 @@ def configure_server():
     else:
         result_info('frps 配置已保存；当前运行服务将在下次重启后使用新配置。')
 
-def check_port_conflict(host, port_value, proto='tcp', exclude_pid=None):
-    """Return True when another local process already listens on host:port/protocol."""
+def check_port_conflict(host, port_value, proto='tcp', exclude_pid=None, exclude_role=None):
+    """Return True when ANOTHER process listens on host:port/protocol.
+
+    Uses `ss -p` so the owning process name is visible; a listener whose
+    process name equals exclude_role (e.g. frps itself) is never a conflict.
+    Returns None when `ss` is unavailable (caller must not treat it as a hit).
+    """
     if not shutil.which('ss'): return None
-    result = run_cmd(['ss', '-lntuH'], capture_output=True, text=True, timeout=10)
+    result = run_cmd(['ss', '-lntuHp'], capture_output=True, text=True, timeout=10)
     needle = ':' + str(port_value)
     for line in result.stdout.splitlines():
         fields = line.split()
-        if len(fields) < 5: continue
-        netid = fields[0].lower()
-        if proto and not netid.startswith(proto): continue
-        local = fields[4]
+        if len(fields) < 4: continue
+        state = fields[0].lower()
+        # ss State column: LISTEN = TCP listener, UNCONN = UDP listener.
+        # (The protocol is NOT the state; filtering on state was a latent bug
+        # that made every check silently skip all lines.)
+        if proto == 'tcp' and state != 'listen': continue
+        if proto == 'udp' and state != 'unconn': continue
+        # ss -lntuH columns: State Recv-Q Send-Q Local Peer Process.
+        # Local is fields[3] (Peer is fields[4]).
+        local = fields[3]
         if not local.endswith(needle): continue
         if host not in ('0.0.0.0', '::', '') and not local.startswith(host): continue
+        # Exclude a specific pid, or any listener whose comm matches the role
+        # (frps/frpc itself listening on its own bindPort is NOT a conflict).
         if exclude_pid and ('pid=' + str(exclude_pid)) in line: continue
+        if exclude_role:
+            import re as _re
+            mname = _re.search(r'users:\(\("([^"]+)"', line)
+            if mname and mname.group(1) == exclude_role: continue
         return True
     return False
 
@@ -1746,8 +1771,10 @@ def frps_config_menu():
                 validate_frps_config(data); verify('frps', toml(data))
                 result_ok('配置语法和字段校验通过。')
                 for key in ('bindPort', 'vhostHTTPPort', 'vhostHTTPSPort', 'kcpBindPort', 'quicBindPort', 'tcpmuxHTTPConnectPort'):
-                    if data.get(key) and check_port_conflict('0.0.0.0', data[key]): result_error(f'{key}={data[key]} 已被其他进程监听。')
-                if web.get('port') and check_port_conflict('127.0.0.1', web['port']): result_error(f'Dashboard 端口 {web["port"]} 已被占用。')
+                    if data.get(key) and check_port_conflict('0.0.0.0', data[key], exclude_role='frps'):
+                        result_error(f'{key}={data[key]} 已被其他进程监听。', hint='frps 自身监听该端口不算冲突；确认是否有别的服务占用了此端口。')
+                if web.get('port') and check_port_conflict('127.0.0.1', web['port'], exclude_role='frps'):
+                    result_error(f'Dashboard 端口 {web["port"]} 已被占用。')
                 pause()
             elif n == 9:
                 ports = [('bindPort', 'tcp')] + [('vhostHTTPPort', 'tcp'), ('vhostHTTPSPort', 'tcp')]
@@ -1990,6 +2017,8 @@ def service_feedback(role, action):
     return state_value
 
 def main_menu(role):
+    global _CURRENT_ROLE
+    _CURRENT_ROLE = role
     while True:
         clear_screen()
         try:

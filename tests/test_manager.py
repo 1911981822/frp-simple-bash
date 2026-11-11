@@ -552,6 +552,53 @@ class ManagerTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             self.assertTrue(m.wait_connection(pid))
 
+    # ---- port conflict must not flag the component itself ----
+    def test_check_port_conflict_tcp_uses_listen_state(self):
+        # ss State is LISTEN for TCP; the check must not filter by 'tcp' prefix.
+        line = 'LISTEN 0 128 0.0.0.0:7000 0.0.0.0:* users:((\"nginx\",pid=999,fd=3))'
+        with patch.object(m.shutil, 'which', return_value='/usr/sbin/ss'), \
+             patch.object(m, 'run_cmd') as rc:
+            rc.return_value = type('R', (), {'stdout': line + '\n', 'stderr': ''})()
+            self.assertTrue(m.check_port_conflict('0.0.0.0', 7000, proto='tcp', exclude_role='frps'))
+    def test_check_port_conflict_udp_uses_unconn_state(self):
+        line = 'UNCONN 0 0 0.0.0.0:7000 0.0.0.0:* users:((\"dnsmasq\",pid=77,fd=3))'
+        with patch.object(m.shutil, 'which', return_value='/usr/sbin/ss'), \
+             patch.object(m, 'run_cmd') as rc:
+            rc.return_value = type('R', (), {'stdout': line + '\n', 'stderr': ''})()
+            self.assertTrue(m.check_port_conflict('0.0.0.0', 7000, proto='udp'))
+    def test_check_port_conflict_ignores_wrong_protocol(self):
+        # A UDP listener must NOT count as a TCP conflict.
+        line = 'UNCONN 0 0 0.0.0.0:7000 0.0.0.0:* users:((\"dnsmasq\",pid=77,fd=3))'
+        with patch.object(m.shutil, 'which', return_value='/usr/sbin/ss'), \
+             patch.object(m, 'run_cmd') as rc:
+            rc.return_value = type('R', (), {'stdout': line + '\n', 'stderr': ''})()
+            self.assertFalse(m.check_port_conflict('0.0.0.0', 7000, proto='tcp'))
+
+    # ---- port conflict must not flag the component itself ----
+    def test_check_port_conflict_excludes_self_role(self):
+        # frps itself listening on 7000 must NOT be reported as a conflict.
+        line = 'LISTEN 0 128 0.0.0.0:7000 0.0.0.0:* users:((\"frps\",pid=12345,fd=3))'
+        with patch.object(m.shutil, 'which', return_value='/usr/sbin/ss'), \
+             patch.object(m, 'run_cmd') as rc:
+            rc.return_value = type('R', (), {'stdout': line + '\n', 'stderr': ''})()
+            self.assertFalse(m.check_port_conflict('0.0.0.0', 7000, exclude_role='frps'))
+    def test_check_port_conflict_flags_other_process(self):
+        line = 'LISTEN 0 128 0.0.0.0:7000 0.0.0.0:* users:((\"nginx\",pid=999,fd=3))'
+        with patch.object(m.shutil, 'which', return_value='/usr/sbin/ss'), \
+             patch.object(m, 'run_cmd') as rc:
+            rc.return_value = type('R', (), {'stdout': line + '\n', 'stderr': ''})()
+            self.assertTrue(m.check_port_conflict('0.0.0.0', 7000, exclude_role='frps'))
+    def test_check_port_conflict_none_when_ss_missing(self):
+        with patch.object(m.shutil, 'which', return_value=None):
+            self.assertIsNone(m.check_port_conflict('0.0.0.0', 7000))
+    def test_result_error_quotes_frps_log_in_frps_menu(self):
+        m._CURRENT_ROLE = 'frps'
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            m.result_error('测试失败')
+        self.assertIn('frps.log', out.getvalue())
+        self.assertNotIn('frpc.log', out.getvalue())
+
     # ---- dashboard default listen address (external access) ----
     def test_configure_server_dashboard_defaults_to_all_interfaces(self):
         # input: 业务监听地址, 业务端口, Dashboard用户名, Dashboard监听地址,

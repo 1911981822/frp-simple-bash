@@ -54,4 +54,30 @@ class InstallerInterfaceTests(unittest.TestCase):
         stop = text.index('was_running=1; systemctl stop')
         self.assertLess(preflight, stop)
 
+    # ---- cross-distro dependency installation ----
+    def test_dependency_install_is_noninteractive_on_debian(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        self.assertIn('DEBIAN_FRONTEND=noninteractive apt-get', text)
+    def test_every_supported_package_manager_is_handled(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        for manager in ('apt-get', 'dnf', 'yum', 'apk'):
+            self.assertIn(manager, text)
+        self.assertIn('apk add --no-cache', text)
+    def test_dpkg_lock_conflict_gives_actionable_hint(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        self.assertIn('check_dpkg_lock', text)
+        self.assertIn('lock-frontend', text)
+        self.assertIn('unattended-upgrades', text)
+    def test_failed_install_prints_manual_commands_per_distro(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        for hint in ('Debian/Ubuntu:', 'Fedora/RHEL:', 'CentOS 7:', 'Alpine:'):
+            self.assertIn(hint, text)
+    def test_sha256sum_maps_to_coreutils(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        self.assertIn('sha256sum) out+=(coreutils)', text)
+    def test_missing_ss_is_a_warning_not_a_blocker(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        self.assertIn('端口占用检测将不可用', text)
+        self.assertIn('iproute2', text)
+
 if __name__ == '__main__': unittest.main()

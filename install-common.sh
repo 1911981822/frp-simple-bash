@@ -64,27 +64,100 @@ case "$(uname -m)" in
 esac
 missing=()
 for tool in curl tar sha256sum python3; do command -v "$tool" >/dev/null || missing+=("$tool"); done
+
+# Detect the package manager and give each family its own non-interactive,
+# lock-aware invocation. Ubuntu/Debian needs DEBIAN_FRONTEND=noninteractive,
+# Fedora/RHEL uses dnf, CentOS 7 uses yum, Alpine uses apk.
+pkg_manager=''
+for candidate in apt-get dnf yum apk; do
+  if command -v "$candidate" >/dev/null 2>&1; then pkg_manager=$candidate; break; fi
+done
+
+pkg_names() {
+  # Map logical names to the distro-specific packages (ss lives in iproute2).
+  local out=()
+  for name in "$@"; do
+    case "$name" in
+      sha256sum) out+=(coreutils);;
+      ss) if [[ "$pkg_manager" == apk ]]; then out+=(iproute2); else out+=(iproute2); fi;;
+      *) out+=("$name");;
+    esac
+  done
+  printf '%s ' "${out[@]}"
+}
+
+check_dpkg_lock() {
+  # A running unattended-upgrade holds the lock; fail with an actionable hint.
+  [[ "$pkg_manager" == apt-get ]] || return 0
+  local locks=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock)
+  for lock in "${locks[@]}"; do
+    if [[ -e "$lock" ]] && command -v fuser >/dev/null 2>&1 && fuser "$lock" >/dev/null 2>&1; then
+      echo "apt 正被其他进程占用（常见于 Ubuntu/Debian 的自动更新）。" >&2
+      echo "请等待其完成后重试，或手动执行：" >&2
+      echo "  sudo systemctl stop unattended-upgrades; sudo apt-get install -y $(pkg_names "$@")" >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
+run_pkg_install() {
+  local packages
+  packages=$(pkg_names "$@")
+  case "$pkg_manager" in
+    apt-get)
+      check_dpkg_lock "$@" || return 1
+      DEBIAN_FRONTEND=noninteractive apt-get update && \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y $packages
+      ;;
+    dnf) dnf install -y $packages ;;
+    yum) yum install -y $packages ;;
+    apk) apk add --no-cache $packages ;;
+    *) return 1 ;;
+  esac
+}
+
 if ((${#missing[@]})); then
-  printf '缺少依赖：%s。将通过系统包管理器安装 curl tar coreutils python3。\n' "${missing[*]}"
+  printf '缺少依赖：%s。将通过系统包管理器安装：%s\n' "${missing[*]}" "$(pkg_names "${missing[@]}")"
+  if [[ -z "$pkg_manager" ]]; then
+    echo '无法识别包管理器，请手动安装：' >&2
+    echo "  curl tar coreutils python3  # 对应发行版的包名可能不同" >&2
+    exit 1
+  fi
   if ((yes == 0)); then read -r -p '确认安装依赖？[y/N] ' answer; [[ "$answer" =~ ^[Yy]$ ]] || exit 1; fi
-  if command -v apt-get >/dev/null; then apt-get update; apt-get install -y curl tar coreutils python3
-  elif command -v dnf >/dev/null; then dnf install -y curl tar coreutils python3
-  elif command -v yum >/dev/null; then yum install -y curl tar coreutils python3
-  elif command -v apk >/dev/null; then apk add curl tar coreutils python3
-  else echo '无法识别包管理器，请手动安装。' >&2; exit 1; fi
+  if ! run_pkg_install "${missing[@]}"; then
+    echo '依赖安装失败。请手动执行（按你的发行版选择）：' >&2
+    echo "  Debian/Ubuntu:  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y $(pkg_names "${missing[@]}")" >&2
+    echo "  Fedora/RHEL:    sudo dnf install -y $(pkg_names "${missing[@]}")" >&2
+    echo "  CentOS 7:       sudo yum install -y $(pkg_names "${missing[@]}")" >&2
+    echo "  Alpine:         sudo apk add $(pkg_names "${missing[@]}")" >&2
+    exit 1
+  fi
 fi
 # Python 3.6+ is enough: the manager carries its own TOML fallback parser.
-if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,6) else 1)'; then
-  echo "检测到 $(python3 -V 2>&1)，本项目需要 Python 3.6 及以上。"
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,6) else 1)' 2>/dev/null; then
+  echo "检测到 $(python3 -V 2>&1 || echo '未安装 python3')，本项目需要 Python 3.6 及以上。"
+  if [[ -z "$pkg_manager" ]]; then echo '请先安装 Python 3.6+（未找到包管理器）。' >&2; exit 1; fi
   if ((yes == 0)); then read -r -p '确认通过包管理器安装 python3？[y/N] ' answer; [[ "$answer" =~ ^[Yy]$ ]] || exit 1; fi
-  if command -v apt-get >/dev/null; then apt-get update; apt-get install -y python3
-  elif command -v dnf >/dev/null; then dnf install -y python3
-  elif command -v yum >/dev/null; then yum install -y python3
-  elif command -v apk >/dev/null; then apk add python3
-  else echo '请先安装 Python 3.6+。' >&2; exit 1; fi
+  if ! run_pkg_install python3; then
+    echo 'Python 安装失败。请手动执行：' >&2
+    echo "  Debian/Ubuntu: sudo apt-get install -y python3" >&2
+    echo "  Fedora/RHEL:   sudo dnf install -y python3" >&2
+    echo "  CentOS 7:      sudo yum install -y python3" >&2
+    echo "  Alpine:        sudo apk add python3" >&2
+    exit 1
+  fi
 fi
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,6) else 1)' || { echo 'Python 版本仍不满足 3.6+。' >&2; exit 1; }
 python3 -c 'import json,hashlib,ipaddress,urllib.request' || { echo 'Python 标准库不完整。' >&2; exit 1; }
+# ss/iproute2 只用于端口占用检测：缺失时降级为「无法检测」而不是阻断安装。
+if ! command -v ss >/dev/null 2>&1; then
+  echo '提示：未找到 ss（iproute2），端口占用检测将不可用；如需该功能请安装：' >&2
+  echo "  Debian/Ubuntu: sudo apt-get install -y iproute2" >&2
+  echo "  Fedora/RHEL:   sudo dnf install -y iproute" >&2
+  echo "  CentOS 7:      sudo yum install -y iproute" >&2
+  echo "  Alpine:        sudo apk add iproute2" >&2
+fi
 manager=none
 if command -v systemctl >/dev/null && [[ -d /run/systemd/system ]]; then manager=systemd
 elif command -v rc-service >/dev/null && command -v rc-update >/dev/null; then manager=openrc

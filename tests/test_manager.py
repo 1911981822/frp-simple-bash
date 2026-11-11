@@ -552,6 +552,51 @@ class ManagerTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             self.assertTrue(m.wait_connection(pid))
 
+    # ---- unit refresh on upgrade (template changes reach a running host) ----
+    def test_unit_differs_detects_template_change(self):
+        unit = m.ROOT / 'installed.service'; unit.write_text('[Service]\n# v1\n')
+        template = m.ROOT / 'template.service'; template.write_text('[Service]\n# v2\n')
+        with patch.object(m, '_service_manager', return_value='systemd'), \
+             patch.object(m, 'installed_unit_path', return_value=unit), \
+             patch.object(m, 'template_path', return_value=template):
+            self.assertTrue(m.unit_differs('frps'))
+            unit.write_text('[Service]\n# v2\n')
+            self.assertFalse(m.unit_differs('frps'))
+    def test_refresh_units_noop_when_no_manager(self):
+        with patch.object(m, '_service_manager', return_value=''):
+            self.assertEqual(m.refresh_units(('frps',)), [])
+    def test_refresh_units_skips_when_identical(self):
+        with patch.object(m, '_service_manager', return_value='systemd'), \
+             patch.object(m, 'unit_differs', return_value=False), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(m.refresh_units(('frps',)), [])
+    def test_refresh_units_respects_decline(self):
+        unit = m.ROOT / 'unit'; unit.write_text('# old\n')
+        template = m.ROOT / 'template'; template.write_text('# new\n')
+        with patch.object(m, '_service_manager', return_value='systemd'), \
+             patch.object(m, 'installed_unit_path', return_value=unit), \
+             patch.object(m, 'template_path', return_value=template), \
+             patch.object(m, 'confirm', return_value=False), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(m.refresh_units(('frps',)), [])
+        self.assertEqual(unit.read_text(), '# old\n')
+    def test_refresh_units_applies_and_reloads(self):
+        unit = m.ROOT / 'unit'; unit.write_text('# old\n')
+        template = m.ROOT / 'template'; template.write_text('# new\n')
+        with patch.object(m, '_service_manager', return_value='systemd'), \
+             patch.object(m, 'installed_unit_path', return_value=unit), \
+             patch.object(m, 'template_path', return_value=template), \
+             patch.object(m, 'confirm', return_value=True), \
+             patch.object(m, 'run_cmd') as runner, \
+             contextlib.redirect_stdout(io.StringIO()):
+            out = m.refresh_units(('frps',))
+        self.assertEqual(out, ['frps'])
+        self.assertEqual(unit.read_text(), '# new\n')
+        self.assertIn('daemon-reload', ' '.join(runner.call_args[0][0]))
+        backups = [p for p in (m.ROOT / 'backups').iterdir() if 'unit-frps' in p.name]
+        self.assertTrue(backups)
+        self.assertEqual((backups[0] / 'frps.service.old').read_text(), '# old\n')
+
     # ---- §17.4 security / §17.2 integration (offline, mocked boundaries) ----
     def test_secret_files_have_restricted_permissions(self):
         if os.name == 'nt': self.skipTest('POSIX permissions only')

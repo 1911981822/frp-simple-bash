@@ -122,6 +122,12 @@ frps configure|logs|install|uninstall [--purge]|upgrade [<version>]
 
 `--json` 输出稳定信封（`ok/code/component/service_state/connection_state/active_profile/error`），适合脚本采集。写操作支持 `--yes` 跳过确认。
 
+**升级会覆盖全部 22 个管理器文件**（`lib/`、安装/卸载脚本、`bin/` 6 个入口、`templates/` 4 个模板），但**不动** `native/` 二进制与 `/etc/frp` 配置。升级后若检测到已注册的 systemd/OpenRC 单元与当前模板不一致，会询问是否刷新并 `daemon-reload`（旧单元保留在 `backups/` 下可回滚）。也可单独执行：
+
+```bash
+frpc refresh-units [--yes]     # 只刷新服务单元，不升级脚本
+```
+
 ## 卸载
 
 ```bash

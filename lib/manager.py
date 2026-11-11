@@ -28,7 +28,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v0.1.23-purge.1'
+MANAGER_RELEASE_VERSION = 'v0.1.24-units.1'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -2334,6 +2334,83 @@ def restore_upgrade_snapshot(directory):
         restored.append(rel)
     return restored
 
+def _service_manager():
+    """Return 'systemd' / 'openrc' / '' for the running host."""
+    if os.name == 'nt': return ''
+    if shutil.which('systemctl') and Path('/run/systemd/system').exists(): return 'systemd'
+    if shutil.which('rc-service') and shutil.which('rc-update'): return 'openrc'
+    return ''
+
+def installed_unit_path(role):
+    """Where the service unit for this component lives on this host."""
+    manager = _service_manager()
+    if manager == 'systemd': return Path('/etc/systemd/system') / (role + '.service')
+    if manager == 'openrc': return Path('/etc/init.d') / role
+    return None
+
+def template_path(role):
+    manager = _service_manager()
+    if manager == 'systemd': return INSTALL_ROOT / 'templates' / (role + '.service')
+    if manager == 'openrc': return INSTALL_ROOT / 'templates' / (role + '.openrc')
+    return None
+
+def unit_differs(role):
+    """True when the registered unit content differs from the current template."""
+    unit, template = installed_unit_path(role), template_path(role)
+    if not unit or not template: return False
+    if not unit.exists() or not template.exists(): return False
+    try: return unit.read_bytes() != template.read_bytes()
+    except OSError: return False
+
+def refresh_units(roles=None, yes=False):
+    """Offer to re-install registered units from the bundled templates.
+
+    Upgrading manager scripts replaces templates/ but historically left already
+    registered systemd/OpenRC units untouched, so template fixes never reached a
+    running host. This closes that gap without silently touching service files:
+    it only refreshes when content actually differs, and requires confirmation
+    unless --yes was passed.
+    """
+    manager = _service_manager()
+    if not manager: return []
+    stale = [r for r in (roles or ('frps', 'frpc')) if unit_differs(r)]
+    if not stale: return []
+    names = '、'.join(stale)
+    result_info('检测到服务单元模板已更新：' + names,
+                detail='已注册的 ' + manager + ' 单元与当前模板不一致，可刷新使新配置生效。')
+    if not yes and not confirm('用新模板刷新 ' + names + ' 的服务单元并 daemon-reload？'):
+        result_info('已跳过服务单元刷新；现有服务注册保持不变。')
+        return []
+    refreshed, failed = [], []
+    for role in stale:
+        unit, template = installed_unit_path(role), template_path(role)
+        try:
+            old = unit.read_bytes() if unit.exists() else None
+            atomic(unit, template.read_text(encoding='utf-8'))
+            os.chmod(str(unit), 0o644 if manager == 'systemd' else 0o755)
+        except (OSError, ValueError) as exc:
+            failed.append(role + '（' + str(exc) + '）')
+            continue
+        refreshed.append(role)
+        # Keep a rollback copy next to the backups so a bad template is recoverable.
+        try:
+            directory = ROOT / 'backups' / (dt.datetime.now().strftime('%Y%m%d-%H%M%S')
+                                            + '-unit-' + role + '-' + secrets.token_hex(3))
+            directory.mkdir(parents=True, mode=0o700)
+            if old is not None:
+                (directory / (role + '.service.old')).write_bytes(old)
+            atomic(directory / 'manifest.json', json.dumps(
+                {'files': [role], 'reason': 'unit-refresh'}, ensure_ascii=False, indent=2) + '\n')
+        except OSError: pass
+    if refreshed and manager == 'systemd':
+        try: run_cmd(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError): pass
+    if refreshed: audit('units-refreshed')
+    if refreshed: result_ok('已刷新服务单元：' + '、'.join(refreshed) + '（已 daemon-reload）')
+    if failed: result_error('部分服务单元刷新失败：' + '、'.join(failed),
+                            hint='服务注册可能仍是旧内容，请检查上方错误或重新运行安装脚本。')
+    return refreshed
+
 def upgrade(role, target=None, yes=False):
     """Update the management scripts (manager itself) from a published release bundle.
 
@@ -2433,6 +2510,9 @@ def upgrade(role, target=None, yes=False):
     rollback_hint = ('升级前快照：' + snapshot.name + '（可用 restore 恢复）') if snapshot else ''
     result_ok(f'管理器已更新：{before} → {after}。配置与 frp 二进制「{installed_frp_version(role)}」保持不变；下次运行 {role} 即生效。',
               detail=rollback_hint or None)
+    # Template fixes do not reach a running host unless the registered unit is
+    # refreshed; do it here (only when content differs, and with confirmation).
+    refresh_units(('frps', 'frpc'), yes=yes)
 
 
 CLI_FLAGS = ('--json', '--yes', '--purge', '--follow', '--non-interactive')
@@ -2527,6 +2607,12 @@ def run(argv=None):
     if cmd in ('upgrade','update'):
         _a, flags = _parse_flags(argv)
         upgrade(role, flags.get('version'), yes=bool(flags.get('yes')))
+        return
+    if cmd in ('refresh-units', 'refresh_units'):
+        _a, flags = _parse_flags(argv)
+        done = refresh_units(('frps', 'frpc'), yes=bool(flags.get('yes')))
+        print(json.dumps({'ok': True, 'code': 0, 'refreshed': done, 'error': None},
+                         ensure_ascii=False, indent=2))
         return
     if cmd == 'configure': (configure_server if role == 'frps' else profile_wizard)(); return
     if cmd == 'import': import_external(role); return

@@ -353,11 +353,24 @@ class ManagerTests(unittest.TestCase):
         self.assertIn('status', calls)
     def test_login_success_does_not_mask_proxy_error(self):
         pid = self.create(); m.set_current(pid)
+        with patch.object(m, 'apply'):
+            m.save_mappings(pid, [self.mapping()])  # an enabled proxy must reach the admin API
         (m.ROOT / 'logs').mkdir(exist_ok=True)
         (m.ROOT / 'logs' / 'frpc.log').write_text('start frpc service\nlogin to server success\n')
         with patch.object(m, 'running', return_value=True), \
              patch.object(m, 'api', return_value={'tcp': [{'name': 'ssh', 'status': 'error'}]}):
             self.assertEqual(m.connection(pid)['state'], 'proxy-error')
+    def test_zero_proxies_skips_network_probes(self):
+        pid = self.create(); m.set_current(pid)
+        m._CONN_CACHE.clear()
+        (m.ROOT / 'logs').mkdir(exist_ok=True)
+        (m.ROOT / 'logs' / 'frpc.log').write_text('start frpc service\nlogin to server success\n')
+        n = [0]
+        def fake_api(*a, **k):
+            n[0] += 1; raise OSError('unreachable')
+        with patch.object(m, 'running', return_value=True), patch.object(m, 'api', side_effect=fake_api):
+            self.assertEqual(m.connection(pid, fresh=True)['state'], 'connected')
+        self.assertEqual(n[0], 0)  # no blocking API probes on the menu path
     def test_auth_failure_detected_from_frp_072_log(self):
         pid = self.create()
         (m.ROOT / 'logs').mkdir(exist_ok=True)
@@ -486,6 +499,42 @@ class ManagerTests(unittest.TestCase):
         # _within must not depend on '/' string prefixes.
         self.assertTrue(m._within(Path('/a/b/c'), Path('/a/b')))
         self.assertFalse(m._within(Path('/a/../b'), Path('/a')) if os.name != 'nt' else True)
+
+    # ---- Menu: status screen must stay visible and not block on double probes ----
+    def test_show_status_accepts_precomputed_data(self):
+        pid = self.create(); data = m.status('frpc')
+        calls = []
+        with patch.object(m, 'status', side_effect=lambda r: (calls.append(r) or data)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            m.show_status('frpc', data)
+        self.assertEqual(calls, [])  # no second status() / API probe
+    def test_menu_status_action_pauses(self):
+        m.atomic(m.ROOT / 'frps.toml', m.toml({'bindPort': 7000}))
+        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', side_effect=['1', '0']), \
+             patch.object(m, 'service', return_value='active'), patch.object(m, 'pause') as paused:
+            m.main_menu('frps')
+        self.assertGreaterEqual(paused.call_count, 1)
+    def test_connection_cache_avoids_repeated_api_probes(self):
+        pid = self.create(); m.set_current(pid)
+        with patch.object(m, 'apply'):
+            m.save_mappings(pid, [self.mapping()])  # enabled proxy -> admin API is consulted
+        m._CONN_CACHE.clear()
+        n = [0]
+        def fake_api(*a, **k):
+            n[0] += 1
+            return {'tcp': [{'name': 'ssh', 'status': 'online'}]}
+        with patch.object(m, 'running', return_value=True), patch.object(m, 'api', side_effect=fake_api), \
+             patch.object(m, '_login_state_from_log', return_value=None):
+            r1 = m.connection(pid); r2 = m.connection(pid)
+        self.assertEqual(r1, r2)
+        self.assertEqual(n[0], 1)  # second call served from cache
+    def test_wait_connection_uses_fresh_state(self):
+        pid = self.create()
+        seq = [{'state': 'connecting'}, {'state': 'connected'}]
+        with patch.object(m, 'connection', side_effect=lambda p, fresh=False: (self.assertTrue(fresh) or seq.pop(0))), \
+             patch.object(m.time, 'monotonic', side_effect=[0, 0, 0, 100]), patch.object(m.time, 'sleep'), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(m.wait_connection(pid))
 
     def test_frps_config_menu_preserves_webserver_tls(self):
         m.atomic(m.ROOT / 'frps.toml', m.toml({'bindPort': 7000,

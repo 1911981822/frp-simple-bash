@@ -28,7 +28,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v0.1.19-qa.1'
+MANAGER_RELEASE_VERSION = 'v0.1.20-menu.1'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -557,14 +557,43 @@ def _login_state_from_log():
         return {'state': 'connecting', 'source': 'frpc-log'}
     return None
 
-def connection(pid):
+_CONN_CACHE = {}
+
+def connection(pid, fresh=False):
+    """Resolve frpc connection state. A short-lived cache keeps menu redraws
+    from repeating blocking API probes; wait_connection() passes fresh=True."""
+    logfile = ROOT / 'logs' / 'frpc.log'
+    try:
+        info = logfile.stat()
+        stamp = getattr(info, 'st_mtime_ns', int(info.st_mtime * 1e9))
+    except OSError: stamp = 0
+    key = (pid, stamp)
+    now = time.monotonic()
+    if not fresh:
+        hit = _CONN_CACHE.get(key)
+        if hit and now - hit[0] < 2.0:
+            return dict(hit[1])
+    result = _connection_uncached(pid)
+    _CONN_CACHE[key] = (now, dict(result))
+    return result
+
+def _connection_uncached(pid):
     if not running('frpc'): return {'state': 'stopped'}
     p = load_profile(pid); s = secrets_for(pid)
     logged = _login_state_from_log()
     # 1) Explicit login failure from frp's own log wins immediately.
     if logged and logged['state'] in ('auth-failed', 'tls-failed'):
         return logged
-    # 2) Per-proxy status from the local admin API is authoritative when
+    # 2) With no enabled proxies there is nothing for the admin API to report:
+    #    a successful login line is conclusive and avoids all network probes.
+    #    (Local disk read only; keeps the menu responsive when Dashboard is down.)
+    try:
+        enabled = [x for x in mappings(pid) if x.get('enabled', True)]
+    except (ValueError, OSError, KeyError, TypeError):
+        enabled = None  # unreadable mappings: fall back to full probing
+    if enabled == [] and logged and logged['state'] == 'connected':
+        return logged
+    # 3) Per-proxy status from the local admin API is authoritative when
     #    proxies exist; it must NOT be masked by a successful login line.
     try:
         data = api(f'http://127.0.0.1:{p.get("admin_port", 7400)}/api/status', 'frp-simple-bash', s['admin_password'])
@@ -576,10 +605,10 @@ def connection(pid):
         if exc.code in (401, 403): return {'state': 'auth-failed', 'detail': f'管理 API 认证失败（HTTP {exc.code}）'}
     except (OSError, ValueError):
         pass
-    # 3) Zero proxies: frp's login line proves the connection.
+    # 5) Zero proxies: frp's login line proves the connection.
     if logged and logged['state'] == 'connected':
         return logged
-    # 4) Optional Dashboard API as a last resort.
+    # 6) Optional Dashboard API as a last resort.
     if s.get('dashboard_username'):
         try:
             host = p.get('dashboard_addr') or p['server_addr']; host = '[' + host + ']' if ':' in host else host
@@ -591,7 +620,7 @@ def connection(pid):
                     return {'state': 'connected', 'source': 'dashboard'}
         except (OSError, ValueError, urllib.error.HTTPError):
             pass
-    # 5) No positive signal yet: report the transient state, never mask as connected.
+    # 7) No positive signal yet: report the transient state, never mask as connected.
     if logged:
         return logged
     return {'state': 'unknown', 'detail': '无启用映射且服务端 API 不可访问，无法确认登录状态'}
@@ -601,7 +630,7 @@ def wait_connection(pid, timeout=30):
     deadline = time.monotonic() + timeout
     last = ''
     while True:
-        result = connection(pid)
+        result = connection(pid, fresh=True)
         state = result['state']
         if state == 'connected':
             result_ok('已连接服务端。')
@@ -1043,7 +1072,7 @@ def diagnostics_report(role):
         report['active_profile'] = {'id': p['id'], 'name': p['name'], 'server': label(p)}
         reachable = port_reachable(p['server_addr'], p['server_port'])
         report['checks'].append({'name': 'server-port', 'ok': reachable, 'detail': f'{p["server_addr"]}:{p["server_port"]}'})
-        result = connection(p['id'])
+        result = connection(p['id'], fresh=True)
         report['checks'].append({'name': 'connection', 'ok': result['state'] == 'connected', 'detail': result['state']})
     report['ok'] = all(item['ok'] for item in report['checks'])
     return report
@@ -1089,7 +1118,7 @@ def diagnostics(role):
             reachable = port_reachable(p['server_addr'], p['server_port'])
             lines.append(f'  服务端端口 {p["server_addr"]}:{p["server_port"]}：{"可达" if reachable else "不可达"}')
             if not reachable: ok = False; lines.append('  建议：检查服务端防火墙、安全组和地址端口。')
-            result = connection(pid)
+            result = connection(pid, fresh=True)
             lines.append('  连接状态：' + result['state'])
             if result.get('detail'): lines.append('  详情：' + result['detail'])
             if result['state'] not in ('connected',): ok = False
@@ -1665,8 +1694,10 @@ def status_bar(role, data):
         parts.append('有待重启修改')
     print('  ' + ' | '.join(str(p) for p in parts if p))
 
-def show_status(role):
-    data = status(role)
+def show_status(role, data=None):
+    """Render a status screen. Accepts a precomputed status dict so the menu
+    does not pay for status() (and its API probes) twice."""
+    if data is None: data = status(role)
     states = {'active': '运行中', 'running': '运行中', 'started': '运行中', 'stopped': '已停止', 'inactive': '已停止', 'failed': '异常', 'unknown': '未知', 'activating': '启动中'}
     section('frps 服务端管理' if role == 'frps' else 'frpc 客户端管理')
     print('  ' + '状态'.ljust(10) + states.get(data['service_state'].lower(), data['service_state']))
@@ -1749,13 +1780,14 @@ def main_menu(role):
         status_bar(role, data)
         n = choose(items, '请选择操作' if role == 'frps' else 'frpc 客户端操作', '退出', groups=groups)
         if not n: return
-        # Sub-menus pause themselves; one-shot results get exactly one pause here.
+        # Sub-menus pause themselves; every other result gets exactly one
+        # pause so the user can actually read it before the menu redraws.
         # Terminal operations (uninstall/upgrade) leave the menu entirely.
-        needs_pause = n != 1
+        needs_pause = True
         terminal = False
         try:
             if role == 'frpc':
-                if n == 1: show_status(role)
+                if n == 1: show_status(role, data)
                 elif n in (2, 3, 4):
                     require_active()
                     if n == 2 or confirm(items[n-1] + '？'):
@@ -1780,7 +1812,7 @@ def main_menu(role):
             else:
                 if n == 1:
                     result_info('正在刷新服务信息。')
-                    show_status(role)
+                    show_status(role, data)
                 elif n in (2,3,4):
                     if n == 2 or confirm(items[n-1] + '？'):
                         service_feedback(role, {2:'start',3:'stop',4:'restart'}[n])

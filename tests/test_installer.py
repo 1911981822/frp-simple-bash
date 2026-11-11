@@ -41,8 +41,10 @@ class InstallerInterfaceTests(unittest.TestCase):
         self.assertNotIn('&& systemctl enable "$component" || systemctl disable', text)
     def test_purge_checks_openrc_and_bin(self):
         text = (ROOT / 'uninstall.sh').read_text()
+        # OpenRC 安装痕迹必须纳入判据
         self.assertIn('/etc/init.d/$other', text)
-        self.assertIn('/opt/frp-simple-bash/bin/$other', text)
+        # 但 bin/{frps,frpc} 是组件共享入口，绝不能作为「另一组件仍安装」的判据
+        self.assertNotIn('/opt/frp-simple-bash/bin/$other', text)
     def test_rollback_snapshots_manager_and_unit(self):
         text = (ROOT / 'install-common.sh').read_text()
         self.assertIn('snapshot_file "$install_root/$rel" "$rel"', text)
@@ -79,5 +81,21 @@ class InstallerInterfaceTests(unittest.TestCase):
         text = (ROOT / 'install-common.sh').read_text()
         self.assertIn('端口占用检测将不可用', text)
         self.assertIn('iproute2', text)
+
+    def test_purge_ignores_shared_bin_entries(self):
+        text = (ROOT / 'uninstall.sh').read_text()
+        self.assertNotIn('"/opt/frp-simple-bash/bin/$other"', text)
+        self.assertIn('other_traces', text)
+        for real_marker in ('/usr/local/bin/$other', '/opt/frp-simple-bash/native/$other',
+                            '/etc/systemd/system/$other.service', '/etc/init.d/$other'):
+            self.assertIn(real_marker, text)
+    def test_purge_reports_which_traces_block_it(self):
+        text = (ROOT / 'uninstall.sh').read_text()
+        self.assertIn('另一个组件 $other 仍安装', text)
+        self.assertIn('发现残留', text)
+        self.assertIn('uninstall.sh $other', text)
+    def test_purge_success_message_present(self):
+        text = (ROOT / 'uninstall.sh').read_text()
+        self.assertIn('彻底清理完成', text)
 
 if __name__ == '__main__': unittest.main()

@@ -37,9 +37,23 @@ rm -f -- "$native"
 if ((purge == 1)); then
   ((yes == 1)) || { echo '--purge 必须同时提供 --yes，避免误删。' >&2; exit 2; }
   other=$([[ "$role" == frps ]] && echo frpc || echo frps)
-  [[ ! -e "/usr/local/bin/$other" && ! -e "/opt/frp-simple-bash/native/$other" && ! -e "/etc/systemd/system/$other.service" && ! -e "/etc/init.d/$other" && ! -e "/opt/frp-simple-bash/bin/$other" ]] || { echo "另一个组件仍安装，拒绝清理共享目录。" >&2; exit 1; }
+  # NOTE: /opt/frp-simple-bash/bin/{frps,frpc} 是组件共享的菜单入口，安装任一组件
+  # 都会同时放置两个，不能作为「另一组件仍安装」的判据（否则 purge 永远失败）。
+  # 只有 native 二进制、用户命令链接、服务单元才代表该组件真实存在。
+  other_traces=()
+  for candidate in "/usr/local/bin/$other" "/opt/frp-simple-bash/native/$other" \
+                   "/etc/systemd/system/$other.service" "/etc/init.d/$other"; do
+    [[ -e "$candidate" || -L "$candidate" ]] && other_traces+=("$candidate")
+  done
+  if ((${#other_traces[@]})); then
+    echo "另一个组件 $other 仍安装，拒绝清理共享目录。" >&2
+    printf '  发现残留：%s\n' "${other_traces[@]}" >&2
+    echo "  如确认不再需要，请先执行：sudo bash /opt/frp-simple-bash/uninstall.sh $other" >&2
+    exit 1
+  fi
   [[ -d /etc/frp && -f /etc/frp/state.json ]] || { echo '配置目录不是本项目目录，拒绝清理。' >&2; exit 1; }
   rm -rf -- /etc/frp /opt/frp-simple-bash
+  echo '彻底清理完成：配置、映射、日志和备份均已删除。'
 else
   echo '卸载完成，配置、映射、日志和备份已保留。'
 fi

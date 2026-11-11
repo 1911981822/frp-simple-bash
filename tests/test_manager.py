@@ -410,7 +410,8 @@ class ManagerTests(unittest.TestCase):
         pid = self.create(); m.set_current(pid)
         m.save_json(m.ROOT / 'state.json', {'active_profile_id': pid, 'pending': True})
         with patch.object(m, 'TEST', False), patch.object(m, 'run_cmd') as rc, \
-             patch.object(m.shutil, 'which', return_value='/bin/systemctl'):
+             patch.object(m.shutil, 'which', return_value='/bin/systemctl'), \
+             patch.object(m.os, 'geteuid', return_value=0):
             rc.return_value = type('R', (), {'returncode': 0, 'stdout': 'active', 'stderr': ''})()
             m.run(['frpc', 'restart'])
         self.assertFalse(m.state()['pending'])
@@ -1052,5 +1053,18 @@ class ManagerTests(unittest.TestCase):
         text = (repo / 'install-common.sh').read_text()
         # macOS 分支不应提示安装 iproute2（用 lsof 替代）
         self.assertIn('macOS 用 lsof', text)
+
+    # ---- non-root run must give a clear sudo hint, not bare Permission denied ----
+    def test_non_root_run_reports_sudo_hint(self):
+        with patch.object(m, 'TEST', False), patch.object(m.os, 'geteuid', return_value=501):
+            with self.assertRaises(ValueError) as ctx:
+                m.run(['frpc', 'status'])
+        self.assertIn('[E002]', str(ctx.exception))
+        self.assertIn('sudo frpc', str(ctx.exception))
+    def test_root_run_passes(self):
+        with patch.object(m, 'TEST', False), patch.object(m.os, 'geteuid', return_value=0), \
+             patch.object(m, 'initialize'), patch.object(m, 'status', return_value={'component': 'frpc'}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            m.run(['frpc', 'status'])
 
 if __name__ == '__main__': unittest.main()

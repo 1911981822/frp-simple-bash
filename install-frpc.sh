@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-FRP_MANAGER_VERSION='v0.1.36-lsof.1'
+FRP_MANAGER_VERSION='v0.1.37-perm.1'
 base="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
 if [[ -f "$base/install-common.sh" && -f "$base/lib/manager.py" && -f "$base/lib/download.sh" ]]; then
   exec bash "$base/install-common.sh" frpc "$@"

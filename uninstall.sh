@@ -22,12 +22,23 @@ if [[ -f "$unit" ]]; then
   grep -Fq "ExecStart=/opt/frp-simple-bash/native/$role -c /etc/frp/$role.toml" "$unit" || { echo "拒绝删除非本项目服务文件：$unit" >&2; exit 1; }
 fi
 if command -v systemctl >/dev/null && [[ -d /run/systemd/system ]]; then
-  systemctl stop "$role" || true; systemctl disable "$role" || true; systemctl reset-failed "$role" >/dev/null 2>&1 || true
-  rm -f -- "$unit"; systemctl daemon-reload
+  if [[ -f "$unit" ]]; then
+    # Only stop/disable when the unit actually exists; otherwise the errors
+    # "Unit not loaded" / "does not exist" leak to the terminal and mislead the
+    # user into thinking uninstall failed (the component was never installed).
+    systemctl stop "$role" >/dev/null 2>&1 || true
+    systemctl disable "$role" >/dev/null 2>&1 || true
+    systemctl reset-failed "$role" >/dev/null 2>&1 || true
+    rm -f -- "$unit"; systemctl daemon-reload
+  fi
 elif command -v rc-service >/dev/null; then
   unit="/etc/init.d/$role"
-  if [[ -f "$unit" ]]; then grep -Fq "/opt/frp-simple-bash/native/$role" "$unit" || { echo "拒绝删除非本项目 OpenRC 文件：$unit" >&2; exit 1; }; fi
-  rc-service "$role" stop || true; rc-update del "$role" default || true; rm -f -- "$unit"
+  if [[ -f "$unit" ]]; then
+    grep -Fq "/opt/frp-simple-bash/native/$role" "$unit" || { echo "拒绝删除非本项目 OpenRC 文件：$unit" >&2; exit 1; }
+    rc-service "$role" stop >/dev/null 2>&1 || true
+    rc-update del "$role" default >/dev/null 2>&1 || true
+    rm -f -- "$unit"
+  fi
 fi
 command="/usr/local/bin/$role"
 if [[ -L "$command" ]]; then [[ "$(readlink "$command")" == "/opt/frp-simple-bash/bin/$role" ]] || { echo "拒绝删除非本项目命令链接" >&2; exit 1; }; rm -f -- "$command"; fi

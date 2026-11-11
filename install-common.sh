@@ -248,9 +248,10 @@ if [[ "$source_root" != "$install_root" ]]; then
   for file in install-common.sh install-frps.sh install-frpc.sh uninstall.sh; do install -m 755 "$source_root/$file" "$install_root/$file"; done
   cp "$source_root/templates/"* "$install_root/templates/"
 fi
-for role in frps frpc; do
-  ln -sfn "$install_root/bin/$role" "/usr/local/bin/$role"
-done
+# Only the component being installed gets its command symlink. The other
+# component's bin/ entry exists (shared menu shell) but is NOT exposed as a
+# command, so users cannot invoke a not-installed component by mistake.
+ln -sfn "$install_root/bin/$component" "/usr/local/bin/$component"
 if [[ "$manager" == systemd ]]; then
   install -m 644 "$source_root/templates/$component.service" "/etc/systemd/system/$component.service"
   systemctl daemon-reload

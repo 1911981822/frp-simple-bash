@@ -98,4 +98,21 @@ class InstallerInterfaceTests(unittest.TestCase):
         text = (ROOT / 'uninstall.sh').read_text()
         self.assertIn('彻底清理完成', text)
 
+    def test_install_only_links_current_component(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        # 建链接处只建当前组件，不再无条件建两个（预检查的 for role 循环保留）
+        self.assertIn('ln -sfn "$install_root/bin/$component"', text)
+        self.assertNotIn('ln -sfn "$install_root/bin/$role" "/usr/local/bin/$role"', text)
+    def test_uninstall_noise_reduced_for_missing_unit(self):
+        text = (ROOT / 'uninstall.sh').read_text()
+        # systemctl stop/disable 只在 unit 存在时执行，且 stderr 静默
+        self.assertIn('if [[ -f "$unit" ]]; then', text)
+        self.assertIn('systemctl stop "$role" >/dev/null 2>&1 || true', text)
+        self.assertIn('systemctl disable "$role" >/dev/null 2>&1 || true', text)
+    def test_purge_still_checks_other_component(self):
+        text = (ROOT / 'uninstall.sh').read_text()
+        # purge 仍检查另一组件的真实痕迹
+        for marker in ('/usr/local/bin/$other', 'native/$other', '$other.service', 'init.d/$other'):
+            self.assertIn(marker, text)
+
 if __name__ == '__main__': unittest.main()

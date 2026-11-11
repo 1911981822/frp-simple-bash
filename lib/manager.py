@@ -28,7 +28,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v0.1.28-bugfix.1'
+MANAGER_RELEASE_VERSION = 'v0.1.29-symlink.1'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))

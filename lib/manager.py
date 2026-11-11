@@ -28,7 +28,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v0.1.31-macos.1'
+MANAGER_RELEASE_VERSION = 'v0.1.32-launchd.1'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -534,28 +534,33 @@ def service(role, action):
         else: result = run_cmd(['rc-service', role, action], capture_output=True, text=True, timeout=30)
     elif sys.platform == 'darwin' and shutil.which('launchctl'):
         # launchd: label frp-simple-bash.<role>, plist in /Library/LaunchDaemons.
+        #   start/stop  -> kickstart / kill (process control)
+        #   enable/disable -> launchctl enable/disable (persistent boot policy)
         label = 'frp-simple-bash.' + role
         plist = Path('/Library/LaunchDaemons') / (label + '.plist')
+        target = 'system/' + label
         if action == 'status':
-            result = run_cmd(['launchctl', 'print', 'system/' + label], capture_output=True, text=True, timeout=30)
+            result = run_cmd(['launchctl', 'print', target], capture_output=True, text=True, timeout=30)
             if result.returncode != 0: return 'stopped'
             # launchctl print exits 0 when loaded; "state = running" means active.
             if 'state = running' in result.stdout: return 'running'
             return 'stopped'
-        if action in ('enable', 'disable'):
-            # launchd auto-starts at boot when the plist is loaded at boot
-            # (system domain). enable=load now, disable=unload now.
-            cmd = ['launchctl', 'load' if action == 'enable' else 'unload', '-w', str(plist)]
-            if action == 'enable' and not plist.exists():
-                raise ValueError('launchd 服务文件不存在：' + str(plist) + '；请先运行安装器')
-            result = run_cmd(cmd, capture_output=True, text=True, timeout=30)
+        if action in ('enable', 'manual', 'disable'):
+            # Persist the boot policy. `enable`/`disable` toggle auto-start at
+            # boot (RunAtLoad is ignored when disabled). `manual` is aliased to
+            # disable on launchd (no separate "manual" concept: disabled = not
+            # auto-started). Using load/unload here would NOT survive a reboot.
+            if action == 'disable' or action == 'manual':
+                result = run_cmd(['launchctl', 'disable', target], capture_output=True, text=True, timeout=30)
+            else:
+                result = run_cmd(['launchctl', 'enable', target], capture_output=True, text=True, timeout=30)
         else:
             if action == 'start':
-                result = run_cmd(['launchctl', 'kickstart', 'system/' + label], capture_output=True, text=True, timeout=30)
+                result = run_cmd(['launchctl', 'kickstart', target], capture_output=True, text=True, timeout=30)
             elif action == 'stop':
-                result = run_cmd(['launchctl', 'kill', 'SIGTERM', 'system/' + label], capture_output=True, text=True, timeout=30)
+                result = run_cmd(['launchctl', 'kill', 'SIGTERM', target], capture_output=True, text=True, timeout=30)
             else:  # restart
-                result = run_cmd(['launchctl', 'kickstart', '-k', 'system/' + label], capture_output=True, text=True, timeout=30)
+                result = run_cmd(['launchctl', 'kickstart', '-k', target], capture_output=True, text=True, timeout=30)
     else: return 'unknown' if action == 'status' else fail('无支持的服务管理器，无法保证后台运行与自启动')
     if action == 'status': return result.stdout.strip() or 'stopped'
     if result.returncode: err('E007', '服务操作失败：' + result.stderr.strip())

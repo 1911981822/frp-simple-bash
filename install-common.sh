@@ -292,7 +292,10 @@ else
   plist_label="frp-simple-bash.$component"
   plist_path="/Library/LaunchDaemons/$plist_label.plist"
   install -m 644 "$source_root/templates/$component.plist" "$plist_path"
-  if ((autostart == 1)); then launchctl load -w "$plist_path"; fi
+  # Boot policy: `enable` persists auto-start; `disable` turns it off so the
+  # RunAtLoad plist does NOT restart at next boot. load/unload would only affect
+  # the current session and be undone by a reboot.
+  if ((autostart == 1)); then launchctl enable "system/$plist_label"; else launchctl disable "system/$plist_label"; fi
 fi
 if [[ ! -f "$config_root/$component.toml" ]]; then
   if ((non_interactive == 1)); then echo "配置不存在，--non-interactive 不进入配置向导：$config_root/$component.toml" >&2; exit 2; fi

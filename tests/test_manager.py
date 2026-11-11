@@ -993,4 +993,35 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(restored, ['lib/manager.py'])
         self.assertEqual((fake_install / 'lib' / 'manager.py').read_text(), '# old\n')
 
+    # ---- launchd enable/disable uses persistent boot policy (macOS) ----
+    def test_launchd_disable_uses_disable_not_unload(self):
+        def fake_which(cmd):
+            return '/bin/launchctl' if cmd == 'launchctl' else None
+        # setUp patches TEST=True which short-circuits service(); override here.
+        with patch.object(m, 'TEST', False), \
+             patch.object(m.shutil, 'which', side_effect=fake_which), \
+             patch.object(m, 'run_cmd') as rc:
+            rc.return_value = type('R',(),{'returncode':0,'stdout':'','stderr':''})()
+            m.service('frpc', 'disable')
+        call = rc.call_args[0][0]
+        # disable must be launchctl disable system/<label>, NOT unload (unload
+        # would not survive a reboot because RunAtLoad re-loads it).
+        self.assertEqual(call[:2], ['launchctl', 'disable'])
+        self.assertTrue(call[2].startswith('system/frp-simple-bash.frpc'))
+    def test_launchd_enable_uses_enable(self):
+        def fake_which(cmd):
+            return '/bin/launchctl' if cmd == 'launchctl' else None
+        with patch.object(m, 'TEST', False), \
+             patch.object(m.shutil, 'which', side_effect=fake_which), \
+             patch.object(m, 'run_cmd') as rc:
+            rc.return_value = type('R',(),{'returncode':0,'stdout':'','stderr':''})()
+            m.service('frpc', 'enable')
+        self.assertEqual(rc.call_args[0][0][:2], ['launchctl', 'enable'])
+    def test_install_script_launchd_uses_enable_disable(self):
+        from pathlib import Path as _P
+        repo = _P(__file__).resolve().parent.parent
+        text = (repo / 'install-common.sh').read_text()
+        self.assertIn('launchctl enable "system/$plist_label"', text)
+        self.assertIn('launchctl disable "system/$plist_label"', text)
+
 if __name__ == '__main__': unittest.main()

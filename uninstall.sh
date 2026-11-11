@@ -42,6 +42,8 @@ elif command -v rc-service >/dev/null; then
 elif [[ "$(uname -s)" == Darwin ]] && command -v launchctl >/dev/null; then
   plist="/Library/LaunchDaemons/frp-simple-bash.$role.plist"
   if [[ -f "$plist" ]]; then
+    # disable clears the persistent boot policy, unload stops it now.
+    launchctl disable "system/frp-simple-bash.$role" >/dev/null 2>&1 || true
     launchctl unload "$plist" >/dev/null 2>&1 || true
     rm -f -- "$plist"
   fi

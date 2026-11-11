@@ -31,6 +31,11 @@ if ($Purge) {
     if (-not $resolved.Equals($default,[StringComparison]::OrdinalIgnoreCase)) { throw 'Automatic purge is allowed only for the default configuration directory. Custom configuration retained.' }
     $other=if ($Component -eq 'frps') { 'frpc' } else { 'frps' }
     if (Get-Service -Name "frp-simple-bash-$other" -ErrorAction SilentlyContinue) { throw 'Another frp service is installed. Shared configuration retained.' }
+    foreach ($trace in @((Join-Path $root "bin/$other.cmd"), (Join-Path $root "bin/$other.ps1"),
+                         (Join-Path $root "services/frp-simple-bash-$other.exe"),
+                         (Join-Path $root "native/$other.exe"))) {
+        if (Test-Path -LiteralPath $trace) { throw "Another component still has installation traces ($trace). Shared configuration retained." }
+    }
     if (Test-Path -LiteralPath $resolved) { Remove-Item -LiteralPath $resolved -Recurse -Force }
 } else { Write-Host "Configuration retained: $data" }
 # Shared Python manager remains available if the other component is installed.

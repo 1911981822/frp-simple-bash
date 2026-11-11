@@ -37,7 +37,7 @@ rm -f -- "$native"
 if ((purge == 1)); then
   ((yes == 1)) || { echo '--purge 必须同时提供 --yes，避免误删。' >&2; exit 2; }
   other=$([[ "$role" == frps ]] && echo frpc || echo frps)
-  [[ ! -e "/usr/local/bin/$other" && ! -e "/opt/frp-simple-bash/native/$other" && ! -e "/etc/systemd/system/$other.service" ]] || { echo "另一个组件仍安装，拒绝清理共享目录。" >&2; exit 1; }
+  [[ ! -e "/usr/local/bin/$other" && ! -e "/opt/frp-simple-bash/native/$other" && ! -e "/etc/systemd/system/$other.service" && ! -e "/etc/init.d/$other" && ! -e "/opt/frp-simple-bash/bin/$other" ]] || { echo "另一个组件仍安装，拒绝清理共享目录。" >&2; exit 1; }
   [[ -d /etc/frp && -f /etc/frp/state.json ]] || { echo '配置目录不是本项目目录，拒绝清理。' >&2; exit 1; }
   rm -rf -- /etc/frp /opt/frp-simple-bash
 else

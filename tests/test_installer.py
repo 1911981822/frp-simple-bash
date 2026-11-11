@@ -25,5 +25,33 @@ class InstallerInterfaceTests(unittest.TestCase):
         result = subprocess.run(['bash', str(ROOT / 'uninstall.sh'), 'frps', '--help'], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('--purge', result.stdout)
+    def test_no_start_flag_is_consumed(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        self.assertIn('--no-start) start=0', text)
+        self.assertIn('((start == 1))', text)  # actually consulted before starting
+    def test_exit_trap_covers_explicit_exits(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        self.assertIn('trap rollback_install EXIT', text)
+        self.assertIn('install_ok=1', text)
+        self.assertIn('trap - EXIT', text)
+        self.assertNotIn('trap rollback_install ERR', text)
+    def test_enable_failure_not_swallowed(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        self.assertIn('if ((autostart == 1)); then systemctl enable', text)
+        self.assertNotIn('&& systemctl enable "$component" || systemctl disable', text)
+    def test_purge_checks_openrc_and_bin(self):
+        text = (ROOT / 'uninstall.sh').read_text()
+        self.assertIn('/etc/init.d/$other', text)
+        self.assertIn('/opt/frp-simple-bash/bin/$other', text)
+    def test_rollback_snapshots_manager_and_unit(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        self.assertIn('snapshot_file "$install_root/$rel" "$rel"', text)
+        self.assertIn('lib/manager.py', text)
+        self.assertIn('snapshot_file "/etc/systemd/system/$component.service"', text)
+    def test_preflight_checks_before_stopping_service(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        preflight = text.index('Pre-flight checks')
+        stop = text.index('was_running=1; systemctl stop')
+        self.assertLess(preflight, stop)
 
 if __name__ == '__main__': unittest.main()

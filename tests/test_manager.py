@@ -280,4 +280,223 @@ class ManagerTests(unittest.TestCase):
         item = self.mapping(); item['type'] = 'http'
         with self.assertRaises(ValueError): m.validate_mapping(item)
 
+    # ---- Python 3.6 fallback parser (_toml_lib is None) ----
+    def test_mini_toml_matches_tomllib(self):
+        content = m.toml({'bindAddr': '0.0.0.0', 'bindPort': 7000,
+                          'auth.method': 'token', 'auth.token': 'SUPERSECRET',
+                          'log.to': '/x', 'log.maxDays': 30, 'log.disablePrintColor': True,
+                          'webServer.port': 7500, 'webServer.user': 'admin',
+                          'webServer.password': 'DASHSECRET',
+                          'transport': {'tls': {'enable': True}},
+                          'proxies': [{'name': 'a', 'type': 'tcp'}]})
+        with patch.object(m, '_toml_lib', None):
+            self.assertEqual(m._load_toml(content), tomllib.loads(content))
+    def test_mini_toml_escape_roundtrip(self):
+        values = ['a\\nb', 'tok\\rvalue', 'ctrl\\u0001x', 'C:\\path\\to\\cert', 'quote"x', '\u4e2d\u6587']
+        with patch.object(m, '_toml_lib', None):
+            for value in values:
+                self.assertEqual(m._load_toml(m.toml({'k': value}))['k'], value)
+    def test_mini_toml_inline_and_numeric(self):
+        with patch.object(m, '_toml_lib', None):
+            self.assertEqual(m._load_toml('a = {b = 1, c.d = 2}'), {'a': {'b': 1, 'c': {'d': 2}}})
+            self.assertEqual(m._load_toml('a = 0x10'), {'a': 16})
+            self.assertEqual(m._load_toml('a = 1_000'), {'a': 1000})
+            self.assertEqual(m._load_toml('a = ["x,y", 2]'), {'a': ['x,y', 2]})
+    def test_mini_toml_redaction_keys_are_nested(self):
+        # Regression: flat dotted keys bypassed the secret redaction in config show.
+        content = m.toml({'auth.token': 'SUPERSECRET', 'webServer.password': 'DASHSECRET'})
+        with patch.object(m, '_toml_lib', None):
+            data = m._load_toml(content)
+        self.assertEqual(data['auth']['token'], 'SUPERSECRET')
+        self.assertEqual(data['webServer']['password'], 'DASHSECRET')
+    def test_toml_rejects_none(self):
+        with self.assertRaises(ValueError): m.toml({'k': None})
+
+    # ---- Input layer: blank / q-cancel must never persist None ----
+    def test_ask_allow_empty_returns_blank(self):
+        with patch('builtins.input', return_value=''):
+            self.assertEqual(m.ask('可留空', allow_empty=True), '')
+    def test_ask_q_returns_none(self):
+        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', return_value='q'):
+            self.assertIsNone(m.ask('字段'))
+    def test_edit_profile_q_cancel_does_not_write(self):
+        pid = self.create(); m.set_current(pid); m.apply(pid)
+        before = {p: p.read_bytes() for p in m.managed_paths()}
+        with patch('builtins.input', return_value='q'):
+            m.edit_profile()
+        self.assertEqual({p: p.read_bytes() for p in m.managed_paths()}, before)
+    def test_edit_profile_blank_token_clears(self):
+        pid = self.create(); m.set_current(pid); m.apply(pid)
+        with patch('builtins.input', side_effect=['5', '10']), patch('getpass.getpass', return_value=''), \
+             patch.object(m, 'confirm', return_value=False), contextlib.redirect_stdout(io.StringIO()):
+            m.edit_profile()
+        self.assertEqual(m.secrets_for(pid)['token'], '')
+    def test_redact_secrets_by_field_name(self):
+        data = {'auth': {'token': 'SUPERSECRET'}, 'webServer': {'password': 'DASHSECRET', 'tls': {'certFile': '/x'}},
+                'nested': {'password': 'HIDDEN'}}
+        out = json.dumps(m.redact_secrets(data))
+        self.assertNotIn('SUPERSECRET', out); self.assertNotIn('DASHSECRET', out); self.assertNotIn('HIDDEN', out)
+        self.assertIn('/x', out)
+    def test_frps_config_show_redacts_on_mini_toml(self):
+        m.atomic(m.ROOT / 'frps.toml', m.toml({'bindPort': 7000, 'auth.token': 'SUPERSECRET',
+                                               'webServer.user': 'admin', 'webServer.password': 'DASHSECRET'}))
+        out = io.StringIO()
+        with patch.object(m, '_toml_lib', None), contextlib.redirect_stdout(out):
+            m.run(['frps', 'config', 'show'])
+        self.assertNotIn('SUPERSECRET', out.getvalue()); self.assertNotIn('DASHSECRET', out.getvalue())
+    # ---- Service control / connection state / pending ----
+    def test_service_feedback_actually_calls_service(self):
+        with patch.object(m, 'service', side_effect=[None, 'active']) as svc, contextlib.redirect_stdout(io.StringIO()):
+            m.service_feedback('frpc', 'start')
+        calls = [c[0][1] for c in svc.call_args_list]
+        self.assertIn('start', calls)
+        self.assertIn('status', calls)
+    def test_login_success_does_not_mask_proxy_error(self):
+        pid = self.create(); m.set_current(pid)
+        (m.ROOT / 'logs').mkdir(exist_ok=True)
+        (m.ROOT / 'logs' / 'frpc.log').write_text('start frpc service\nlogin to server success\n')
+        with patch.object(m, 'running', return_value=True), \
+             patch.object(m, 'api', return_value={'tcp': [{'name': 'ssh', 'status': 'error'}]}):
+            self.assertEqual(m.connection(pid)['state'], 'proxy-error')
+    def test_auth_failure_detected_from_frp_072_log(self):
+        pid = self.create()
+        (m.ROOT / 'logs').mkdir(exist_ok=True)
+        (m.ROOT / 'logs' / 'frpc.log').write_text('start frpc service\nUser authentication failed\n')
+        with patch.object(m, 'running', return_value=True), patch.object(m, 'api', side_effect=OSError('x')):
+            self.assertEqual(m.connection(pid)['state'], 'auth-failed')
+    def test_apply_sets_pending_when_running(self):
+        pid = self.create(); m.set_current(pid)
+        with patch.object(m, 'running', return_value=True):
+            m.apply(pid)
+        self.assertTrue(m.state()['pending'])
+    def test_pending_cleared_after_restart(self):
+        pid = self.create(); m.set_current(pid)
+        m.save_json(m.ROOT / 'state.json', {'active_profile_id': pid, 'pending': True})
+        with patch.object(m, 'TEST', False), patch.object(m, 'run_cmd') as rc, \
+             patch.object(m.shutil, 'which', return_value='/bin/systemctl'):
+            rc.return_value = type('R', (), {'returncode': 0, 'stdout': 'active', 'stderr': ''})()
+            m.run(['frpc', 'restart'])
+        self.assertFalse(m.state()['pending'])
+    def test_status_json_survives_broken_profile(self):
+        m.save_json(m.ROOT / 'state.json', {'active_profile_id': 'invalid'})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            m.run(['frpc', 'status'])
+        self.assertEqual(json.loads(out.getvalue())['component'], 'frpc')
+        self.assertIsNone(json.loads(out.getvalue())['active_profile'])
+    def test_main_menu_survives_broken_profile(self):
+        m.save_json(m.ROOT / 'state.json', {'active_profile_id': 'invalid'})
+        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', return_value='0'):
+            m.main_menu('frpc')  # must not raise UnboundLocalError
+
+    # ---- Transaction / lock / robustness ----
+    def test_lock_clears_stale_directory(self):
+        stale = m.ROOT / '.operation.lock'; stale.mkdir()
+        (stale / 'owner.json').write_text(json.dumps({'pid': 99999999, 'time': 0}))
+        with m.lock():
+            self.assertTrue(stale.exists())
+        self.assertFalse(stale.exists())
+    def test_lock_rejects_live_holder(self):
+        live = m.ROOT / '.operation.lock'; live.mkdir()
+        (live / 'owner.json').write_text(json.dumps({'pid': os.getpid(), 'time': __import__('time').time()}))
+        with self.assertRaises(ValueError):
+            with m.lock(): pass
+        m.shutil.rmtree(live)
+    def test_transaction_rolls_back_on_baseexception(self):
+        original = m.ROOT / 'state.json'
+        before = original.read_bytes()
+        with self.assertRaises(KeyboardInterrupt):
+            with m.lock(), m.transaction():
+                m.atomic(original, '{"changed": true}\n')
+                raise KeyboardInterrupt()
+        self.assertEqual(original.read_bytes(), before)
+    def test_port_rejects_unicode_digits(self):
+        with self.assertRaises(ValueError): m.port('７０００')
+        self.assertEqual(m.port(7000), 7000)
+    def test_rotate_logs_has_no_time_ns(self):
+        import inspect
+        self.assertNotIn('time_ns', inspect.getsource(m.rotate_logs))
+    def test_import_external_missing_field_is_readable(self):
+        pid = self.create(); m.set_current(pid); m.apply(pid)
+        m.atomic(m.ROOT / 'frpc.toml', m.render(pid).replace('serverPort = 7000', ''))
+        with patch.object(m, '_login_state_from_log', return_value=None), \
+             patch.object(m, 'running', return_value=False), patch('builtins.input', return_value='1'):
+            with self.assertRaises(ValueError) as ctx: m.import_external('frpc')
+        self.assertIn('serverPort', str(ctx.exception))
+
+    # ---- Upgrade transaction / mode / HTTPS ----
+    def test_upgrade_rejects_non_https_mirror(self):
+        with patch.object(m, 'confirm', return_value=True), \
+             patch.dict(os.environ, {'FRP_MIRROR_URL': 'http://evil.example'}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(ValueError): m.upgrade('frpc')
+    def test_upgrade_rejects_off_mirror(self):
+        with patch.object(m, 'confirm', return_value=True), \
+             patch.dict(os.environ, {'FRP_MIRROR_URL': 'off'}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(ValueError): m.upgrade('frpc')
+    def test_upgrade_stages_all_files_and_restores_mode(self):
+        import tarfile, hashlib, tempfile, io as _io
+        files = {
+            'frp-simple-bash/lib/manager.py': b'# new manager\n',
+            'frp-simple-bash/lib/download.sh': b'# dl\n',
+            'frp-simple-bash/install-common.sh': b'# ic\n',
+            'frp-simple-bash/install-frps.sh': b'# is\n',
+            'frp-simple-bash/install-frpc.sh': b"FRP_MANAGER_VERSION='v9.9.9-test'\n",
+            'frp-simple-bash/install-windows.ps1': b'# iw\n',
+            'frp-simple-bash/install-frps.ps1': b'# ips\n',
+            'frp-simple-bash/install-frpc.ps1': b'# ipc\n',
+            'frp-simple-bash/uninstall.sh': b'# u\n',
+            'frp-simple-bash/uninstall-frps.ps1': b'# ups\n',
+            'frp-simple-bash/uninstall-frpc.ps1': b'# upc\n',
+            'frp-simple-bash/uninstall-windows.ps1': b'# uw\n',
+            'frp-simple-bash/bin/frpc': b'#!/bin/bash\n',
+            'frp-simple-bash/templates/frpc.service': b'[Unit]\n',
+        }
+        buf = _io.BytesIO()
+        with tarfile.open(fileobj=buf, mode='w:gz') as tar:
+            for name, data in files.items():
+                info = tarfile.TarInfo(name); info.size = len(data); info.mode = 0o755
+                tar.addfile(info, _io.BytesIO(data))
+        bundle = buf.getvalue()
+        manifest = hashlib.sha256(bundle).hexdigest() + '  source.tar.gz\n'
+        install_root = Path(tempfile.mkdtemp())
+        (install_root / 'install-frpc.sh').write_text("FRP_MANAGER_VERSION='v0.0.1-old'\n")
+        with patch.object(m, 'INSTALL_ROOT', install_root), patch.object(m, 'confirm', return_value=True), \
+             patch.object(m, '_https_get', side_effect=[bundle, manifest.encode()]), \
+             patch.object(m, 'installed_frp_version', return_value='0.72.0'), \
+             contextlib.redirect_stdout(io.StringIO()):
+            m.upgrade('frpc', 'v9.9.9-test')
+        self.assertIn('v9.9.9-test', (install_root / 'install-frpc.sh').read_text())
+        self.assertTrue((install_root / 'install-windows.ps1').exists())
+        self.assertEqual((install_root / 'bin' / 'frpc').stat().st_mode & 0o111, 0o111)
+    def test_upgrade_rejects_incomplete_bundle(self):
+        import tarfile, hashlib, io as _io
+        buf = _io.BytesIO()
+        with tarfile.open(fileobj=buf, mode='w:gz') as tar:
+            data = b'# only manager\n'
+            info = tarfile.TarInfo('frp-simple-bash/lib/manager.py'); info.size = len(data); tar.addfile(info, _io.BytesIO(data))
+        bundle = buf.getvalue(); manifest = hashlib.sha256(bundle).hexdigest() + '  source.tar.gz\n'
+        with patch.object(m, 'confirm', return_value=True), \
+             patch.object(m, '_https_get', side_effect=[bundle, manifest.encode()]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(ValueError): m.upgrade('frpc', 'v9.9.9-test')
+    def test_within_works_on_windows_paths(self):
+        from pathlib import PureWindowsPath
+        # _within must not depend on '/' string prefixes.
+        self.assertTrue(m._within(Path('/a/b/c'), Path('/a/b')))
+        self.assertFalse(m._within(Path('/a/../b'), Path('/a')) if os.name != 'nt' else True)
+
+    def test_frps_config_menu_preserves_webserver_tls(self):
+        m.atomic(m.ROOT / 'frps.toml', m.toml({'bindPort': 7000,
+                                               'webServer.addr': '127.0.0.1', 'webServer.port': 7500,
+                                               'webServer.user': 'admin', 'webServer.password': 'pw',
+                                               'webServer.tls.certFile': '/cert.pem'}))
+        with patch('builtins.input', side_effect=['4', 'admin', '127.0.0.1', '7500', '0']), \
+             patch('getpass.getpass', return_value=''), patch.object(m, 'clear_screen'), \
+             patch.object(m, 'pause'), patch.object(m, 'save_frps_config', side_effect=lambda d: m.atomic(m.ROOT / 'frps.toml', m.toml(d))):
+            m.frps_config_menu()
+        data = m.read_frps_config()
+        self.assertEqual(data['webServer']['tls']['certFile'], '/cert.pem')
+
 if __name__ == '__main__': unittest.main()

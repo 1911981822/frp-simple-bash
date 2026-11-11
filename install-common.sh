@@ -105,25 +105,64 @@ if ! printf '%s  %s\n' "$expected" "$work/$asset" | sha256sum -c - >/dev/null; t
 fi
 tar -xzf "$work/$asset" -C "$work" 2>/dev/null || tar -xzf "$work/$asset" -C "$work"
 "$work/frp_${version}_linux_${arch}/$component" --version
+# Pre-flight checks that must NOT stop a running service before failing.
+for role in frps frpc; do
+  if [[ -e "/usr/local/bin/$role" && ! -L "/usr/local/bin/$role" ]]; then
+    echo "已有 /usr/local/bin/$role，请先手动迁移，未修改现有安装。" >&2; exit 1
+  fi
+  if [[ -L "/usr/local/bin/$role" && "$(readlink "/usr/local/bin/$role")" != "$install_root/bin/$role" ]]; then
+    echo "已有非本项目命令链接 /usr/local/bin/$role，未覆盖。" >&2; exit 1
+  fi
+done
 mkdir -p "$install_root/native" "$install_root/bin" "$install_root/lib" "$install_root/templates" "$config_root" /usr/local/bin
 chmod 700 "$config_root"
-# Preserve the previous binary for reinstall/upgrade rollback.
-if [[ -f "$install_root/native/$component" ]]; then cp -p "$install_root/native/$component" "$work/previous"; fi
+# Snapshot every file/state we are about to touch, so a failed install can be
+# fully rolled back. EXIT trap (not ERR) also covers explicit `exit N`.
+rollback_dir="$work/rollback"
+mkdir -p "$rollback_dir"
+snapshot_file() {
+  local src="$1" rel="$2"
+  if [[ -e "$src" || -L "$src" ]]; then
+    mkdir -p "$(dirname "$rollback_dir/$rel")"
+    cp -a -- "$src" "$rollback_dir/$rel"
+  fi
+}
+snapshot_file "$install_root/native/$component" "native/$component"
+for rel in bin/frps bin/frpc lib/manager.py lib/download.sh install-common.sh install-frps.sh install-frpc.sh uninstall.sh; do
+  snapshot_file "$install_root/$rel" "$rel"
+done
+for rel in templates/frps.service templates/frpc.service templates/frps.openrc templates/frpc.openrc; do
+  snapshot_file "$install_root/$rel" "$rel"
+done
+if [[ "$manager" == systemd ]]; then snapshot_file "/etc/systemd/system/$component.service" "unit/$component.service"; fi
+if [[ "$manager" == openrc ]]; then snapshot_file "/etc/init.d/$component" "unit/$component.openrc"; fi
 was_running=0
+install_ok=0
 rollback_install() {
   local exit_code=$?
-  trap - ERR
-  if [[ -f "$work/previous" ]]; then
-    install -m 755 "$work/previous" "$install_root/native/$component.restore" || true
-    mv -f "$install_root/native/$component.restore" "$install_root/native/$component" || true
+  trap - EXIT
+  if ((install_ok == 0)); then
+    for rel in native/$component bin/frps bin/frpc lib/manager.py lib/download.sh \
+               install-common.sh install-frps.sh install-frpc.sh uninstall.sh \
+               templates/frps.service templates/frpc.service templates/frps.openrc templates/frpc.openrc; do
+      local saved="$rollback_dir/$rel" dest="$install_root/$rel"
+      if [[ -e "$saved" || -L "$saved" ]]; then
+        mkdir -p "$(dirname "$dest")" || true; cp -a -- "$saved" "$dest" || true
+      fi
+    done
+    if [[ "$manager" == systemd && -f "$rollback_dir/unit/$component.service" ]]; then
+      mkdir -p /etc/systemd/system || true; cp -a -- "$rollback_dir/unit/$component.service" "/etc/systemd/system/$component.service" || true
+    elif [[ "$manager" == openrc && -f "$rollback_dir/unit/$component.openrc" ]]; then
+      mkdir -p /etc/init.d || true; cp -a -- "$rollback_dir/unit/$component.openrc" "/etc/init.d/$component" || true
+    fi
+    if ((was_running == 1)); then
+      if [[ "$manager" == systemd ]]; then systemctl start "$component" || true; else rc-service "$component" start || true; fi
+    fi
+    echo '安装失败，已尝试恢复旧文件及先前运行状态；配置已保留。' >&2
   fi
-  if [[ "$was_running" == 1 ]]; then
-    if [[ "$manager" == systemd ]]; then systemctl start "$component" || true; else rc-service "$component" start || true; fi
-  fi
-  echo '安装失败，已尝试恢复旧二进制及先前运行状态；配置已保留。' >&2
   exit "$exit_code"
 }
-trap rollback_install ERR
+trap rollback_install EXIT
 if [[ "$manager" == systemd ]] && systemctl is-active --quiet "$component"; then was_running=1; systemctl stop "$component"; fi
 if [[ "$manager" == openrc ]] && rc-service "$component" status >/dev/null 2>&1; then was_running=1; rc-service "$component" stop; fi
 # Stage then atomically replace the executable (avoids ETXTBSY).
@@ -137,15 +176,12 @@ if [[ "$source_root" != "$install_root" ]]; then
   cp "$source_root/templates/"* "$install_root/templates/"
 fi
 for role in frps frpc; do
-  if [[ -e "/usr/local/bin/$role" && ! -L "/usr/local/bin/$role" ]]; then
-    echo "已有 /usr/local/bin/$role，请手动迁移，安装未替换该命令。" >&2; exit 1
-  fi
   ln -sfn "$install_root/bin/$role" "/usr/local/bin/$role"
 done
 if [[ "$manager" == systemd ]]; then
   install -m 644 "$source_root/templates/$component.service" "/etc/systemd/system/$component.service"
   systemctl daemon-reload
-  ((autostart == 1)) && systemctl enable "$component" || systemctl disable "$component" || true
+  if ((autostart == 1)); then systemctl enable "$component"; else systemctl disable "$component" || true; fi
 else
   install -m 755 "$source_root/templates/$component.openrc" "/etc/init.d/$component"
   if ((autostart == 1)); then rc-update add "$component" default; else rc-update del "$component" default || true; fi
@@ -156,10 +192,16 @@ if [[ ! -f "$config_root/$component.toml" ]]; then
 fi
 if [[ -f "$config_root/$component.toml" ]]; then
   if "$install_root/native/$component" verify -c "$config_root/$component.toml" >/dev/null 2>&1; then
-    if [[ "$manager" == systemd ]]; then systemctl start "$component"; else rc-service "$component" start; fi
+    if ((start == 1)); then
+      if [[ "$manager" == systemd ]]; then systemctl start "$component"; else rc-service "$component" start; fi
+    else
+      echo '服务已注册但按 --no-start 保持停止。'
+    fi
   else
     echo '配置校验失败，服务未启动。' >&2
     false
   fi
 else echo '配置尚未创建，服务已注册但保持停止。'; fi
+install_ok=1
+trap - EXIT
 printf '安装完成。输入 %s 打开数字菜单。防火墙只检测提示，请自行检查业务端口和映射端口规则。\n' "$component"

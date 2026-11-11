@@ -10,7 +10,16 @@ import subprocess
 import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_VERSION = 'v0.1.9-ux2.1'
+
+def _default_version():
+    """Read the pinned version from the bootstrap so it never goes stale."""
+    import re
+    text = (ROOT / 'install-frpc.sh').read_text(encoding='utf-8')
+    match = re.search(r"FRP_MANAGER_VERSION='([^']+)'", text)
+    if not match: raise ValueError('Cannot determine version from install-frpc.sh')
+    return match.group(1)
+
+DEFAULT_VERSION = _default_version()
 
 def build(version=DEFAULT_VERSION):
     if not version.startswith('v') or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-' for c in version):

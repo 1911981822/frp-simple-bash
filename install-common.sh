@@ -313,9 +313,10 @@ else
   plist_label="frp-simple-bash.$component"
   plist_path="/Library/LaunchDaemons/$plist_label.plist"
   install -m 644 "$source_root/templates/$component.plist" "$plist_path"
-  # Boot policy: `enable` persists auto-start; `disable` turns it off so the
-  # RunAtLoad plist does NOT restart at next boot. load/unload would only affect
-  # the current session and be undone by a reboot.
+  # Load the service into launchd FIRST (bootstrap), then set the boot policy.
+  # enable/disable alone does NOT load the service; kickstart/print would fail
+  # with "Could not find service" without this step.
+  launchctl bootstrap "system" "$plist_path" >/dev/null 2>&1 || launchctl load "$plist_path" >/dev/null 2>&1 || true
   if ((autostart == 1)); then launchctl enable "system/$plist_label"; else launchctl disable "system/$plist_label"; fi
 fi
 if [[ ! -f "$config_root/$component.toml" ]]; then

@@ -177,4 +177,15 @@ class InstallerInterfaceTests(unittest.TestCase):
         self.assertIn('frp_${version}_${os_short}_${arch}.tar.gz', text)
         self.assertNotIn('frp_${version}_linux_${arch}.tar.gz', text)
 
+    def test_macos_install_bootstraps_launchd_service(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        # 关键修复：安装时必须 bootstrap 加载服务，否则 kickstart 找不到
+        self.assertIn('launchctl bootstrap', text)
+        self.assertIn('launchctl enable "system/$plist_label"', text)
+        self.assertIn('launchctl disable "system/$plist_label"', text)
+    def test_macos_uninstall_bootout(self):
+        text = (ROOT / 'uninstall.sh').read_text()
+        self.assertIn('launchctl bootout', text)
+        self.assertIn('launchctl disable "system/frp-simple-bash.$role"', text)
+
 if __name__ == '__main__': unittest.main()

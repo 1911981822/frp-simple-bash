@@ -28,7 +28,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v0.1.34-darwin.1'
+MANAGER_RELEASE_VERSION = 'v0.1.35-bootstrap.1'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -556,6 +556,11 @@ def service(role, action):
                 result = run_cmd(['launchctl', 'enable', target], capture_output=True, text=True, timeout=30)
         else:
             if action == 'start':
+                # If the service was never bootstrapped (e.g. a failed install),
+                # bootstrap it now so kickstart can find it instead of erroring.
+                probe = run_cmd(['launchctl', 'print', target], capture_output=True, text=True, timeout=30)
+                if probe.returncode != 0 and plist.exists():
+                    run_cmd(['launchctl', 'bootstrap', 'system', str(plist)], capture_output=True, text=True, timeout=30)
                 result = run_cmd(['launchctl', 'kickstart', target], capture_output=True, text=True, timeout=30)
             elif action == 'stop':
                 result = run_cmd(['launchctl', 'kill', 'SIGTERM', target], capture_output=True, text=True, timeout=30)

@@ -195,7 +195,10 @@ fi
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,6) else 1)' || { echo 'Python 版本仍不满足 3.6+。' >&2; exit 1; }
 python3 -c 'import json,hashlib,ipaddress,urllib.request' || { echo 'Python 标准库不完整。' >&2; exit 1; }
 # ss/iproute2 只用于端口占用检测：缺失时降级为「无法检测」而不是阻断安装。
-if ! command -v ss >/dev/null 2>&1; then
+# macOS 用 lsof（系统自带）做同样的事，不提示安装 iproute2。
+if [[ "$os_name" == Darwin ]]; then
+  : # macOS 端口占用检测由 manager 的 check_port_conflict 用 lsof 完成
+elif ! command -v ss >/dev/null 2>&1; then
   echo '提示：未找到 ss（iproute2），端口占用检测将不可用；如需该功能请安装：' >&2
   echo "  Debian/Ubuntu: sudo apt-get install -y iproute2" >&2
   echo "  Fedora/RHEL:   sudo dnf install -y iproute" >&2

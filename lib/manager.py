@@ -28,7 +28,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v0.1.35-bootstrap.1'
+MANAGER_RELEASE_VERSION = 'v0.1.36-lsof.1'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -1614,36 +1614,50 @@ def configure_server():
 def check_port_conflict(host, port_value, proto='tcp', exclude_pid=None, exclude_role=None):
     """Return True when ANOTHER process listens on host:port/protocol.
 
-    Uses `ss -p` so the owning process name is visible; a listener whose
-    process name equals exclude_role (e.g. frps itself) is never a conflict.
-    Returns None when `ss` is unavailable (caller must not treat it as a hit).
+    Linux uses `ss -p`; macOS uses `lsof` (its equivalent, since `ss` does not
+    exist there). A listener whose process name equals exclude_role (e.g. frps
+    itself) is never a conflict. Returns None when the tool is unavailable.
     """
-    if not shutil.which('ss'): return None
-    result = run_cmd(['ss', '-lntuHp'], capture_output=True, text=True, timeout=10)
     needle = ':' + str(port_value)
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        if len(fields) < 4: continue
-        state = fields[0].lower()
-        # ss State column: LISTEN = TCP listener, UNCONN = UDP listener.
-        # (The protocol is NOT the state; filtering on state was a latent bug
-        # that made every check silently skip all lines.)
-        if proto == 'tcp' and state != 'listen': continue
-        if proto == 'udp' and state != 'unconn': continue
-        # ss -lntuH columns: State Recv-Q Send-Q Local Peer Process.
-        # Local is fields[3] (Peer is fields[4]).
-        local = fields[3]
-        if not local.endswith(needle): continue
-        if host not in ('0.0.0.0', '::', '') and not local.startswith(host): continue
-        # Exclude a specific pid, or any listener whose comm matches the role
-        # (frps/frpc itself listening on its own bindPort is NOT a conflict).
-        if exclude_pid and ('pid=' + str(exclude_pid)) in line: continue
-        if exclude_role:
-            import re as _re
-            mname = _re.search(r'users:\(\("([^"]+)"', line)
-            if mname and mname.group(1) == exclude_role: continue
-        return True
-    return False
+    if shutil.which('ss'):
+        result = run_cmd(['ss', '-lntuHp'], capture_output=True, text=True, timeout=10)
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) < 4: continue
+            state = fields[0].lower()
+            # ss State column: LISTEN = TCP listener, UNCONN = UDP listener.
+            if proto == 'tcp' and state != 'listen': continue
+            if proto == 'udp' and state != 'unconn': continue
+            # ss -lntuH columns: State Recv-Q Send-Q Local Peer Process.
+            local = fields[3]
+            if not local.endswith(needle): continue
+            if host not in ('0.0.0.0', '::', '') and not local.startswith(host): continue
+            if exclude_pid and ('pid=' + str(exclude_pid)) in line: continue
+            if exclude_role:
+                import re as _re
+                mname = _re.search(r'users:\(\("([^"]+)"', line)
+                if mname and mname.group(1) == exclude_role: continue
+            return True
+        return False
+    if sys.platform == 'darwin' and shutil.which('lsof'):
+        # lsof -nP -iTCP -sTCP:LISTEN:  COMMAND PID ... NAME
+        # NAME looks like "*:7500 (LISTEN)" or "127.0.0.1:7500 (LISTEN)".
+        args = ['lsof', '-nP', '-i' + ('TCP' if proto == 'tcp' else 'UDP')]
+        if proto == 'tcp': args += ['-sTCP:LISTEN']
+        result = run_cmd(args, capture_output=True, text=True, timeout=10)
+        for line in result.stdout.splitlines()[1:]:  # skip header
+            fields = line.split()
+            if len(fields) < 9: continue
+            comm = fields[0]
+            name = fields[8]  # NAME column
+            # Match the port in the NAME field, e.g. ":7500 (LISTEN)".
+            if ':' + str(port_value) not in name and not name.endswith(':' + str(port_value)): continue
+            if host not in ('0.0.0.0', '::', '', '*') and host not in name: continue
+            if exclude_pid and fields[1] == str(exclude_pid): continue
+            if exclude_role and comm == exclude_role: continue
+            return True
+        return False
+    return None
 
 def firewall_hint(port_value, proto='tcp'):
     """Detect common firewall tools and return actionable hints; never modify rules."""

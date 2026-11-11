@@ -1032,4 +1032,25 @@ class ManagerTests(unittest.TestCase):
         self.assertIn('launchctl enable "system/$plist_label"', text)
         self.assertIn('launchctl disable "system/$plist_label"', text)
 
+    # ---- macOS lsof port conflict detection ----
+    def test_lsof_port_conflict_parses_macos_format(self):
+        fake = 'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nfrps 123 root 3u IPv4 0x123 0t0 TCP *:7000 (LISTEN)\n'
+        with patch.object(m.shutil, 'which', side_effect=lambda c: None if c == 'ss' else '/usr/sbin/lsof'), \
+             patch.object(m, 'run_cmd') as rc:
+            rc.return_value = type('R',(),{'returncode':0,'stdout':fake,'stderr':''})()
+            self.assertFalse(m.check_port_conflict('0.0.0.0', 7000, exclude_role='frps'))
+            self.assertTrue(m.check_port_conflict('0.0.0.0', 7000))
+    def test_lsof_port_conflict_no_port_returns_false(self):
+        fake = 'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nfrps 123 root 3u IPv4 0x123 0t0 TCP *:7000 (LISTEN)\n'
+        with patch.object(m.shutil, 'which', side_effect=lambda c: None if c == 'ss' else '/usr/sbin/lsof'), \
+             patch.object(m, 'run_cmd') as rc:
+            rc.return_value = type('R',(),{'returncode':0,'stdout':fake,'stderr':''})()
+            self.assertFalse(m.check_port_conflict('0.0.0.0', 9999))
+    def test_install_script_macos_skips_ss_prompt(self):
+        from pathlib import Path as _P
+        repo = _P(__file__).resolve().parent.parent
+        text = (repo / 'install-common.sh').read_text()
+        # macOS 分支不应提示安装 iproute2（用 lsof 替代）
+        self.assertIn('macOS 用 lsof', text)
+
 if __name__ == '__main__': unittest.main()

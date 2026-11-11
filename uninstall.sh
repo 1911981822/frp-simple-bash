@@ -12,7 +12,7 @@ while (($#)); do
     *) echo "未知参数：$1" >&2; exit 2;;
   esac
 done
-[[ "${EUID}" == 0 ]] || { echo '需要 root 权限' >&2; exit 1; }
+[[ "$(id -u)" == 0 ]] || { echo '需要 root 权限' >&2; exit 1; }
 if ((yes == 0)); then
   read -r -p "卸载 $role（默认保留配置和日志）？输入 YES 确认：" answer
   [[ "$answer" == YES ]] || { echo '已取消。'; exit 0; }
@@ -38,6 +38,12 @@ elif command -v rc-service >/dev/null; then
     rc-service "$role" stop >/dev/null 2>&1 || true
     rc-update del "$role" default >/dev/null 2>&1 || true
     rm -f -- "$unit"
+  fi
+elif [[ "$(uname -s)" == Darwin ]] && command -v launchctl >/dev/null; then
+  plist="/Library/LaunchDaemons/frp-simple-bash.$role.plist"
+  if [[ -f "$plist" ]]; then
+    launchctl unload "$plist" >/dev/null 2>&1 || true
+    rm -f -- "$plist"
   fi
 fi
 command="/usr/local/bin/$role"

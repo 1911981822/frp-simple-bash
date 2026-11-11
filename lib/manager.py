@@ -28,7 +28,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v0.1.30-purgescope.1'
+MANAGER_RELEASE_VERSION = 'v0.1.31-macos.1'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -532,6 +532,30 @@ def service(role, action):
         if action in ('enable', 'disable'):
             result = run_cmd(['rc-update', 'add' if action == 'enable' else 'del', role, 'default'], capture_output=True, text=True, timeout=30)
         else: result = run_cmd(['rc-service', role, action], capture_output=True, text=True, timeout=30)
+    elif sys.platform == 'darwin' and shutil.which('launchctl'):
+        # launchd: label frp-simple-bash.<role>, plist in /Library/LaunchDaemons.
+        label = 'frp-simple-bash.' + role
+        plist = Path('/Library/LaunchDaemons') / (label + '.plist')
+        if action == 'status':
+            result = run_cmd(['launchctl', 'print', 'system/' + label], capture_output=True, text=True, timeout=30)
+            if result.returncode != 0: return 'stopped'
+            # launchctl print exits 0 when loaded; "state = running" means active.
+            if 'state = running' in result.stdout: return 'running'
+            return 'stopped'
+        if action in ('enable', 'disable'):
+            # launchd auto-starts at boot when the plist is loaded at boot
+            # (system domain). enable=load now, disable=unload now.
+            cmd = ['launchctl', 'load' if action == 'enable' else 'unload', '-w', str(plist)]
+            if action == 'enable' and not plist.exists():
+                raise ValueError('launchd 服务文件不存在：' + str(plist) + '；请先运行安装器')
+            result = run_cmd(cmd, capture_output=True, text=True, timeout=30)
+        else:
+            if action == 'start':
+                result = run_cmd(['launchctl', 'kickstart', 'system/' + label], capture_output=True, text=True, timeout=30)
+            elif action == 'stop':
+                result = run_cmd(['launchctl', 'kill', 'SIGTERM', 'system/' + label], capture_output=True, text=True, timeout=30)
+            else:  # restart
+                result = run_cmd(['launchctl', 'kickstart', '-k', 'system/' + label], capture_output=True, text=True, timeout=30)
     else: return 'unknown' if action == 'status' else fail('无支持的服务管理器，无法保证后台运行与自启动')
     if action == 'status': return result.stdout.strip() or 'stopped'
     if result.returncode: err('E007', '服务操作失败：' + result.stderr.strip())
@@ -2435,6 +2459,7 @@ def _service_manager():
     if os.name == 'nt': return ''
     if shutil.which('systemctl') and Path('/run/systemd/system').exists(): return 'systemd'
     if shutil.which('rc-service') and shutil.which('rc-update'): return 'openrc'
+    if sys.platform == 'darwin' and shutil.which('launchctl'): return 'launchd'
     return ''
 
 def installed_unit_path(role):
@@ -2442,12 +2467,14 @@ def installed_unit_path(role):
     manager = _service_manager()
     if manager == 'systemd': return Path('/etc/systemd/system') / (role + '.service')
     if manager == 'openrc': return Path('/etc/init.d') / role
+    if manager == 'launchd': return Path('/Library/LaunchDaemons') / ('frp-simple-bash.' + role + '.plist')
     return None
 
 def template_path(role):
     manager = _service_manager()
     if manager == 'systemd': return INSTALL_ROOT / 'templates' / (role + '.service')
     if manager == 'openrc': return INSTALL_ROOT / 'templates' / (role + '.openrc')
+    if manager == 'launchd': return INSTALL_ROOT / 'templates' / (role + '.plist')
     return None
 
 def unit_differs(role):
@@ -2483,7 +2510,8 @@ def refresh_units(roles=None, yes=False):
         try:
             old = unit.read_bytes() if unit.exists() else None
             atomic(unit, template.read_text(encoding='utf-8'))
-            os.chmod(str(unit), 0o644 if manager == 'systemd' else 0o755)
+            # systemd unit and launchd plist are both 0644; openrc init scripts are 0755.
+            os.chmod(str(unit), 0o755 if manager == 'openrc' else 0o644)
         except (OSError, ValueError) as exc:
             failed.append(role + '（' + str(exc) + '）')
             continue

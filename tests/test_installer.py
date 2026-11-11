@@ -132,4 +132,31 @@ class InstallerInterfaceTests(unittest.TestCase):
         self.assertIn('if [[ "$role" == frpc ]]; then', text)
         self.assertIn('rm -rf -- "$config_root/frps.toml" "$config_root/.canonical-frps.toml"', text)
 
+    # ---- macOS (Darwin) compatibility ----
+    def test_macos_allowed_in_os_check(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        self.assertIn('Darwin', text)
+        self.assertNotIn('此安装器仅支持 Linux；', text)
+    def test_macos_uses_id_u_not_euid(self):
+        for f in ('install-common.sh', 'uninstall.sh'):
+            text = (ROOT / f).read_text()
+            self.assertIn('id -u', text)
+            self.assertNotIn('EUID', text)
+    def test_macos_sha_cmd_fallback(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        self.assertIn('shasum -a 256', text)
+        self.assertIn('sha_cmd=', text)
+    def test_macos_launchd_service_detection(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        self.assertIn('launchctl', text)
+        self.assertIn('launchd', text)
+    def test_macos_brew_only_prints(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        self.assertIn('brew install', text)
+        # 不自动 brew install，只提示
+        self.assertIn('不会自动安装', text)
+    def test_plist_templates_exist(self):
+        self.assertTrue((ROOT / 'templates' / 'frps.plist').exists())
+        self.assertTrue((ROOT / 'templates' / 'frpc.plist').exists())
+
 if __name__ == '__main__': unittest.main()

@@ -39,8 +39,9 @@ if [[ "$install_root" != /opt/frp-simple-bash || "$config_root" != /etc/frp ]]; 
   echo '自定义安装/配置目录当前尚未接入 systemd、命令入口和 manager 环境，请使用默认目录 /opt/frp-simple-bash 与 /etc/frp。' >&2
   exit 2
 fi
-[[ "$(uname -s)" == Linux ]] || { echo '此安装器仅支持 Linux；Windows 请使用 PowerShell 安装器。' >&2; exit 1; }
-[[ "${EUID}" == 0 ]] || { echo '请使用 root/sudo 安装。' >&2; exit 1; }
+os_name="$(uname -s)"
+[[ "$os_name" == Linux || "$os_name" == Darwin ]] || { echo '此安装器仅支持 Linux 与 macOS；Windows 请使用 PowerShell 安装器。' >&2; exit 1; }
+[[ "$(id -u)" == 0 ]] || { echo '请使用 root/sudo 安装。' >&2; exit 1; }
 source_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$source_root/lib/download.sh"
 [[ -n "$mirror" ]] && export FRP_MIRROR_URL="$mirror"
@@ -60,18 +61,29 @@ version='0.72.0'
 case "$(uname -m)" in
   x86_64|amd64) arch=amd64; expected=daf719b32ca2778770bb92955e231a07414d754378b9af328aa2642862479804 ;;
   aarch64|arm64) arch=arm64; expected=02180b857480302fd934e9ddbd50fe2f73229f99062f88756abc6de9df5e95cf ;;
-  *) echo '首期只支持 Linux amd64/arm64。' >&2; exit 1 ;;
+  *) echo '首期只支持 amd64/arm64。' >&2; exit 1 ;;
 esac
 missing=()
-for tool in curl tar sha256sum python3; do command -v "$tool" >/dev/null || missing+=("$tool"); done
+for tool in curl tar python3; do command -v "$tool" >/dev/null || missing+=("$tool"); done
+# SHA256 checker differs by platform: Linux has sha256sum, macOS has shasum.
+if command -v sha256sum >/dev/null; then sha_cmd='sha256sum'
+elif command -v shasum >/dev/null; then sha_cmd='shasum'
+else missing+=(sha256sum); sha_cmd=''
+fi
 
 # Detect the package manager and give each family its own non-interactive,
 # lock-aware invocation. Ubuntu/Debian needs DEBIAN_FRONTEND=noninteractive,
 # Fedora/RHEL uses dnf, CentOS 7 uses yum, Alpine uses apk.
 pkg_manager=''
-for candidate in apt-get dnf yum apk; do
-  if command -v "$candidate" >/dev/null 2>&1; then pkg_manager=$candidate; break; fi
-done
+if [[ "$os_name" == Darwin ]]; then
+  # macOS: Homebrew is the standard package manager but installing via brew
+  # interactively is non-deterministic; we only ever PRINT the command.
+  command -v brew >/dev/null 2>&1 && pkg_manager=brew
+else
+  for candidate in apt-get dnf yum apk; do
+    if command -v "$candidate" >/dev/null 2>&1; then pkg_manager=$candidate; break; fi
+  done
+fi
 
 pkg_names() {
   # Map logical names to the distro-specific packages (ss lives in iproute2).
@@ -118,6 +130,16 @@ run_pkg_install() {
 }
 
 if ((${#missing[@]})); then
+  # macOS: never auto-install via brew (interactive, non-deterministic). Print
+  # the exact commands and exit so the user runs them deliberately.
+  if [[ "$os_name" == Darwin ]]; then
+    echo '缺少依赖：'"${missing[*]}"'。macOS 不会自动安装，请手动执行：' >&2
+    for dep in "${missing[@]}"; do
+      echo "  brew install $dep" >&2
+    done
+    echo '  （coreutils 提供 sha256sum；或已有 shasum 则无需额外安装）' >&2
+    exit 1
+  fi
   printf '缺少依赖：%s。将通过系统包管理器安装：%s\n' "${missing[*]}" "$(pkg_names "${missing[@]}")"
   if [[ -z "$pkg_manager" ]]; then
     echo '无法识别包管理器，请手动安装：' >&2
@@ -161,7 +183,8 @@ fi
 manager=none
 if command -v systemctl >/dev/null && [[ -d /run/systemd/system ]]; then manager=systemd
 elif command -v rc-service >/dev/null && command -v rc-update >/dev/null; then manager=openrc
-else echo '未检测到 systemd/OpenRC；不能完成后台与自启动安装。' >&2; exit 1; fi
+elif [[ "$os_name" == Darwin ]] && command -v launchctl >/dev/null; then manager=launchd
+else echo '未检测到 systemd/OpenRC/launchd；不能完成后台与自启动安装。' >&2; exit 1; fi
 work="$(mktemp -d)"
 trap '[[ -n "${work:-}" && -d "$work" ]] && rm -rf -- "$work"' EXIT
 asset="frp_${version}_linux_${arch}.tar.gz"
@@ -172,9 +195,14 @@ else
   case "$arch" in amd64) asset_id=710291514 ;; arm64) asset_id=710291691 ;; esac
   frp_download_asset "$work/$asset" "$expected" "frp/v${version}/$asset" "https://github.com/fatedier/frp/releases/download/v${version}/${asset}" "https://api.github.com/repos/fatedier/frp/releases/assets/$asset_id"
 fi
-if ! printf '%s  %s\n' "$expected" "$work/$asset" | sha256sum -c - >/dev/null; then
-  echo 'frp 安装包 SHA256 校验失败，未执行二进制、未修改现有服务。' >&2
-  exit 1
+if [[ -z "$sha_cmd" ]]; then
+  echo '缺少 sha256sum/shasum，无法校验下载包。' >&2; exit 1
+fi
+if [[ "$sha_cmd" == sha256sum ]]; then
+  printf '%s  %s\n' "$expected" "$work/$asset" | sha256sum -c - >/dev/null || { echo 'frp 安装包 SHA256 校验失败，未执行二进制、未修改现有服务。' >&2; exit 1; }
+else
+  actual="$(shasum -a 256 "$work/$asset" | awk '{print $1}')"
+  [[ "$actual" == "$expected" ]] || { echo 'frp 安装包 SHA256 校验失败，未执行二进制、未修改现有服务。' >&2; exit 1; }
 fi
 tar -xzf "$work/$asset" -C "$work" 2>/dev/null || tar -xzf "$work/$asset" -C "$work"
 "$work/frp_${version}_linux_${arch}/$component" --version
@@ -256,9 +284,15 @@ if [[ "$manager" == systemd ]]; then
   install -m 644 "$source_root/templates/$component.service" "/etc/systemd/system/$component.service"
   systemctl daemon-reload
   if ((autostart == 1)); then systemctl enable "$component"; else systemctl disable "$component" || true; fi
-else
+elif [[ "$manager" == openrc ]]; then
   install -m 755 "$source_root/templates/$component.openrc" "/etc/init.d/$component"
   if ((autostart == 1)); then rc-update add "$component" default; else rc-update del "$component" default || true; fi
+else
+  # launchd (macOS): plist in /Library/LaunchDaemons, label frp-simple-bash.<role>.
+  plist_label="frp-simple-bash.$component"
+  plist_path="/Library/LaunchDaemons/$plist_label.plist"
+  install -m 644 "$source_root/templates/$component.plist" "$plist_path"
+  if ((autostart == 1)); then launchctl load -w "$plist_path"; fi
 fi
 if [[ ! -f "$config_root/$component.toml" ]]; then
   if ((non_interactive == 1)); then echo "配置不存在，--non-interactive 不进入配置向导：$config_root/$component.toml" >&2; exit 2; fi
@@ -267,7 +301,9 @@ fi
 if [[ -f "$config_root/$component.toml" ]]; then
   if "$install_root/native/$component" verify -c "$config_root/$component.toml" >/dev/null 2>&1; then
     if ((start == 1)); then
-      if [[ "$manager" == systemd ]]; then systemctl start "$component"; else rc-service "$component" start; fi
+      if [[ "$manager" == systemd ]]; then systemctl start "$component"
+      elif [[ "$manager" == openrc ]]; then rc-service "$component" start
+      else launchctl kickstart "system/frp-simple-bash.$component"; fi
     else
       echo '服务已注册但按 --no-start 保持停止。'
     fi

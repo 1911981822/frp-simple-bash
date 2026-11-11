@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>frp-simple-bash.frpc</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/frp-simple-bash/native/frpc</string>
+        <string>-c</string>
+        <string>/etc/frp/frpc.toml</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/etc/frp/logs/frpc.log</string>
+    <key>StandardErrorPath</key>
+    <string>/etc/frp/logs/frpc.log</string>
+</dict>
+</plist>

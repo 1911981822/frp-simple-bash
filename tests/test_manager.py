@@ -7,7 +7,13 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-import tomllib
+try:
+    import tomllib                      # Python 3.11+
+except ImportError:                     # Python 3.6-3.10 fallback
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None
 
 spec = importlib.util.spec_from_file_location('manager', Path(__file__).resolve().parents[1] / 'lib' / 'manager.py')
 m = importlib.util.module_from_spec(spec)
@@ -60,7 +66,7 @@ class ManagerTests(unittest.TestCase):
         (m.ROOT/'logs').mkdir(exist_ok=True)
         current=m.ROOT/'logs'/'frps.log'; current.write_text('current\n')
         rotated=m.ROOT/'logs'/'frps.log.123'; rotated.write_text('old\n')
-        with patch.object(m,'clear_screen'),patch.object(m,'pause'),patch('builtins.input',side_effect=['4','0']):
+        with patch.object(m,'clear_screen'),patch.object(m,'pause'),patch('builtins.input',side_effect=['5','0']):
             m.logs_and_diagnostics_menu('frps')
         self.assertTrue(current.exists()); self.assertFalse(rotated.exists())
     def test_show_logs_line_limit(self):
@@ -80,14 +86,24 @@ class ManagerTests(unittest.TestCase):
         self.assertIn('transport.useEncryption = true', rendered)
     def test_backup_captures_pre_change_state(self):
         pid=self.create();m.set_current(pid)
-        m.save_mappings(pid,[self.mapping()])
-        # Backup is taken before writing, so newest backup holds the empty pre-change mappings.
-        newest=m.list_backups()[0]
-        self.assertIn(f'profiles/{pid}/mappings.toml',newest['files'])
-        self.assertEqual(tomllib.loads((newest['path']/f'profiles/{pid}/mappings.toml').read_text()).get('mappings',[]),[])
-        m.save_mappings(pid,[])
-        previous=m.list_backups()[0]
-        m.restore_backup(previous['path'])
+        before=set(str(b['path']) for b in m.list_backups())
+        with patch.object(m, 'apply'):
+            m.save_mappings(pid,[self.mapping()])
+        # The first write must leave a pre-change snapshot holding the empty state.
+        first=[b for b in m.list_backups() if str(b['path']) not in before
+               and f'profiles/{pid}/mappings.toml' in b['files']]
+        self.assertTrue(first, 'save_mappings must snapshot mappings.toml before writing')
+        empty=min(first, key=lambda b: b['path'].stat().st_mtime)
+        self.assertEqual(tomllib.loads((empty['path']/f'profiles/{pid}/mappings.toml').read_text()).get('mappings',[]),[])
+        # The second write snapshots the state that still contains 'ssh'.
+        seen=set(str(b['path']) for b in m.list_backups())
+        with patch.object(m, 'apply'):
+            m.save_mappings(pid,[])
+        second=[b for b in m.list_backups() if str(b['path']) not in seen
+                and f'profiles/{pid}/mappings.toml' in b['files']]
+        self.assertTrue(second, 'second save_mappings must snapshot the previous mappings')
+        keep=max(second, key=lambda b: b['path'].stat().st_mtime)
+        m.restore_backup(keep['path'])
         self.assertEqual([x['name'] for x in m.mappings(pid)],['ssh'])
     def test_backup_menu_lists_and_cancels(self):
         pid=self.create();m.set_current(pid);m.save_mappings(pid,[self.mapping()])
@@ -535,6 +551,237 @@ class ManagerTests(unittest.TestCase):
              patch.object(m.time, 'monotonic', side_effect=[0, 0, 0, 100]), patch.object(m.time, 'sleep'), \
              contextlib.redirect_stdout(io.StringIO()):
             self.assertTrue(m.wait_connection(pid))
+
+    # ---- §17.4 security / §17.2 integration (offline, mocked boundaries) ----
+    def test_secret_files_have_restricted_permissions(self):
+        if os.name == 'nt': self.skipTest('POSIX permissions only')
+        pid = self.create()
+        for name in ('profile.toml', 'secrets.toml', 'mappings.toml'):
+            mode = (m.pdir(pid) / name).stat().st_mode & 0o777
+            self.assertEqual(mode, 0o600, name + ' mode ' + oct(mode))
+        self.assertEqual(m.ROOT.stat().st_mode & 0o777, 0o700)
+    def test_token_never_appears_in_json_status(self):
+        pid = self.create(); m.set_current(pid)
+        with contextlib.redirect_stdout(io.StringIO()):
+            m.apply(pid)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            m.run(['frpc', 'status', '--json'])
+        self.assertNotIn('token"\\&/', out.getvalue())
+    def test_shell_metacharacters_in_name_are_rejected(self):
+        for bad in ('a;rm -rf /', 'a$(id)', 'a`id`', 'a|b', 'a&b', 'a>b'):
+            with self.assertRaises(ValueError): m.name(bad)
+    def test_path_traversal_inputs_are_rejected(self):
+        with self.assertRaises(ValueError): m.pdir('../../etc')
+        with self.assertRaises(ValueError): m.pdir('/etc/passwd')
+        self.create()
+        directory = m.backup(m.managed_paths(), 'sec')
+        m.save_json(directory / 'manifest.json', {'files': ['../../escape']})
+        with self.assertRaises(ValueError): m.restore_backup(directory)
+    def test_upgrade_rejects_non_https_and_off(self):
+        for value in ('http://evil.example', 'off'):
+            with patch.object(m, 'confirm', return_value=True), \
+                 patch.dict(os.environ, {'FRP_MIRROR_URL': value}), \
+                 patch.object(m, 'upgrade_snapshot', return_value=None), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(ValueError): m.upgrade('frpc')
+    def test_restore_failure_does_not_corrupt_current_config(self):
+        pid = self.create(); m.set_current(pid)
+        with contextlib.redirect_stdout(io.StringIO()):
+            m.apply(pid)
+        before = (m.ROOT / 'frpc.toml').read_bytes()
+        directory = m.backup([m.ROOT / 'frpc.toml'], 'broken')
+        (directory / 'frpc.toml').unlink()
+        with self.assertRaises(ValueError): m.restore_backup(directory)
+        self.assertEqual((m.ROOT / 'frpc.toml').read_bytes(), before)
+
+    # ---- R11/R12/M6: CLI flags, JSON envelope, error codes, audit ----
+    def test_parse_flags_handles_documented_options(self):
+        args, flags = m._parse_flags(['alpha', '--json', '--yes', '--lines', '200',
+                                      '--version', 'v1.2.3', '--purge', '--profile', 'p1'])
+        self.assertEqual(args, ['alpha'])
+        for key in ('json', 'yes', 'purge', 'profile'):
+            self.assertTrue(flags.get(key), key)
+        self.assertEqual(flags['lines'], '200')
+        self.assertEqual(flags['version'], 'v1.2.3')
+    def test_status_json_envelope_has_stable_fields(self):
+        pid = self.create(); m.set_current(pid)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            m.run(['frpc', 'status', '--json'])
+        payload = json.loads(out.getvalue())
+        for key in ('ok', 'code', 'component', 'service_state', 'connection_state',
+                    'active_profile', 'pending', 'error', 'detail'):
+            self.assertIn(key, payload)
+        self.assertTrue(payload['ok']); self.assertEqual(payload['code'], 0)
+        self.assertEqual(payload['active_profile']['name'], '生产服务器')
+        self.assertNotIn('token', json.dumps(payload))
+    def test_status_without_json_keeps_legacy_shape(self):
+        pid = self.create(); m.set_current(pid)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            m.run(['frpc', 'status'])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload['component'], 'frpc')
+        self.assertIn('config_path', payload)
+    def test_error_codes_are_attached_without_changing_exception_type(self):
+        with self.assertRaises(ValueError) as ctx:
+            m.err('E006', '端口非法')
+        self.assertIn('[E006]', str(ctx.exception))
+        self.assertEqual(ValueError, type(ctx.exception))
+        for code in ('E001', 'E007', 'E013', 'E014', 'E017'):
+            self.assertIn(code, m.ERROR_CODES)
+    def test_profile_use_accepts_menu_number(self):
+        a = self.create('A'); b = self.create('B'); m.set_current(a)
+        with patch.object(m, 'running', return_value=False), contextlib.redirect_stdout(io.StringIO()):
+            m.run(['frpc', 'profile', 'use', '2'])
+        self.assertEqual(m.active(), b)
+    def test_audit_records_service_actions(self):
+        pid = self.create(); m.set_current(pid)
+        with patch.object(m, 'TEST', False), patch.object(m, 'run_cmd') as rc, \
+             patch.object(m.shutil, 'which', return_value='/bin/systemctl'):
+            rc.return_value = type('R', (), {'returncode': 0, 'stdout': 'active', 'stderr': ''})()
+            m.service('frpc', 'restart')
+        log = (m.ROOT / 'logs' / 'manager.log').read_text()
+        self.assertIn('service-restart', log)
+
+    # ---- FLOW F4: one bad field must not abort the wizard/session ----
+    def test_edit_profile_bad_field_keeps_session(self):
+        pid = self.create(); m.set_current(pid); m.apply(pid)
+        with patch('builtins.input', side_effect=['4', 'abc', '2', '改名成功', '10']), \
+             patch.object(m, 'confirm', return_value=False), contextlib.redirect_stdout(io.StringIO()):
+            m.edit_profile()
+        self.assertEqual(m.load_profile(pid)['name'], '改名成功')
+    def test_mapping_wizard_reasks_bad_remote_port(self):
+        answers = ['m1', 'tcp', '127.0.0.1', '22', 'not-a-port', '6000', 'y']
+        with patch('builtins.input', side_effect=answers), contextlib.redirect_stdout(io.StringIO()):
+            result = m.mapping_wizard()
+        self.assertIsNotNone(result)
+        self.assertEqual(result['remote_port'], 6000)
+    def test_mapping_wizard_rejects_http_without_domain_then_recovers(self):
+        answers = ['m2', 'http', '127.0.0.1', '80', '', 'example.com', 'y']
+        with patch('builtins.input', side_effect=answers), contextlib.redirect_stdout(io.StringIO()):
+            result = m.mapping_wizard()
+        self.assertIsNotNone(result)
+        self.assertEqual(result['domain'], 'example.com')
+
+    # ---- FLOW F6/F7: delete profile requires YES and guides afterwards ----
+    def test_delete_profile_requires_yes_confirmation(self):
+        pid = self.create('D'); m.set_current(pid)
+        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', side_effect=['y','y']):
+            m.delete_profile_id(pid)
+        self.assertTrue((m.ROOT / 'profiles' / pid).exists())
+    def test_delete_active_profile_guides_and_clears_state(self):
+        a = self.create('A'); b = self.create('B'); m.set_current(a)
+        m.save_json(m.ROOT / 'state.json', {'active_profile_id': a, 'pending': True,
+                                            'frpc_hash': 'x', 'frpc_log_offset': 5})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), patch('builtins.input', return_value='YES'), \
+             patch.object(m, 'running', return_value=False):
+            m.delete_profile_id(a)
+        self.assertFalse((m.ROOT / 'profiles' / a).exists())
+        self.assertEqual(m.profiles()[0]['name'], 'B')
+        self.assertIn('剩余服务端', out.getvalue())
+        st = m.state()
+        for key in ('pending', 'frpc_hash', 'frpc_log_offset'):
+            self.assertNotIn(key, st)
+    def test_delete_last_profile_guides_to_create(self):
+        pid = self.create('Only'); m.set_current(pid)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), patch('builtins.input', return_value='YES'), \
+             patch.object(m, 'running', return_value=False):
+            m.delete_profile_id(pid)
+        self.assertEqual(m.profiles(), [])
+        self.assertIn('新建 frps 服务端', out.getvalue())
+
+    # ---- FLOW F1: switch must compensate on start failure ----
+    def test_switch_start_failure_restores_old_runtime(self):
+        a = self.create('A'); b = self.create('B'); m.set_current(a)
+        def fake_service(role, action):
+            if action == 'status': return 'active'
+            if action == 'stop': return None
+            if action == 'start': raise ValueError('unit masked')
+            return None
+        with patch.object(m, 'service', side_effect=fake_service), \
+             patch.object(m, 'confirm', return_value=True), \
+             patch.object(m, 'wait_connection'), contextlib.redirect_stdout(io.StringIO()):
+            m.switch(b)  # must not raise; service failure is reported, not propagated
+        # Target profile stays active per 详细设计 §15.2(4)
+        self.assertEqual(m.active(), b)
+    def test_switch_does_not_hold_lock_during_probe(self):
+        import inspect
+        src = inspect.getsource(m.switch)
+        # The transactional block must close before start/probe happen.
+        locked = src.index('with lock()')
+        probe = src.index('wait_connection')
+        self.assertLess(locked, probe)
+        # Only a single `with lock()` in switch, and it wraps just the write.
+        self.assertEqual(src.count('with lock()'), 1)
+
+    # ---- R7/R1: token strength + frps TLS ----
+    def test_wizard_rejects_weak_token(self):
+        with patch('builtins.input', side_effect=['0.0.0.0','7000','']), \
+             patch('getpass.getpass', return_value='abc'), \
+             patch.object(m, 'verify'), patch.object(m, 'running', return_value=False), \
+             patch.object(m, 'confirm', return_value=True), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(ValueError) as ctx: m.configure_server()
+        self.assertIn('token', str(ctx.exception).lower())
+    def test_wizard_autogenerates_strong_token_when_blank(self):
+        with patch('builtins.input', side_effect=['0.0.0.0','7000','', '', '', '', '', 'n']), \
+             patch('getpass.getpass', return_value=''), \
+             patch.object(m, 'verify'), patch.object(m, 'running', return_value=False), \
+             patch.object(m, 'confirm', return_value=True), contextlib.redirect_stdout(io.StringIO()):
+            m.configure_server()
+        token = m.read_toml(m.ROOT / 'frps.toml')['auth']['token']
+        self.assertGreaterEqual(len(token), 8)
+        m.validate_frps_config(m.read_toml(m.ROOT / 'frps.toml'))  # config must be valid
+    def test_validate_frps_rejects_same_dashboard_port(self):
+        with self.assertRaises(ValueError):
+            m.validate_frps_config({'bindPort': 7000, 'webServer': {'port': 7000, 'user': 'a', 'password': 'b'}})
+    def test_validate_frps_accepts_tls_when_files_exist(self):
+        import tempfile as _tf
+        cert = Path(_tf.mkdtemp()) / 'cert.pem'; cert.write_text('x')
+        key = cert.parent / 'key.pem'; key.write_text('y')
+        m.validate_frps_config({'bindPort': 7000, 'transport': {'tls': {'certFile': str(cert), 'keyFile': str(key)}}})
+    def test_validate_frps_rejects_tls_without_key(self):
+        with self.assertRaises(ValueError):
+            m.validate_frps_config({'bindPort': 7000, 'transport': {'tls': {'certFile': '/nope.pem'}}})
+    def test_expand_keys_builds_nested(self):
+        self.assertEqual(m.expand_keys({'auth.token': 'x', 'a': 1}), {'auth': {'token': 'x'}, 'a': 1})
+
+    # ---- STATE: status/state mapping/diagnostics robustness ----
+    def test_status_bar_survives_broken_mappings_file(self):
+        pid = self.create(); m.set_current(pid)
+        (m.pdir(pid) / 'mappings.toml').write_text('this is not toml\n')
+        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', return_value='0'):
+            m.main_menu('frpc')  # must not raise / exit
+    def test_broken_profile_reports_config_error(self):
+        m.save_json(m.ROOT / 'state.json', {'active_profile_id': 'deadbeefdeadbeefdeadbeef'})
+        data = m.status('frpc')
+        self.assertIsNone(data['active_profile'])
+        self.assertEqual(data['connection']['state'], 'config-error')
+        self.assertIn('profile_error', data)
+    def test_state_labels_cover_documented_enums(self):
+        for key in ('not-installed', 'stopped', 'starting', 'running', 'stopping', 'failed', 'unknown'):
+            self.assertIn(key, m.SERVICE_STATES)
+        for key in ('not-configured', 'connecting', 'connected', 'disconnected', 'auth-failed',
+                    'unreachable', 'tls-failed', 'config-error', 'timeout', 'unknown'):
+            self.assertIn(key, m.CONNECTION_STATES)
+    def test_wait_connection_fails_fast_when_service_stopped(self):
+        pid = self.create()
+        with patch.object(m, 'connection', return_value={'state': 'stopped'}), \
+             patch.object(m, 'running', return_value=False), \
+             patch.object(m.time, 'monotonic', side_effect=[0, 1]), \
+             patch.object(m.time, 'sleep') as sleeper, contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(m.wait_connection(pid, timeout=30))
+            sleeper.assert_not_called()  # no pointless 30s wait
+    def test_toml_errors_do_not_echo_values(self):
+        with self.assertRaises(ValueError) as ctx:
+            m._mini_toml('auth.token = "SUPERSECRET')
+        self.assertNotIn('SUPERSECRET', str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx2:
+            m._mini_toml('a = @BADVALUE@')
+        self.assertNotIn('@BADVALUE@', str(ctx2.exception))
 
     def test_frps_config_menu_preserves_webserver_tls(self):
         m.atomic(m.ROOT / 'frps.toml', m.toml({'bindPort': 7000,

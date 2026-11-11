@@ -934,4 +934,63 @@ class ManagerTests(unittest.TestCase):
             m.upgrade('frps')
         self.assertIn('已是最新版本', out.getvalue())
 
+    # ---- bug fixes: flags, error codes, firewall, log, upgrade rollback ----
+    def test_no_start_flag_parses_to_no_start_key(self):
+        args, flags = m._parse_flags(['--no-start', '--yes'])
+        self.assertTrue(flags.get('no_start'))
+        self.assertTrue(flags.get('yes'))
+    def test_mapping_delete_requires_yes(self):
+        pid = self.create(); m.set_current(pid)
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(m, 'apply'):
+            m.save_mappings(pid, [self.mapping()])
+        # CLI delete with plain 'y' must be rejected (danger confirm requires YES)
+        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', side_effect=['y']):
+            m.mapping_command(['delete', 'ssh'])
+        self.assertEqual(len(m.mappings(pid)), 1)  # unchanged
+    def test_err_rejects_unknown_code(self):
+        with self.assertRaises(ValueError) as ctx:
+            m.err('E999', 'boom')
+        self.assertIn('未知错误码', str(ctx.exception))
+    def test_port_error_has_code(self):
+        with self.assertRaises(ValueError) as ctx:
+            m.port('abc')
+        self.assertIn('[E006]', str(ctx.exception))
+    def test_firewall_hint_port_not_substring_match(self):
+        # "80" must not match "8080" as a rule
+        fake = 'Status: active\nTo                         Action      From\n8080/tcp                  ALLOW       Anywhere\n'
+        with patch.object(m.shutil, 'which', return_value='/usr/sbin/ufw'), \
+             patch.object(m, 'run_cmd') as rc:
+            rc.return_value = type('R', (), {'stdout': fake, 'stderr': ''})()
+            hints = m.firewall_hint(80, 'tcp')
+        # 80 is NOT explicitly allowed (only 8080), so a hint should appear
+        self.assertTrue(any('80/tcp' in h for h in hints))
+    def test_firewall_hint_exact_port_allowed(self):
+        fake = 'Status: active\nTo                         Action      From\n80/tcp                    ALLOW       Anywhere\n'
+        with patch.object(m.shutil, 'which', return_value='/usr/sbin/ufw'), \
+             patch.object(m, 'run_cmd') as rc:
+            rc.return_value = type('R', (), {'stdout': fake, 'stderr': ''})()
+            hints = m.firewall_hint(80, 'tcp')
+        self.assertEqual(hints, [])  # explicitly allowed, no hint
+    def test_login_state_no_false_auth_from_token_word(self):
+        log = m.ROOT / 'logs' / 'frpc.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text('start frpc service\nuse token: xyz\nconnecting to server...\n')
+        self.assertIsNone(m._login_state_from_log())
+    def test_restore_upgrade_snapshot_dispatches(self):
+        # Simulate an upgrade snapshot dir and verify restore dispatches correctly.
+        from pathlib import Path as _P
+        snap = m.ROOT / 'backups' / '20260101-000000-upgrade-abc'
+        (snap / 'install-root' / 'lib').mkdir(parents=True)
+        (snap / 'install-root' / 'lib' / 'manager.py').write_text('# old\n')
+        m.save_json(snap / 'manifest.json', {'reason': 'upgrade',
+                                             'files': ['lib/manager.py'],
+                                             'sha256': {}})
+        # patch INSTALL_ROOT to a temp dir so we don't touch the real one
+        import tempfile as _tf
+        fake_install = _P(_tf.mkdtemp())
+        with patch.object(m, 'INSTALL_ROOT', fake_install):
+            restored = m.restore_upgrade_snapshot(snap)
+        self.assertEqual(restored, ['lib/manager.py'])
+        self.assertEqual((fake_install / 'lib' / 'manager.py').read_text(), '# old\n')
+
 if __name__ == '__main__': unittest.main()

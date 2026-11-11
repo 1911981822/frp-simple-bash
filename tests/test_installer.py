@@ -91,8 +91,9 @@ class InstallerInterfaceTests(unittest.TestCase):
             self.assertIn(real_marker, text)
     def test_purge_reports_which_traces_block_it(self):
         text = (ROOT / 'uninstall.sh').read_text()
-        self.assertIn('另一个组件 $other 仍安装', text)
-        self.assertIn('发现残留', text)
+        # 卸载本组件时：先删本组件配置，另一组件仍在则保留共享目录并提示
+        self.assertIn('已删除 $role 的配置', text)
+        self.assertIn('保留共享目录', text)
         self.assertIn('uninstall.sh $other', text)
     def test_purge_success_message_present(self):
         text = (ROOT / 'uninstall.sh').read_text()
@@ -114,5 +115,21 @@ class InstallerInterfaceTests(unittest.TestCase):
         # purge 仍检查另一组件的真实痕迹
         for marker in ('/usr/local/bin/$other', 'native/$other', '$other.service', 'init.d/$other'):
             self.assertIn(marker, text)
+
+    def test_purge_frpc_only_removes_frpc_config(self):
+        # 语义：卸载 frpc 只删 frpc 专属配置，绝不删 frps 配置。
+        text = (ROOT / 'uninstall.sh').read_text()
+        # frpc purge 删除 frpc.toml/profiles/index.json
+        self.assertIn('frpc.toml" "$config_root/profiles" "$config_root/index.json', text)
+        # 但绝不删除 frps.toml（frps 专属配置）
+        self.assertIn('rm -rf -- "$config_root/frps.toml" "$config_root/.canonical-frps.toml"', text)
+        # 共享目录只在另一组件不存在时才删
+        self.assertIn('rm -rf -- /etc/frp /opt/frp-simple-bash', text)
+    def test_purge_keeps_frps_config_when_uninstalling_frpc(self):
+        text = (ROOT / 'uninstall.sh').read_text()
+        # 卸载 frpc 的 purge 分支不包含删除 frps.toml 的代码路径
+        # （frps.toml 删除只在 role==frps 分支）
+        self.assertIn('if [[ "$role" == frpc ]]; then', text)
+        self.assertIn('rm -rf -- "$config_root/frps.toml" "$config_root/.canonical-frps.toml"', text)
 
 if __name__ == '__main__': unittest.main()

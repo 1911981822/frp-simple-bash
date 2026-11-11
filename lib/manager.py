@@ -28,7 +28,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v0.1.32-launchd.1'
+MANAGER_RELEASE_VERSION = 'v0.1.33-frpc-only.1'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -2698,6 +2698,9 @@ def run(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or argv[0] not in ('frps','frpc'): raise ValueError('需要指定 frps/frpc')
     role = argv.pop(0); initialize()
+    # macOS 只提供客户端 frpc，不提供服务端 frps。
+    if sys.platform == 'darwin' and role == 'frps':
+        err('E001', 'macOS 仅支持客户端 frpc，不提供 frps 服务端；如需 frps 请在 Linux 服务器上运行。')
     cmd = argv.pop(0) if argv else 'menu'
     if cmd == 'status':
         _args, flags = _parse_flags(argv)

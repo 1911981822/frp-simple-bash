@@ -41,6 +41,12 @@ if [[ "$install_root" != /opt/frp-simple-bash || "$config_root" != /etc/frp ]]; 
 fi
 os_name="$(uname -s)"
 [[ "$os_name" == Linux || "$os_name" == Darwin ]] || { echo '此安装器仅支持 Linux 与 macOS；Windows 请使用 PowerShell 安装器。' >&2; exit 1; }
+# macOS 只提供客户端 frpc，不提供服务端 frps。
+if [[ "$os_name" == Darwin && "$component" == frps ]]; then
+  echo 'macOS 仅支持客户端 frpc，不提供 frps 服务端安装。' >&2
+  echo '如需 frps 服务端，请在 Linux 服务器上安装。' >&2
+  exit 1
+fi
 [[ "$(id -u)" == 0 ]] || { echo '请使用 root/sudo 安装。' >&2; exit 1; }
 source_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$source_root/lib/download.sh"

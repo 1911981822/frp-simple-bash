@@ -357,9 +357,17 @@ class ManagerTests(unittest.TestCase):
         m.atomic(m.ROOT / 'frps.toml', m.toml({'bindPort': 7000, 'auth.token': 'SUPERSECRET',
                                                'webServer.user': 'admin', 'webServer.password': 'DASHSECRET'}))
         out = io.StringIO()
-        with patch.object(m, '_toml_lib', None), contextlib.redirect_stdout(out):
+        # 本机是 darwin，run(['frps',...]) 会被 macOS 拦截；测试 frps 底层逻辑需模拟 linux
+        with patch.object(m.sys, 'platform', 'linux'), \
+             patch.object(m, '_toml_lib', None), contextlib.redirect_stdout(out):
             m.run(['frps', 'config', 'show'])
         self.assertNotIn('SUPERSECRET', out.getvalue()); self.assertNotIn('DASHSECRET', out.getvalue())
+    def test_macos_rejects_frps_command(self):
+        with patch.object(m.sys, 'platform', 'darwin'), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(ValueError) as ctx:
+                m.run(['frps', 'status'])
+        self.assertIn('macOS 仅支持客户端 frpc', str(ctx.exception))
+        self.assertIn('[E001]', str(ctx.exception))
     # ---- Service control / connection state / pending ----
     def test_service_feedback_actually_calls_service(self):
         with patch.object(m, 'service', side_effect=[None, 'active']) as svc, contextlib.redirect_stdout(io.StringIO()):

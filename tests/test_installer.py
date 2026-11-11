@@ -156,7 +156,12 @@ class InstallerInterfaceTests(unittest.TestCase):
         # 不自动 brew install，只提示
         self.assertIn('不会自动安装', text)
     def test_plist_templates_exist(self):
-        self.assertTrue((ROOT / 'templates' / 'frps.plist').exists())
+        # macOS 只支持客户端 frpc，只应有 frpc.plist，不应有 frps.plist
         self.assertTrue((ROOT / 'templates' / 'frpc.plist').exists())
+        self.assertFalse((ROOT / 'templates' / 'frps.plist').exists())
+    def test_macos_rejects_frps(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        self.assertIn('macOS 仅支持客户端 frpc', text)
+        self.assertIn('$component" == frps', text)
 
 if __name__ == '__main__': unittest.main()

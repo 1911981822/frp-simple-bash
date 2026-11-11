@@ -164,4 +164,17 @@ class InstallerInterfaceTests(unittest.TestCase):
         self.assertIn('macOS 仅支持客户端 frpc', text)
         self.assertIn('$component" == frps', text)
 
+    def test_macos_darwin_asset_and_sha256(self):
+        text = (ROOT / 'install-common.sh').read_text()
+        # macOS arm64 用 darwin_arm64 包 + 对应 SHA256
+        self.assertIn('6e8576c5b6b9914a86850f6ff4fb81c5a09e706f91f70f64d5f398558bdc9db8', text)
+        self.assertIn('710291519', text)
+        # macOS amd64
+        self.assertIn('60439dc6bf794c4182a1a4cac147d642f839d55201607208979eb23aecd09be9', text)
+        self.assertIn('710291782', text)
+        # asset 名用 os_short 动态，不再是硬编码 linux
+        self.assertIn('os_short=', text)
+        self.assertIn('frp_${version}_${os_short}_${arch}.tar.gz', text)
+        self.assertNotIn('frp_${version}_linux_${arch}.tar.gz', text)
+
 if __name__ == '__main__': unittest.main()

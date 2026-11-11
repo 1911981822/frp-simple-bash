@@ -64,9 +64,25 @@ for role in frps frpc; do
   fi
 done
 version='0.72.0'
+# Platform string in the frp release asset name: linux_* on Linux, darwin_* on macOS.
+os_short=$([[ "$os_name" == Darwin ]] && echo darwin || echo linux)
 case "$(uname -m)" in
-  x86_64|amd64) arch=amd64; expected=daf719b32ca2778770bb92955e231a07414d754378b9af328aa2642862479804 ;;
-  aarch64|arm64) arch=arm64; expected=02180b857480302fd934e9ddbd50fe2f73229f99062f88756abc6de9df5e95cf ;;
+  x86_64|amd64)
+    arch=amd64
+    if [[ "$os_name" == Darwin ]]; then
+      expected=60439dc6bf794c4182a1a4cac147d642f839d55201607208979eb23aecd09be9; asset_id=710291782
+    else
+      expected=daf719b32ca2778770bb92955e231a07414d754378b9af328aa2642862479804; asset_id=710291514
+    fi
+    ;;
+  aarch64|arm64)
+    arch=arm64
+    if [[ "$os_name" == Darwin ]]; then
+      expected=6e8576c5b6b9914a86850f6ff4fb81c5a09e706f91f70f64d5f398558bdc9db8; asset_id=710291519
+    else
+      expected=02180b857480302fd934e9ddbd50fe2f73229f99062f88756abc6de9df5e95cf; asset_id=710291691
+    fi
+    ;;
   *) echo '首期只支持 amd64/arm64。' >&2; exit 1 ;;
 esac
 missing=()
@@ -193,12 +209,11 @@ elif [[ "$os_name" == Darwin ]] && command -v launchctl >/dev/null; then manager
 else echo '未检测到 systemd/OpenRC/launchd；不能完成后台与自启动安装。' >&2; exit 1; fi
 work="$(mktemp -d)"
 trap '[[ -n "${work:-}" && -d "$work" ]] && rm -rf -- "$work"' EXIT
-asset="frp_${version}_linux_${arch}.tar.gz"
+asset="frp_${version}_${os_short}_${arch}.tar.gz"
 if [[ -n "$archive_path" ]]; then
   [[ -f "$archive_path" ]] || { echo '本地 frp 安装包不存在。' >&2; exit 1; }
   cp -- "$archive_path" "$work/$asset"
 else
-  case "$arch" in amd64) asset_id=710291514 ;; arm64) asset_id=710291691 ;; esac
   frp_download_asset "$work/$asset" "$expected" "frp/v${version}/$asset" "https://github.com/fatedier/frp/releases/download/v${version}/${asset}" "https://api.github.com/repos/fatedier/frp/releases/assets/$asset_id"
 fi
 if [[ -z "$sha_cmd" ]]; then
@@ -211,7 +226,7 @@ else
   [[ "$actual" == "$expected" ]] || { echo 'frp 安装包 SHA256 校验失败，未执行二进制、未修改现有服务。' >&2; exit 1; }
 fi
 tar -xzf "$work/$asset" -C "$work" 2>/dev/null || tar -xzf "$work/$asset" -C "$work"
-"$work/frp_${version}_linux_${arch}/$component" --version
+"$work/frp_${version}_${os_short}_${arch}/$component" --version
 # Pre-flight checks that must NOT stop a running service before failing.
 for role in frps frpc; do
   if [[ -e "/usr/local/bin/$role" && ! -L "/usr/local/bin/$role" ]]; then
@@ -273,7 +288,7 @@ trap rollback_install EXIT
 if [[ "$manager" == systemd ]] && systemctl is-active --quiet "$component"; then was_running=1; systemctl stop "$component"; fi
 if [[ "$manager" == openrc ]] && rc-service "$component" status >/dev/null 2>&1; then was_running=1; rc-service "$component" stop; fi
 # Stage then atomically replace the executable (avoids ETXTBSY).
-install -m 755 "$work/frp_${version}_linux_${arch}/$component" "$install_root/native/$component.new"
+install -m 755 "$work/frp_${version}_${os_short}_${arch}/$component" "$install_root/native/$component.new"
 mv -f "$install_root/native/$component.new" "$install_root/native/$component"
 if [[ "$source_root" != "$install_root" ]]; then
   for file in frps frpc; do install -m 755 "$source_root/bin/$file" "$install_root/bin/$file"; done

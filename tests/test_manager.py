@@ -552,6 +552,35 @@ class ManagerTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             self.assertTrue(m.wait_connection(pid))
 
+    # ---- dashboard default listen address (external access) ----
+    def test_configure_server_dashboard_defaults_to_all_interfaces(self):
+        # input: 业务监听地址, 业务端口, Dashboard用户名, Dashboard监听地址,
+        #        Dashboard端口, vhostHTTP(空), vhostHTTPS(空)
+        # getpass: token 和 Dashboard 密码都返回 secret123
+        # confirm: 对外监听=True, 启用TLS=False
+        with patch('builtins.input', side_effect=['0.0.0.0','7000','admin','0.0.0.0','7500','','']), \
+             patch('getpass.getpass', return_value='secret123'), \
+             patch.object(m, 'verify'), patch.object(m, 'running', return_value=False), \
+             patch.object(m, 'confirm', side_effect=[True, False]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            m.configure_server()
+        cfg = m.read_toml(m.ROOT / 'frps.toml')
+        self.assertEqual(cfg['webServer']['addr'], '0.0.0.0')
+        self.assertEqual(cfg['webServer']['port'], 7500)
+    def test_config_menu_dashboard_default_is_all_interfaces(self):
+        m.ROOT.mkdir(exist_ok=True)
+        # pre-seed a config with webServer present
+        m.atomic(m.ROOT / 'frps.toml', m.toml({'bindAddr':'0.0.0.0','bindPort':7000,
+            'webServer':{'addr':'0.0.0.0','port':7500,'user':'admin','password':'pw'}}))
+        # assert the menu's default string is all-interfaces (not 127.0.0.1)
+        import inspect
+        src = inspect.getsource(m.frps_config_menu)
+        self.assertIn("web.get('addr', '0.0.0.0')", src)
+        self.assertNotIn("web.get('addr', '127.0.0.1')", src)
+    def test_validate_frps_accepts_external_dashboard(self):
+        m.validate_frps_config({'bindPort':7000,
+            'webServer':{'addr':'0.0.0.0','port':7500,'user':'admin','password':'pw'}})
+
     # ---- unit refresh on upgrade (template changes reach a running host) ----
     def test_unit_differs_detects_template_change(self):
         unit = m.ROOT / 'installed.service'; unit.write_text('[Service]\n# v1\n')

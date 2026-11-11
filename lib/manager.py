@@ -28,7 +28,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v0.1.24-units.1'
+MANAGER_RELEASE_VERSION = 'v0.1.25-dashboard.1'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -1518,7 +1518,7 @@ def configure_server():
     user = ask('Dashboard 用户名（留空关闭）', allow_empty=True)
     if user is None: return
     if user:
-        host_raw = ask('Dashboard 监听地址', '127.0.0.1')
+        host_raw = ask('Dashboard 监听地址', '0.0.0.0')
         if host_raw is None: return
         host = address(host_raw)
         if host not in ('127.0.0.1', '::1') and not confirm('管理接口将对外监听，确认？'): return
@@ -1696,7 +1696,7 @@ def frps_config_menu():
                 if not user:
                     data.pop('webServer', None)
                 else:
-                    host_raw = ask('Dashboard 监听地址', web.get('addr', '127.0.0.1'))
+                    host_raw = ask('Dashboard 监听地址', web.get('addr', '0.0.0.0'))
                     if host_raw is None: continue
                     host = address(host_raw)
                     if host not in ('127.0.0.1', '::1') and not confirm('管理接口将对外监听，确认？'): continue

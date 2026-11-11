@@ -237,6 +237,33 @@ class ManagerTests(unittest.TestCase):
         pid = self.create()
         with patch.object(m, 'running', return_value=True), patch.object(m, 'api', return_value={}):
             self.assertEqual(m.connection(pid)['state'], 'unknown')
+    def test_login_log_proves_connected_with_zero_proxies(self):
+        # Regression: frps shows the client online but frpc showed "connecting"
+        # because the Dashboard fallback timed out and masked a successful login.
+        pid = self.create()
+        (m.ROOT / 'logs').mkdir(exist_ok=True)
+        (m.ROOT / 'logs' / 'frpc.log').write_text(
+            'start frpc service for config file\n'
+            'try to connect to server...\n'
+            'login to server success, get run id [abc]\n'
+            'http response [/api/status]: code [200]\n')
+        with patch.object(m, 'running', return_value=True), patch.object(m, 'api', side_effect=OSError('dashboard unreachable')):
+            result = m.connection(pid)
+        self.assertEqual(result['state'], 'connected')
+        self.assertEqual(result.get('source'), 'frpc-log')
+    def test_admin_api_online_status_is_connected(self):
+        # frp 0.72 /api/status reports "online", not "running".
+        pid = self.create()
+        with patch.object(m, 'running', return_value=True), patch.object(m, 'api', return_value={'tcp': [{'name': 'ssh', 'status': 'online'}]}):
+            self.assertEqual(m.connection(pid)['state'], 'connected')
+    def test_reconnect_after_login_is_not_connected(self):
+        pid = self.create()
+        (m.ROOT / 'logs').mkdir(exist_ok=True)
+        (m.ROOT / 'logs' / 'frpc.log').write_text(
+            'start frpc service\nlogin to server success\n'
+            'connect to server error: i/o timeout\n')
+        with patch.object(m, 'running', return_value=True), patch.object(m, 'api', side_effect=OSError('unreachable')):
+            self.assertEqual(m.connection(pid)['state'], 'connecting')
     def test_foreign_profile_import_is_rejected(self):
         pid = self.create(); m.set_current(pid); m.apply(pid)
         external = m.render(pid).replace('clientID = "' + pid + '"', 'clientID = "other"')

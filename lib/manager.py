@@ -28,7 +28,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v0.1.17-ui.1'
+MANAGER_RELEASE_VERSION = 'v0.1.18-conn.1'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -385,38 +385,71 @@ def api(url, user, password):
         return data['data']
     return data
 
+def _login_state_from_log():
+    """Read the tail of frpc.log and decide login state from frp's own messages.
+
+    This is the most reliable signal: it works with zero proxies and does not
+    depend on the admin API response shape or Dashboard credentials.
+    """
+    logfile = ROOT / 'logs' / 'frpc.log'
+    if not logfile.exists(): return None
+    try:
+        with logfile.open('rb') as f:
+            size = logfile.stat().st_size
+            f.seek(max(0, size - 262144))
+            logs = f.read().decode('utf-8', errors='replace')
+    except OSError:
+        return None
+    # Only consider the current process: frp prints this line on every start.
+    start = logs.rfind('start frpc service')
+    if start >= 0: logs = logs[start:]
+    success = logs.rfind('login to server success')
+    failure = max(logs.rfind('login to server failed'), logs.rfind('try to reconnect'),
+                  logs.rfind('control writer is closing'), logs.rfind('connect to server error'))
+    if success >= 0 and success > failure:
+        return {'state': 'connected', 'source': 'frpc-log'}
+    if failure > success:
+        recent = logs[max(0, failure - 256):].lower()
+        if 'token' in recent or 'authentication' in recent:
+            return {'state': 'auth-failed', 'detail': 'token 或认证参数不匹配'}
+        if 'tls' in recent or 'certificate' in recent:
+            return {'state': 'tls-failed', 'detail': 'TLS 证书或信任配置错误'}
+        return {'state': 'connecting', 'source': 'frpc-log'}
+    return None
+
 def connection(pid):
     if not running('frpc'): return {'state': 'stopped'}
     p = load_profile(pid); s = secrets_for(pid)
+    # 1) frp's own log is authoritative for login state (0-proxy safe).
+    logged = _login_state_from_log()
+    if logged and logged['state'] in ('connected', 'auth-failed', 'tls-failed'):
+        return logged
+    # 2) Local admin API reports per-proxy status (frp 0.72 uses "online").
     try:
         data = api(f'http://127.0.0.1:{p.get("admin_port", 7400)}/api/status', 'frp-simple-bash', s['admin_password'])
-        rows = [x for group in data.values() for x in group]
-        if rows: return {'state': 'connected' if all(x.get('status') == 'running' for x in rows) else 'proxy-error', 'proxies': rows}
-        # An empty proxy list alone cannot prove login success.
-        logfile = ROOT / 'logs' / 'frpc.log'
-        if logfile.exists():
-            with logfile.open('rb') as f:
-                size = logfile.stat().st_size
-                f.seek(min(state().get('frpc_log_offset', size), size))
-                logs = f.read()[-262144:].decode('utf-8', errors='replace')
-            success = logs.rfind('login to server success')
-            failure = max(logs.rfind('login to server failed'), logs.rfind('try to reconnect'), logs.rfind('control writer is closing'))
-            if success >= 0 and success > failure: return {'state': 'connected', 'source': 'current-process-log'}
-            if failure > success:
-                recent = logs[max(0, failure - 256):].lower()
-                if 'token' in recent or 'authentication' in recent: return {'state': 'auth-failed', 'detail': 'token 或认证参数不匹配'}
-                if 'tls' in recent or 'certificate' in recent: return {'state': 'tls-failed', 'detail': 'TLS 证书或信任配置错误'}
-        if s.get('dashboard_username'):
+        rows = [x for group in data.values() if isinstance(group, list) for x in group if isinstance(x, dict)]
+        if rows:
+            ok = all(x.get('status') in ('online', 'running') for x in rows)
+            return {'state': 'connected' if ok else 'proxy-error', 'proxies': rows}
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403): return {'state': 'auth-failed', 'detail': f'管理 API 认证失败（HTTP {exc.code}）'}
+    except (OSError, ValueError):
+        pass
+    # 3) Optional Dashboard API as a last resort; its failure must not mask a
+    #    successful login as "connecting".
+    if s.get('dashboard_username'):
+        try:
             host = p.get('dashboard_addr') or p['server_addr']; host = '[' + host + ']' if ':' in host else host
             scheme = p.get('dashboard_scheme', 'http')
             data = api(f'{scheme}://{host}:{p.get("dashboard_port", 7500)}/api/v2/clients?pageSize=200', s['dashboard_username'], s.get('dashboard_password', ''))
             for item in data.get('items', []):
-                if item.get('clientID') == pid and item.get('online'): return {'state': 'connected'}
-        return {'state': 'unknown', 'detail': '无启用映射且无可访问服务端 API，无法确认登录状态'}
-    except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403): return {'state': 'auth-failed', 'detail': f'管理 API 认证失败（HTTP {exc.code}）'}
-        return {'state': 'connecting', 'detail': f'管理 API 返回 HTTP {exc.code}'}
-    except (OSError, ValueError): return {'state': 'connecting'}
+                if item.get('clientID') == pid and item.get('online'):
+                    return {'state': 'connected', 'source': 'dashboard'}
+        except (OSError, ValueError, urllib.error.HTTPError):
+            pass
+    if logged:
+        return logged
+    return {'state': 'unknown', 'detail': '无启用映射且服务端 API 不可访问，无法确认登录状态'}
 
 def wait_connection(pid, timeout=30):
     """Poll connection state with a visible countdown and actionable next steps."""
@@ -804,8 +837,8 @@ def restore_backup(directory):
     return restored
 
 def backup_menu():
+    clear_screen()
     while True:
-        clear_screen()
         items = list_backups()[:20]
         labels = [f'{item["time"]}  {item["reason"]}  文件 {len(item["files"])} 个' for item in items]
         if not items:
@@ -993,8 +1026,8 @@ def show_mappings(items):
     print(RULE)
 
 def mapping_menu():
+    clear_screen()
     while True:
-        clear_screen()
         pid = require_active(); result_info('当前 frps：' + label(load_profile(pid)))
         n = choose(['新增端口映射', '查看当前服务端映射', '修改端口映射', '启用/停用端口映射', '删除端口映射'])
         if not n: return
@@ -1044,7 +1077,6 @@ def edit_profile():
     pid = require_active(); p = load_profile(pid); s = secrets_for(pid)
     version = hashlib.sha256((pdir(pid) / 'profile.toml').read_bytes() + (pdir(pid) / 'secrets.toml').read_bytes()).hexdigest()
     while True:
-        clear_screen()
         n = choose(['查看连接配置', '修改服务端名称', '修改服务器地址', '修改服务器端口', '修改 token', '修改 TLS 配置', '修改 Dashboard/API', '修改传输协议', '修改日志级别与保留天数', '保存并返回', '删除当前服务端及全部映射'], label(p))
         if n == 0: return
         if n == 1:
@@ -1191,8 +1223,8 @@ def frps_config_menu():
     items = ['查看当前配置（脱敏）', '修改业务监听地址/端口', '修改 token', '修改 Dashboard/API',
              '修改 HTTP/HTTPS vhost 端口', '修改 KCP/QUIC/TCPMUX 端口', '校验配置并检测端口冲突',
              '查看防火墙放行提示', '备份与恢复配置']
+    clear_screen()
     while True:
-        clear_screen()
         try: data = read_frps_config()
         except (ValueError, OSError) as exc: result_error(str(exc)); pause(); return
         web = data.get('webServer', {})
@@ -1554,8 +1586,8 @@ def show_logs(role, lines=50):
 
 def logs_and_diagnostics_menu(role):
     """Combined, single sub-menu for logs and connection diagnostics."""
+    clear_screen()
     while True:
-        clear_screen()
         files = log_files(role)
         n = choose(['查看最近 50 行日志', '查看最近 200 行日志', '查看日志目录与轮转策略', '清理轮转归档（保留当前日志）', '运行连接诊断', '导出诊断报告（JSON）'], '日志与连接诊断', '返回上一级')
         if not n: return

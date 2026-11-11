@@ -2,7 +2,7 @@
 
 frp v0.72.0 的终端数字菜单管理封装。Linux 用 Bash 安装入口，Windows 用 PowerShell，macOS 用 Bash（仅客户端 frpc）；共享业务核心是单文件 Python（**3.6+，零第三方依赖**，自带 TOML 解析回退）。
 
-**当前是开发版。Debian 12/systemd 已完成实机安装、启停、自启动、profile/映射切换与卸载；macOS frpc 已完成真机验证；OpenRC、其他发行版和 Windows 仍待实机验收，请先在测试环境验证。**
+**当前版本：v1.0.0-rc.1（预发布候选版）。** Linux（Debian 12/systemd）已完成实机安装、启停、自启动、profile/映射切换与卸载；macOS frpc 已完成引擎与 launchd 逻辑真机验证；Windows、OpenRC 及其他发行版仍待实机验收。生产环境请先在目标平台验证后再部署。
 
 ## 一键安装
 

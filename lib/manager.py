@@ -28,7 +28,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v0.1.26-portconflict.1'
+MANAGER_RELEASE_VERSION = 'v0.1.27-upgrade.1'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -2303,6 +2303,26 @@ def _https_get(url, timeout=60):
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
+def _latest_manager_version(mirror):
+    """Read the authoritative latest manager version from the mirror.
+
+    The bundled install-frps.sh at the mirror root is re-written on every
+    release with the new FRP_MANAGER_VERSION, so it is the source of truth for
+    "what's the newest version" — the local script's own hard-coded version
+    would otherwise make upgrade() always target the currently-installed one.
+    """
+    import re as _re
+    bootstrap = _https_get(f'{mirror}/frp-simple-bash/install-frps.sh', timeout=30).decode('utf-8', 'replace')
+    m = _re.search(r"FRP_MANAGER_VERSION='([^']+)'", bootstrap)
+    if not m:
+        m = _re.search(r'FRP_MANAGER_VERSION="([^"]+)"', bootstrap)
+    if not m:
+        raise ValueError('镜像站引导脚本中未找到 FRP_MANAGER_VERSION，无法确定最新版本。')
+    version = m.group(1)
+    if not version.startswith('v') or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-' for c in version):
+        raise ValueError('镜像站返回了非法的最新版本号：' + version)
+    return version
+
 UPGRADE_FILES = (
     'lib/manager.py', 'lib/download.sh', 'install-common.sh',
     'install-frps.sh', 'install-frpc.sh', 'install-windows.ps1',
@@ -2448,20 +2468,30 @@ def upgrade(role, target=None, yes=False):
     """
     before = installed_manager_version()
     result_info('准备更新管理器', detail='当前管理器版本：' + before + '\n当前 frp 二进制版本：' + installed_frp_version(role))
-    target = target or MANAGER_RELEASE_VERSION
+    mirror = os.environ.get('FRP_MIRROR_URL', 'https://download.sueiyuan.top').rstrip('/')
+    if mirror in ('', 'off', 'OFF'):
+        raise ValueError('升级需要 HTTPS 镜像；FRP_MIRROR_URL=off 时无法下载管理器发布包。')
+    if not mirror.startswith('https://') or any(c.isspace() for c in mirror):
+        raise ValueError('FRP_MIRROR_URL 必须是合法 HTTPS 地址。')
+    if target is None:
+        # Discover the newest version from the mirror (the local hard-coded
+        # version is the CURRENT one, never the target).
+        result_info('正在检查镜像站最新版本…')
+        try:
+            target = _latest_manager_version(mirror)
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            raise ValueError('无法获取镜像站最新版本：' + str(exc) + '；可指定版本：frpc upgrade <version>')
     if not target.startswith('v') or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-' for c in target):
         raise ValueError('非法的管理器版本号：' + str(target))
+    if target == before:
+        result_info('当前已是最新版本：' + before + '，无需升级。')
+        return
     result_info('将更新管理器至：' + target)
     if not yes and not confirm('更新管理器脚本（保留 frp 二进制与配置）？'): return
     snapshot = None
     try: snapshot = upgrade_snapshot()
     except (OSError, ValueError) as exc:
         if not yes and not confirm('升级前备份失败（' + str(exc) + '），仍要继续？'): return
-    mirror = os.environ.get('FRP_MIRROR_URL', 'https://download.sueiyuan.top').rstrip('/')
-    if mirror in ('', 'off', 'OFF'):
-        raise ValueError('升级需要 HTTPS 镜像；FRP_MIRROR_URL=off 时无法下载管理器发布包。')
-    if not mirror.startswith('https://') or any(c.isspace() for c in mirror):
-        raise ValueError('FRP_MIRROR_URL 必须是合法 HTTPS 地址。')
     try:
         bundle_url = f'{mirror}/frp-simple-bash/releases/{target}/source.tar.gz'
         sha_url = f'{mirror}/frp-simple-bash/releases/{target}/SHA256SUMS.txt'

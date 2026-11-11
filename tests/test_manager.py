@@ -916,4 +916,22 @@ class ManagerTests(unittest.TestCase):
         data = m.read_frps_config()
         self.assertEqual(data['webServer']['tls']['certFile'], '/cert.pem')
 
+    # ---- upgrade must discover the latest version from the mirror ----
+    def test_latest_manager_version_parses_bootstrap(self):
+        bootstrap = "#!/bin/bash\nFRP_MANAGER_VERSION='v9.9.9-test.1'\necho hi\n"
+        with patch.object(m, '_https_get', return_value=bootstrap.encode()):
+            self.assertEqual(m._latest_manager_version('https://x.example'), 'v9.9.9-test.1')
+    def test_latest_manager_version_rejects_malformed(self):
+        with patch.object(m, '_https_get', return_value=b'no version here'):
+            with self.assertRaises(ValueError):
+                m._latest_manager_version('https://x.example')
+    def test_upgrade_same_version_short_circuits(self):
+        out = io.StringIO()
+        with patch.object(m, 'installed_manager_version', return_value='v1.2.3'), \
+             patch.object(m, 'installed_frp_version', return_value='0.72.0'), \
+             patch.object(m, '_latest_manager_version', return_value='v1.2.3'), \
+             contextlib.redirect_stdout(out):
+            m.upgrade('frps')
+        self.assertIn('已是最新版本', out.getvalue())
+
 if __name__ == '__main__': unittest.main()

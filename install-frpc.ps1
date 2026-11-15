@@ -1,8 +1,8 @@
 [CmdletBinding()]
-param([ValidateSet('v0.72.0')][string]$Version='v0.72.0', [string]$WinSWSha256='')
+param([ValidateSet('v0.72.0')][string]$Version='v0.72.0', [string]$WinSWSha256='', [switch]$NoStart)
 $ErrorActionPreference='Stop'
 [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
-$ManagerVersion='v1.0.0-rc.2'
+$ManagerVersion='v1.0.0-rc.3'
 # Follow redirects explicitly so HTTPS can never downgrade to HTTP.
 function Get-HttpsFile([string]$Url, [string]$Destination) {
     $uri = [Uri]$Url
@@ -12,7 +12,7 @@ function Get-HttpsFile([string]$Url, [string]$Destination) {
         $request.AllowAutoRedirect = $false
         $request.Timeout = 120000
         $request.ReadWriteTimeout = 120000
-        $request.UserAgent = 'frp-simple-bash/v1.0.0-rc.2'
+        $request.UserAgent = 'frp-simple-bash/v1.0.0-rc.3'
         $response = $request.GetResponse()
         try {
             $status = [int]$response.StatusCode
@@ -60,6 +60,7 @@ try {
     # (Restricted/RemoteSigned) may block. Spawn a child PowerShell that bypasses
     # the policy for this file only, mirroring the .cmd launcher.
     $childArgs = @('-Component', 'frpc', '-Version', $Version)
+    if ($NoStart) { $childArgs += '-NoStart' }
     if ($WinSWSha256) { $childArgs += @('-WinSWSha256', $WinSWSha256) }
     & powershell.exe -ExecutionPolicy Bypass -NoProfile -NoLogo -File $installer @childArgs
     if ($LASTEXITCODE -ne 0) { throw ('Installer exited with code ' + $LASTEXITCODE) }

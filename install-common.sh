@@ -261,6 +261,7 @@ for rel in templates/frps.service templates/frpc.service templates/frps.openrc t
 done
 if [[ "$manager" == systemd ]]; then snapshot_file "/etc/systemd/system/$component.service" "unit/$component.service"; fi
 if [[ "$manager" == openrc ]]; then snapshot_file "/etc/init.d/$component" "unit/$component.openrc"; fi
+if [[ "$manager" == launchd ]]; then snapshot_file "/Library/LaunchDaemons/frp-simple-bash.$component.plist" "unit/$component.plist"; fi
 was_running=0
 install_ok=0
 rollback_install() {
@@ -279,9 +280,17 @@ rollback_install() {
       mkdir -p /etc/systemd/system || true; cp -a -- "$rollback_dir/unit/$component.service" "/etc/systemd/system/$component.service" || true
     elif [[ "$manager" == openrc && -f "$rollback_dir/unit/$component.openrc" ]]; then
       mkdir -p /etc/init.d || true; cp -a -- "$rollback_dir/unit/$component.openrc" "/etc/init.d/$component" || true
+    elif [[ "$manager" == launchd ]]; then
+      if [[ -f "$rollback_dir/unit/$component.plist" ]]; then
+        cp -a -- "$rollback_dir/unit/$component.plist" "/Library/LaunchDaemons/frp-simple-bash.$component.plist" || true
+      else
+        rm -f -- "/Library/LaunchDaemons/frp-simple-bash.$component.plist" || true
+      fi
     fi
     if ((was_running == 1)); then
-      if [[ "$manager" == systemd ]]; then systemctl start "$component" || true; else rc-service "$component" start || true; fi
+      if [[ "$manager" == systemd ]]; then systemctl start "$component" || true
+      elif [[ "$manager" == openrc ]]; then rc-service "$component" start || true
+      else launchctl kickstart "system/frp-simple-bash.$component" >/dev/null 2>&1 || true; fi
     fi
     echo '安装失败，已尝试恢复旧文件及先前运行状态；配置已保留。' >&2
   fi
@@ -291,6 +300,9 @@ rollback_install() {
 trap rollback_install EXIT
 if [[ "$manager" == systemd ]] && systemctl is-active --quiet "$component"; then was_running=1; systemctl stop "$component"; fi
 if [[ "$manager" == openrc ]] && rc-service "$component" status >/dev/null 2>&1; then was_running=1; rc-service "$component" stop; fi
+if [[ "$manager" == launchd ]] && launchctl print "system/frp-simple-bash.$component" 2>/dev/null | grep -q 'state = running'; then
+  was_running=1; launchctl kill SIGTERM "system/frp-simple-bash.$component" >/dev/null 2>&1 || true
+fi
 # Stage then atomically replace the executable (avoids ETXTBSY).
 install -m 755 "$work/frp_${version}_${os_short}_${arch}/$component" "$install_root/native/$component.new"
 mv -f "$install_root/native/$component.new" "$install_root/native/$component"

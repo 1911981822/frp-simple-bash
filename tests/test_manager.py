@@ -35,7 +35,7 @@ class ManagerTests(unittest.TestCase):
         clients={'total':1,'items':[{'hostname':'内网机器','clientID':'c1','version':'0.72.0','clientIP':'127.0.0.1','online':True,'status':{'proxyCount':2}}]}
         proxies={'total':1,'items':[{'name':'web','spec':{'type':'tcp'},'status':{'phase':'online','todayTrafficIn':1,'todayTrafficOut':2,'curConns':3}}]}
         with patch.object(m,'api',side_effect=[clients,proxies]), contextlib.redirect_stdout(io.StringIO()) as output: m.server_clients()
-        shown=output.getvalue();self.assertIn('内网机器 [在线]',shown);self.assertIn('代理数量=2',shown);self.assertIn('web [在线]',shown);self.assertNotIn('password',shown)
+        shown=output.getvalue();self.assertIn('内网机器',shown);self.assertIn('在线',shown);self.assertIn('代理数=2',shown);self.assertIn('web [在线]',shown);self.assertNotIn('password',shown)
     def test_backup_and_restore_roundtrip(self):
         pid=self.create();m.set_current(pid);m.save_mappings(pid,[self.mapping()])
         directory=m.backup(m.managed_paths(),'test-snapshot')
@@ -66,7 +66,9 @@ class ManagerTests(unittest.TestCase):
         (m.ROOT/'logs').mkdir(exist_ok=True)
         current=m.ROOT/'logs'/'frps.log'; current.write_text('current\n')
         rotated=m.ROOT/'logs'/'frps.log.123'; rotated.write_text('old\n')
-        with patch.object(m,'clear_screen'),patch.object(m,'pause'),patch('builtins.input',side_effect=['5','0']):
+        # 清理归档现在需要危险确认（YES）；菜单编号也变了（第 6 项）
+        with patch.object(m,'clear_screen'),patch.object(m,'pause'), \
+             patch('builtins.input', side_effect=['6','YES','0']):
             m.logs_and_diagnostics_menu('frps')
         self.assertTrue(current.exists()); self.assertFalse(rotated.exists())
     def test_show_logs_line_limit(self):
@@ -298,7 +300,7 @@ class ManagerTests(unittest.TestCase):
     def test_cancel_configuration_preserves_disk(self):
         pid = self.create(); m.set_current(pid); m.apply(pid)
         before = {p: p.read_bytes() for p in m.managed_paths()}
-        with patch('builtins.input', side_effect=['2','新名称','0']): m.edit_profile()
+        with patch('builtins.input', side_effect=['2','新名称','0','y']): m.edit_profile()
         self.assertEqual({p: p.read_bytes() for p in m.managed_paths()}, before)
     def test_http_requires_domain(self):
         item = self.mapping(); item['type'] = 'http'
@@ -858,13 +860,17 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(src.count('with lock()'), 1)
 
     # ---- R7/R1: token strength + frps TLS ----
-    def test_wizard_rejects_weak_token(self):
-        with patch('builtins.input', side_effect=['0.0.0.0','7000','']), \
-             patch('getpass.getpass', return_value='abc'), \
+    def test_wizard_reasks_weak_token_then_accepts_strong(self):
+        # 弱 token 只重问该字段，不中断向导（LOGIC-3）
+        # input 顺序：监听地址/端口、Dashboard用户名(空)、TLS确认(空)、两个vhost(空)
+        with patch('builtins.input', side_effect=['0.0.0.0','7000','','','','']), \
+             patch('getpass.getpass', side_effect=['abc', 'strongtoken123']), \
              patch.object(m, 'verify'), patch.object(m, 'running', return_value=False), \
-             patch.object(m, 'confirm', return_value=True), contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaises(ValueError) as ctx: m.configure_server()
-        self.assertIn('token', str(ctx.exception).lower())
+             patch.object(m, 'confirm', return_value=False), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            m.configure_server()
+        self.assertIn('至少 8 个字符', out.getvalue())
+        self.assertEqual(m.read_toml(m.ROOT / 'frps.toml')['auth']['token'], 'strongtoken123')
     def test_wizard_autogenerates_strong_token_when_blank(self):
         with patch('builtins.input', side_effect=['0.0.0.0','7000','', '', '', '', '', 'n']), \
              patch('getpass.getpass', return_value=''), \
@@ -1139,5 +1145,42 @@ class ManagerTests(unittest.TestCase):
              patch.object(m, 'initialize'), patch.object(m.os, 'geteuid', return_value=0):
             m.run(['frpc', 'upgrade', 'v9.9.9'])
         self.assertEqual(seen['target'], 'v9.9.9')
+
+    # ---- 第三轮修复回归 ----
+    def test_edit_profile_dirty_prompts_before_leaving(self):
+        pid = self.create(); m.set_current(pid); m.apply(pid)
+        called = {'n': 0}
+        def ask_no(*a, **k):
+            called['n'] += 1
+            return 'n'
+        # 改名后按 0 返回 → 因有未保存修改而询问 → 确认放弃
+        with patch('builtins.input', side_effect=['2', '改名', '0', 'y']), \
+             contextlib.redirect_stdout(io.StringIO()):
+            m.edit_profile()
+        self.assertEqual(m.load_profile(pid)['name'], '生产服务器')  # 放弃修改
+    def test_mapping_explicit_profile_allowed(self):
+        a = self.create('A'); b = self.create('B'); m.set_current(a)
+        with patch.object(m, 'apply'):
+            m.save_mappings(b, [self.mapping()], explicit=True)
+        self.assertEqual(len(m.mappings(b)), 1)
+    def test_restore_upgrade_snapshot_rolls_back_on_failure(self):
+        import tempfile
+        snap = m.ROOT / 'backups' / '20260101-000000-upgrade-x'
+        (snap / 'install-root' / 'lib').mkdir(parents=True)
+        (snap / 'install-root' / 'lib' / 'manager.py').write_bytes(b'# old\n')
+        m.save_json(snap / 'manifest.json', {'reason': 'upgrade', 'files': ['lib/manager.py'], 'sha256': {}})
+        fake = Path(tempfile.mkdtemp()); (fake / 'lib').mkdir()
+        target = fake / 'lib' / 'manager.py'; target.write_text('# current\n')
+        with patch.object(m, 'INSTALL_ROOT', fake), \
+             patch.object(m.os, 'chmod', side_effect=OSError('boom')):
+            with self.assertRaises(OSError): m.restore_upgrade_snapshot(snap)
+        self.assertEqual(target.read_text(), '# current\n')   # 失败后回滚
+    def test_human_bytes(self):
+        self.assertEqual(m._human_bytes(0), '0 B')
+        self.assertIn('KB', m._human_bytes(2048))
+        self.assertIn('MB', m._human_bytes(5 * 1024 * 1024))
+    def test_shorten_keeps_display_width(self):
+        s = m._shorten('一二三四五六七八九十', 8)
+        self.assertLessEqual(m._display_width(s), 8)
 
 if __name__ == '__main__': unittest.main()

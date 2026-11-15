@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-FRP_MANAGER_VERSION='v1.0.0-rc.2'
+FRP_MANAGER_VERSION='v1.0.0-rc.3'
 base="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
 if [[ -f "$base/install-common.sh" && -f "$base/lib/manager.py" && -f "$base/lib/download.sh" ]]; then
   exec bash "$base/install-common.sh" frpc "$@"
 fi
 for tool in curl tar; do command -v "$tool" >/dev/null || { echo "Missing dependency: $tool" >&2; exit 1; }; done
-# macOS 自带 shasum 而没有 sha256sum；两者其一即可。
+# macOS ships shasum but not sha256sum; either one is fine.
 if command -v sha256sum >/dev/null; then sha_cmd=sha256sum
 elif command -v shasum >/dev/null; then sha_cmd=shasum
 else echo "Missing dependency: sha256sum or shasum" >&2; exit 1; fi
@@ -32,8 +32,13 @@ if [[ -n "$mirror" ]] && fetch "$mirror/frp-simple-bash/releases/$FRP_MANAGER_VE
   fi
   source_kind=mirror
 else
-  echo 'WARNING: mirror unavailable; falling back to UNVERIFIED GitHub main source.' >&2
-  echo '         (no SHA256 pin for this path — proceed only if you trust the network.)' >&2
+  if [[ "${FRP_ALLOW_UNVERIFIED:-0}" != "1" ]]; then
+    echo 'Mirror unavailable. Falling back to GitHub main has NO pinned SHA256,' >&2
+    echo 'so execution is refused by default for safety.' >&2
+    echo 'To allow it explicitly: sudo FRP_ALLOW_UNVERIFIED=1 bash -c "$script"' >&2
+    exit 1
+  fi
+  echo 'WARNING: using UNVERIFIED GitHub main source (allowed by FRP_ALLOW_UNVERIFIED=1).' >&2
   fetch 'https://codeload.github.com/1911981822/frp-simple-bash/tar.gz/refs/heads/main' "$work/source.tar.gz" || { echo 'All source downloads failed.' >&2; exit 1; }
 fi
 # Only a completed, verified (for mirror) archive reaches extraction.

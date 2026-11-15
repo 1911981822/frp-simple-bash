@@ -31,17 +31,36 @@ if ($Purge) {
     if (-not $resolved.Equals($default,[StringComparison]::OrdinalIgnoreCase)) { throw 'Automatic purge is allowed only for the default configuration directory. Custom configuration retained.' }
     $other=if ($Component -eq 'frps') { 'frpc' } else { 'frps' }
 
-    # 1) Always delete THIS component's own config (purge = 彻底清理本组件),
+    # 1) Always delete THIS component's own config (purge = ),
     #    never blocked by the other component still being installed.
     if ($Component -eq 'frpc') {
         foreach ($rel in @('frpc.toml','profiles','index.json')) {
             $target = Join-Path $resolved $rel
             if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
         }
+        # Align with the bash version: drop this component's keys so a reinstall
+        $stateFile = Join-Path $resolved 'state.json'
+        if (Test-Path -LiteralPath $stateFile) {
+            try {
+                $st = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
+                foreach ($k in @('active_profile_id','pending','frpc_hash','frpc_log_offset')) {
+                    if ($st.PSObject.Properties.Name -contains $k) { $st.PSObject.Properties.Remove($k) }
+                }
+                $st | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $stateFile -Encoding UTF8
+            } catch { Write-Host "Warning: could not clean state.json keys: $_" }
+        }
     } else {
         foreach ($rel in @('frps.toml','.canonical-frps.toml')) {
             $target = Join-Path $resolved $rel
             if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }
+        }
+        $stateFile = Join-Path $resolved 'state.json'
+        if (Test-Path -LiteralPath $stateFile) {
+            try {
+                $st = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
+                if ($st.PSObject.Properties.Name -contains 'frps_hash') { $st.PSObject.Properties.Remove('frps_hash') }
+                $st | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $stateFile -Encoding UTF8
+            } catch { Write-Host "Warning: could not clean state.json keys: $_" }
         }
     }
 

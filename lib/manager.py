@@ -29,7 +29,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.2'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.3'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -864,6 +864,16 @@ def _tag(kind):
         return '\033[1;' + _COLORS[kind] + 'm' + kind + '\033[0m'
     return kind
 
+def _shorten(text, width):
+    """Truncate to a display width with an ellipsis (CJK counts as 2)."""
+    s = str(text)
+    if _display_width(s) <= width: return s
+    out = ''
+    for ch in s:
+        if _display_width(out + ch) > width - 1: break
+        out += ch
+    return out + '…'
+
 def _dim(text):
     """De-emphasise hint text (no-op when colors are off)."""
     return '\033[2m' + str(text) + '\033[0m' if UI_COLOR else str(text)
@@ -1023,7 +1033,12 @@ def _report(title, lines):
     print('┌' + '─' * inner + '┐')
     print('│' + _pad_line(' ' + _tag('[提示]') + ' ' + title, inner) + '│')
     for raw in lines:
-        for line in _wrap_text(str(raw), inner - 2):
+        text = str(raw)
+        low = text
+        if any(w in low for w in ('不可达', '失败', '异常', '未启用', '未通过')): mark = '✗ '
+        elif any(w in low for w in ('可达', '成功', '通过', '已设置')): mark = '✓ '
+        else: mark = ''
+        for line in _wrap_text(mark + text, inner - 2):
             print('│' + _pad_line(' ' + line, inner) + '│')
     print('└' + '─' * inner + '┘')
 
@@ -1131,7 +1146,7 @@ def profile_wizard():
         ('server_port', 'frps 业务端口', '7000', False, port),
         ('dashboard_port', 'Dashboard/API 管理端口', '7500', False, port),
         ('tls_enable', '启用 TLS？[Y/n]', 'y', False, lambda v: v.lower() != 'n'),
-        ('token', 'token（不使用时留空）', '', True, lambda v: v),
+        ('token', 'token（必须与 frps 的 auth.token 一致；服务端未启用认证才留空）', '', True, lambda v: v),
         ('dashboard_username', 'Dashboard 用户名（留空关闭远程查询）', '', False, lambda v: v),
     ]
     i = 0
@@ -1416,11 +1431,14 @@ def port_reachable(host, port_value, timeout=3):
 def api_scheme(web): return 'https' if web.get('tls', {}).get('certFile') else 'http'
 def api_host(host): return '[' + host + ']' if ':' in host else host
 
-def save_mappings(pid, items):
-    if pid != require_active(): raise ValueError('只能管理当前 profile 的映射')
+def save_mappings(pid, items, explicit=False):
+    """Persist mappings. explicit=True is used by `mapping ... --profile <id>`
+    so a non-active profile can be edited from the CLI (FUNC-6)."""
+    if not explicit and pid != require_active(): raise ValueError('只能管理当前 profile 的映射')
+    load_profile(pid)
     before_count = len(mappings(pid))
     with lock(), transaction():
-        if pid != active(): raise ValueError('当前服务端已在另一终端切换，请重新打开映射菜单')
+        if not explicit and pid != active(): raise ValueError('当前服务端已在另一终端切换，请重新打开映射菜单')
         for m in items: validate_mapping(m)
         path = pdir(pid) / 'mappings.toml'; old = path.read_text(encoding='utf-8')
         backup([path]); atomic(path, toml({'schema_version': 1, 'mappings': items}))
@@ -1452,6 +1470,13 @@ def mapping_wizard(old=None):
         i = 0
         while i < len(fields):
             key, prompt, default, convert = fields[i]
+            if key == 'remote_or_domain':
+                # 同一字段按类型含义不同，提示必须随之变化（UX-20）
+                if m.get('type') in ('tcp', 'udp'):
+                    prompt = '远程端口（1-65535，映射到 frps 后对外暴露的端口）'
+                else:
+                    prompt = '域名（例 nas.example.com；需 frps 已配置 vhostHTTPPort/vhostHTTPSPort）'
+                default = None
             value = ask(prompt, default=default if default is not None else m.get(key),
                         allow_back=(i > 0))
             if value is None: return None
@@ -1479,17 +1504,44 @@ def mapping_wizard(old=None):
             result_error(str(exc), hint='请重新填写该映射。')
             continue
 
-def show_mappings(items):
+def _table(headers, rows, widths):
+    """Render a CJK-safe table: columns are padded by DISPLAY width, not chars."""
+    lines = ['  ' + ''.join(_pad_line(str(h), w) for h, w in zip(headers, widths))]
+    for row in rows:
+        lines.append('  ' + ''.join(_pad_line(str(c), w) for c, w in zip(row, widths)))
+    return '\n'.join(lines)
+
+def _proxy_status_map(pid):
+    """Best-effort {proxy_name: True/False} online state from the local admin API."""
+    try:
+        prof = load_profile(pid); sec = secrets_for(pid)
+        data = api(f'http://127.0.0.1:{prof.get("admin_port", 7400)}/api/status',
+                   'frp-simple-bash', sec['admin_password'])
+        rows = [x for group in data.values() if isinstance(group, list) for x in group if isinstance(x, dict)]
+        return {str(r.get('name', '')): (r.get('status') in ('online', 'running')) for r in rows}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+def show_mappings(items, pid=None):
+    """Mapping table with an online column so 'enabled' is not confused with 'working'."""
     if not items:
         result_info('当前服务端暂无端口映射。'); return
     section('当前服务端端口映射')
-    print('  ' + f'{"序号":<4}{"名称":<16}{"类型":<6}{"本地":<22}{"远端":<20}{"状态"}')
+    online = _proxy_status_map(pid) if pid else {}
+    rows = []
     for n, m in enumerate(items, 1):
         local = f'{m.get("local_ip", "127.0.0.1")}:{m["local_port"]}'
         if m['type'] in ('tcp', 'udp'): remote = str(m.get('remote_port', '-'))
         else: remote = m.get('domain', '-')
         enabled = '启用' if m.get('enabled', True) else '停用'
-        print('  ' + f'{n:<4}{m["name"]:<16}{m["type"]:<6}{local:<22}{remote:<20}' + color_state(enabled))
+        if not m.get('enabled', True): state = '停用'
+        elif not online: state = '—'
+        else: state = '在线' if online.get(str(m.get('name', ''))) else '未就绪'
+        rows.append([n, m['name'][:18], m['type'], local, remote, color_state(enabled), color_state(state)])
+    print(_table(['序号', '名称', '类型', '本地地址', '远端', '启用', '状态'],
+                 rows, [6, 20, 6, 22, 20, 6, 8]))
+    if not online:
+        result_info('（映射在线状态需 frpc 运行且本机管理端口可访问，当前无法读取）')
     print(RULE)
 
 def mapping_menu():
@@ -1505,7 +1557,7 @@ def mapping_menu():
                 created = mapping_wizard()
                 if created is None: continue
                 items.append(created); save_mappings(pid, items); pause(); continue
-            elif n == 2: show_mappings(items); pause(); continue
+            elif n == 2: show_mappings(items, pid); pause(); continue
             else:
                 index = choose([m['name'] + (' [启用]' if m.get('enabled', True) else ' [停用]') for m in items], '选择映射')
                 if not index: continue
@@ -1544,6 +1596,10 @@ def edit_profile():
     pid = require_active(); p = load_profile(pid); s = secrets_for(pid)
     version = hashlib.sha256((pdir(pid) / 'profile.toml').read_bytes() + (pdir(pid) / 'secrets.toml').read_bytes()).hexdigest()
 
+    baseline = json.dumps([p, s], sort_keys=True, ensure_ascii=False)
+    def is_dirty():
+        return json.dumps([p, s], sort_keys=True, ensure_ascii=False) != baseline
+
     def store(mapping, key, value):
         """Skip writes when the user cancelled (q -> None); never persist None."""
         if value is not None: mapping[key] = value
@@ -1558,8 +1614,15 @@ def edit_profile():
             return False
 
     while True:
-        n = choose(['查看连接配置', '修改服务端名称', '修改服务器地址', '修改服务器端口', '修改 token', '修改 TLS 配置', '修改 Dashboard/API', '修改传输协议', '修改日志级别与保留天数', '保存并返回', '删除当前服务端及全部映射'], label(p))
-        if not n: return  # 0 = back, None = q cancel
+        try:
+            n = choose(['查看连接配置', '修改服务端名称', '修改服务器地址', '修改服务器端口', '修改 token', '修改 TLS 配置', '修改 Dashboard/API', '修改传输协议', '修改日志级别与保留天数', '保存并返回', '删除当前服务端及全部映射'], label(p))
+        except QuitProgram:
+            # 未保存修改在退出前必须确认，否则整段编辑静默丢失（UX-08）
+            if is_dirty() and not confirm('有未保存的修改，确认退出并放弃？'): continue
+            raise
+        if not n:
+            if is_dirty() and not confirm('有未保存的修改，确认返回并放弃？'): continue
+            return
         if n == 1:
             section('连接配置')
             profile_summary(p, s)
@@ -1637,56 +1700,110 @@ def edit_profile():
             return
 
 
+def _ask_validated(prompt, default=None, validator=None, secret=False,
+                   allow_empty=False, example=None, step=None):
+    """Ask one field until the validator accepts it.
+
+    A mistyped field re-prompts that field only; it never aborts the caller.
+    Returns None only when the user cancels with q.
+    """
+    label_text = (step + ' · ' + prompt) if step else prompt
+    while True:
+        raw = ask(label_text, default=default, secret=secret,
+                  allow_empty=allow_empty, example=example)
+        if raw is None: return None
+        if validator is None: return raw
+        try:
+            return validator(raw)
+        except ValueError as exc:
+            result_error(str(exc), hint='该项未保存，请重新输入；其他已填项保持不变。')
+
 def configure_server():
-    addr = ask('业务监听地址', '0.0.0.0')
+    """First-run frps wizard.
+
+    Every field is validated and re-asked in place (LOGIC-3): a single typo must
+    never abort the wizard, because aborting here rolls the whole install back.
+    """
+    step = '第 1/6 步'
+    addr = _ask_validated('业务监听地址', '0.0.0.0', validator=address,
+                          example='0.0.0.0 或 192.0.2.10', step=step)
     if addr is None: return
-    bind_port = ask('业务端口', '7000')
+    bind_port = _ask_validated('业务端口', '7000', validator=port,
+                               example='7000', step='第 2/6 步')
     if bind_port is None: return
-    suggested = secrets.token_urlsafe(24)
-    token = ask('token（留空自动生成强 token；无认证请确认后留空并输入 none）', secret=True, allow_empty=True)
-    if token is None: return
-    if token == '':
-        token = suggested
-        result_info('已自动生成随机 token：' + token,
-                    detail='请立即记录；在 frpc 侧填写同一 token。本值只在此显示一次。')
-    elif token.lower() == 'none':
-        if not confirm('确认在无 token 模式下运行 frps？任何客户端都可接入。', danger=True): return
-        token = ''
-    data = {'bindAddr': address(addr), 'bindPort': port(bind_port),
+    # token：留空自动生成；输入 none 表示明确关闭认证；否则强制 >=8 位。
+    while True:
+        raw = ask('第 3/6 步 · token（留空自动生成；输入 none 关闭认证）',
+                  secret=True, allow_empty=True)
+        if raw is None: return
+        if raw == '':
+            token = secrets.token_urlsafe(24)
+            result_info('已自动生成随机 token：' + token,
+                        detail='请立即记录；在 frpc 侧填写同一 token。本值只在此显示一次。')
+            break
+        if raw.lower() == 'none':
+            if confirm('确认在无 token 模式下运行 frps？任何客户端都可接入。', danger=True):
+                token = ''
+                break
+            continue
+        if len(raw) < 8:
+            result_error('token 长度至少 8 个字符（需求 §7.3 强制最小长度）', hint='请重新输入，或留空自动生成。')
+            continue
+        token = raw
+        break
+    data = {'bindAddr': addr, 'bindPort': bind_port,
             'auth.method': 'token', 'auth.token': token,
             'log.to': str(ROOT / 'logs' / 'frps.log'), 'log.maxDays': 30, 'log.disablePrintColor': True}
-    if data['auth.token'] and len(data['auth.token']) < 8:
-        raise ValueError('token 长度至少 8 个字符（需求 §7.3 强制最小长度）')
-    if address(addr) not in ('127.0.0.1', '::1'):
+    if addr not in ('127.0.0.1', '::1'):
         result_info('业务监听 ' + addr + ' 将对公网/局域网开放，请确认防火墙与安全组规则。')
-    user = ask('Dashboard 用户名（留空关闭）', allow_empty=True)
+    user = ask('第 4/6 步 · Dashboard 用户名（留空关闭）', allow_empty=True)
     if user is None: return
     if user:
-        host_raw = ask('Dashboard 监听地址', '0.0.0.0')
-        if host_raw is None: return
-        host = address(host_raw)
+        host = _ask_validated('Dashboard 监听地址', '0.0.0.0', validator=address, step='第 5/6 步')
+        if host is None: return
         if host not in ('127.0.0.1', '::1') and not confirm('管理接口将对外监听，确认？'): return
-        password = ask('Dashboard 密码', secret=True)
-        if password is None: return
-        if not password: raise ValueError('启用 Dashboard 时密码不能为空')
-        port_raw = ask('Dashboard 端口', '7500')
-        if port_raw is None: return
-        if port(port_raw) == data['bindPort']: raise ValueError('Dashboard 端口不能与业务端口相同')
-        data.update({'webServer.addr': host, 'webServer.port': port(port_raw), 'webServer.user': user, 'webServer.password': password})
-    if confirm('启用 TLS（transport.tls）？生产环境建议启用'):
-        cert = ask('TLS 证书路径', '', allow_empty=True)
-        if cert is None: return
-        if cert:
+        while True:
+            password = ask('Dashboard 密码', secret=True)
+            if password is None: return
+            if password: break
+            result_error('启用 Dashboard 时密码不能为空')
+        def _dash_port(raw):
+            value = port(raw)
+            if value == bind_port: raise ValueError('Dashboard 端口不能与业务端口相同')
+            return value
+        dash_port = _ask_validated('Dashboard 端口', '7500', validator=_dash_port, step='第 5/6 步')
+        if dash_port is None: return
+        data.update({'webServer.addr': host, 'webServer.port': dash_port,
+                     'webServer.user': user, 'webServer.password': password})
+    if confirm('第 5/6 步 · 启用 TLS（transport.tls）？生产环境建议启用'):
+        while True:
+            cert = ask('TLS 证书路径（PEM，留空跳过）', '', allow_empty=True)
+            if cert is None: return
+            if not cert: break
             key = ask('TLS 私钥路径', '', allow_empty=True)
             if key is None: return
+            try:
+                if not Path(cert).is_file(): raise ValueError('证书文件不存在或不可读：' + cert)
+                if not Path(key).is_file(): raise ValueError('私钥文件不存在或不可读：' + key)
+            except ValueError as exc:
+                result_error(str(exc), hint='TLS 未保存，请重新输入路径或留空跳过。')
+                continue
             data['transport.tls.certFile'] = cert
             data['transport.tls.keyFile'] = key
+            break
     for key in ('vhostHTTPPort', 'vhostHTTPSPort'):
-        value = ask(key + '（留空禁用）', allow_empty=True)
+        # 空值表示「禁用」，因此校验器必须放行空串，否则会无限重问。
+        value = _ask_validated(key + '（留空禁用）', None,
+                               validator=lambda v: port(v) if v else '',
+                               allow_empty=True, step='第 6/6 步')
         if value is None: return
-        if value: data[key] = port(value)
-    # Validate BEFORE writing so the wizard cannot persist an invalid config (R7).
-    validate_frps_config(expand_keys(data))
+        if value: data[key] = value
+    # Final guard: still validate before writing, but report instead of aborting.
+    try:
+        validate_frps_config(expand_keys(data))
+    except ValueError as exc:
+        result_error('配置未通过校验：' + str(exc), hint='请重新运行配置向导或从备份恢复。')
+        return
     content = toml(data); verify('frps', content)
     with lock(), transaction(): backup([ROOT / 'frps.toml']); atomic(ROOT / 'frps.toml', content); mark_hash('frps')
     if running('frps') and confirm('重启 frps？'):
@@ -1957,6 +2074,15 @@ def frps_config_menu():
             elif n == 10: backup_menu()
         except MENU_ERRORS as exc: result_error(str(exc)); pause()
 
+def _human_bytes(value):
+    """Render a byte count as KB/MB/GB for readability."""
+    try: n = float(value)
+    except (TypeError, ValueError): return str(value)
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024 or unit == 'TB': return ('%d %s' % (n, unit)) if unit == 'B' else ('%.1f %s' % (n, unit))
+        n /= 1024.0
+    return str(value)
+
 def server_clients():
     p = read_toml(ROOT / 'frps.toml'); web = p.get('webServer', {})
     if not web.get('port'): raise ValueError('Dashboard/API 未启用，请先配置')
@@ -1971,24 +2097,56 @@ def server_clients():
             rows.extend(data.get('items', []))
             if page * 200 >= data.get('total', 0): return rows
             page += 1
-    clients, proxies = paged('clients'), paged('proxies')
-    lines = ['在线客户端（Dashboard/API）']
-    if not clients: lines.append('暂无客户端连接。')
-    for n, item in enumerate(clients, 1):
-        state = '在线' if item.get('online') else '离线'
-        lines.append(f'{n}. {item.get("hostname") or item.get("clientID") or item.get("key", "未知")} [' + color_state(state) + ']')
-        lines.append(f'   clientID={item.get("clientID", "")} 版本={item.get("version", "")} IP={item.get("clientIP", "")}')
-        lines.append(f'   代理数量={item.get("status", {}).get("proxyCount", "未知")}')
-    lines.append('代理状态')
-    if not proxies: lines.append('暂无代理统计。')
-    for n, item in enumerate(proxies, 1):
-        status = item.get('status', {})
-        phase = str(status.get('phase', '未知'))
-        phase_text = color_state('在线' if phase.lower() in ('online', 'running') else phase)
-        lines.append(f'{n}. {item.get("name", "未知")} [{phase_text}] 类型={item.get("spec", {}).get("type", "未知")}')
-        lines.append(f'   今日流量：入站 {status.get("todayTrafficIn", 0)} / 出站 {status.get("todayTrafficOut", 0)}，连接数 {status.get("curConns", 0)}')
-    _report('客户端连接信息', lines)
-    result_info(f'客户端连接查询完成：{len(clients)} 个客户端，{len(proxies)} 个代理。')
+    try:
+        clients, proxies = paged('clients'), paged('proxies')
+    except (OSError, ValueError, urllib.error.HTTPError) as exc:
+        result_error('无法获取实时客户端信息：' + str(exc),
+                     hint='确认 frps 正在运行、Dashboard/API 端口可达、用户名密码正确；'
+                          '也可用「运行连接诊断」逐项检查。')
+        return
+    # 先给结论，再给明细，避免一屏英文刷屏后找不到重点。
+    online_c = sum(1 for c in clients if c.get('online'))
+    online_p = sum(1 for x in proxies if str(x.get('status', {}).get('phase', '')).lower() in ('online', 'running'))
+    section('客户端连接概览')
+    print(_kv('客户端', f'{len(clients)} 个（在线 {online_c}，离线 {len(clients) - online_c}）'))
+    print(_kv('代理', f'{len(proxies)} 个（在线 {online_p}，未就绪 {len(proxies) - online_p}）'))
+    print(RULE)
+    if not clients and not proxies:
+        result_info('暂无客户端连接。'); return
+    page_size = 10
+    for start in range(0, max(len(clients), 1), page_size):
+        chunk = clients[start:start + page_size]
+        if not chunk: break
+        section(f'客户端明细 {start + 1}-{start + len(chunk)} / {len(clients)}')
+        for n, item in enumerate(chunk, start + 1):
+            state = '在线' if item.get('online') else '离线'
+            print(f'  {n}. ' + str(item.get('hostname') or item.get('clientID') or item.get('key', '未知'))
+                  + '  [' + color_state(state) + ']')
+            print('     版本={0}  IP={1}  代理数={2}'.format(
+                item.get('version', '-'), item.get('clientIP', '-'),
+                item.get('status', {}).get('proxyCount', '-')))
+        if start + page_size < len(clients):
+            print(RULE)
+            try: more = input('  回车看下一页，0 结束明细 … ')
+            except EOFError: break
+            if more.strip() == '0': break
+    if proxies:
+        section('代理状态')
+        for n, item in enumerate(proxies[:20], 1):
+            status = item.get('status', {})
+            phase = str(status.get('phase', '未知'))
+            phase_text = color_state('在线' if phase.lower() in ('online', 'running') else phase)
+            print(f'  {n}. {item.get("name", "未知")} [{phase_text}] 类型={item.get("spec", {}).get("type", "未知")}')
+            print('     今日流量：入 {0} / 出 {1}，连接数 {2}'.format(
+                _human_bytes(status.get('todayTrafficIn', 0)),
+                _human_bytes(status.get('todayTrafficOut', 0)),
+                status.get('curConns', 0)))
+        if len(proxies) > 20:
+            print(RULE)
+            result_info(f'代理较多，仅显示前 20 个（共 {len(proxies)} 个）；完整数据请用 Dashboard 查看。')
+    print(RULE)
+    result_ok(f'查询完成：{len(clients)} 个客户端，{len(proxies)} 个代理。')
+
 
 def import_external(role):
     path = ROOT / (role + '.toml'); s = state()
@@ -2171,7 +2329,8 @@ def show_status(role, data=None):
             concerns.append('有配置修改等待重启后生效')
     if concerns:
         print()
-        print('  ' + _tag('[提示]') + ' 需关注：')
+        head = '\033[1;31m需关注\033[0m' if UI_COLOR else '需关注'
+        print('  ' + head + '（以下事项需要处理）：')
         for c in concerns: print('    - ' + c)
     print(RULE)
     return data
@@ -2261,12 +2420,18 @@ def main_menu(role):
             alias = '配置错误'
             data = {'component': role, 'version': VERSION, 'service_state': 'unknown', 'config_path': str(ROOT / (role + '.toml')), 'pending': False}
         if role == 'frpc':
-            items = ['查看当前状态', '启动 frpc', '停止 frpc', '重启 frpc', '新建 frps 服务端', '查看服务端列表', '切换服务端', '修改当前 frps 配置', f'修改当前 frps（{alias}）端口映射', '查看日志与连接诊断', '备份与恢复配置', '设置/取消开机自启动', '卸载 frpc', '升级 frpc']
+            items = ['查看当前状态', '启动 frpc', '停止 frpc', '重启 frpc', '新建 frps 服务端', '查看服务端列表', '切换服务端', '修改当前 frps 配置', f'修改当前 frps（{_shorten(alias, 12)}）端口映射', '查看日志与连接诊断', '备份与恢复配置', '设置/取消开机自启动', '卸载 frpc', '升级 frpc']
             groups = {0: '── 服务控制 ──', 4: '── 服务端与映射 ──', 9: '── 运维 ──', 12: '── 危险操作 ──'}
         else:
             items = ['查看服务信息（状态、版本、路径）', '启动 frps', '停止 frps', '重启 frps', '查看客户端连接信息', '修改服务端配置', '查看日志与连接诊断', '备份与恢复配置', '设置/取消开机自启动', '卸载 frps', '升级 frps']
             groups = {0: '── 服务控制 ──', 4: '── 配置与连接 ──', 6: '── 运维 ──', 9: '── 危险操作 ──'}
         status_bar(role, data)
+        if role == 'frpc' and not profiles():
+            # 新用户第一个动作常是「启动」，但没服务端时必然失败(E011)。
+            # 先给三步引导，避免误以为安装失败。
+            print('  ' + _tag('[提示]') + ' 还没有服务端配置，建议按顺序：')
+            print('    ① 新建 frps 服务端（本菜单 5）  →  ② 添加端口映射（本菜单 9）  →  ③ 启动并验证（本菜单 2）')
+            print(RULE)
         n = choose(items, '请选择操作' if role == 'frps' else 'frpc 客户端操作', '退出', groups=groups)
         if not n: return
         # Sub-menus pause themselves; every other result gets exactly one
@@ -2330,14 +2495,36 @@ def log_files(role):
     if not base.exists(): return []
     return sorted([p for p in base.iterdir() if p.is_file() and not p.is_symlink() and (p.name == role + '.log' or p.name.startswith(role + '.log.'))], key=lambda p: p.stat().st_mtime, reverse=True)
 
-def show_logs(role, lines=50):
+_LOG_BAD = ('error', 'fatal', 'panic')
+_LOG_WARN = ('warn',)
+
+def _highlight_log_line(line):
+    """Colour whole log lines that contain ERROR/FATAL or WARN (no-op without colour)."""
+    if not UI_COLOR: return line
+    low = line.lower()
+    if any(w in low for w in _LOG_BAD): return '\033[1;31m' + line + '\033[0m'
+    if any(w in low for w in _LOG_WARN): return '\033[1;33m' + line + '\033[0m'
+    return line
+
+def show_logs(role, lines=50, only_errors=False):
     path = ROOT / 'logs' / (role + '.log')
     if path.exists():
         content = path.read_text(encoding='utf-8', errors='replace').splitlines()
-        section(f'{role} 日志（最近 {min(lines, len(content))} 行）')
-        print('\n'.join(content[-lines:]))
+        recent = content[-lines:]
+        errors = sum(1 for x in recent if any(w in x.lower() for w in _LOG_BAD))
+        warns = sum(1 for x in recent if any(w in x.lower() for w in _LOG_WARN))
+        if only_errors:
+            recent = [x for x in recent if any(w in x.lower() for w in _LOG_BAD + _LOG_WARN)]
+            title = f'{role} 日志 · 最近 {lines} 行中的错误/警告（{len(recent)} 条）'
+        else:
+            title = f'{role} 日志（最近 {min(lines, len(content))} 行）'
+        section(title)
+        for line in recent:
+            print(_highlight_log_line(line))
         print(RULE)
-        result_info(f'{path} 共 {len(content)} 行，已显示最近 {min(lines, len(content))} 行。')
+        if not only_errors:
+            result_info(f'共 {len(content)} 行；本页 {len(recent)} 行，其中错误 {errors} 条、警告 {warns} 条。',
+                        detail='红色=错误，黄色=警告。菜单「只看错误」可过滤。')
         return
     if os.name != 'nt' and shutil.which('journalctl'):
         run_cmd(['journalctl', '-u', role, '-n', str(lines), '--no-pager'])
@@ -2369,27 +2556,36 @@ def logs_and_diagnostics_menu(role):
     clear_screen()
     while True:
         files = log_files(role)
-        n = choose(['查看最近 50 行日志', '查看最近 200 行日志', '持续跟踪日志（Ctrl-C 返回）',
-                    '查看日志目录与轮转策略', '清理轮转归档（保留当前日志）', '运行连接诊断',
-                    '导出诊断报告（JSON）'], '日志与连接诊断', '返回上一级')
+        n = choose(['查看最近 50 行日志', '查看最近 200 行日志', '只看错误与警告',
+                    '持续跟踪日志（Ctrl-C 返回）', '查看日志目录与轮转策略',
+                    '清理轮转归档（保留当前日志）', '运行连接诊断', '导出诊断报告（文件）'],
+                   '日志与连接诊断', '返回上一级')
         if not n: return
         if n == 1: show_logs(role, 50); pause()
         elif n == 2: show_logs(role, 200); pause()
-        elif n == 3: follow_log(role, 50); pause()
-        elif n == 4:
-            result_info('日志目录：' + str(ROOT / 'logs'), detail='轮转策略：单文件超过 50MB 自动归档；保留 30 天；总量上限 500MB。'); pause()
+        elif n == 3: show_logs(role, 500, only_errors=True); pause()
+        elif n == 4: follow_log(role, 50); pause()
         elif n == 5:
+            result_info('日志目录：' + str(ROOT / 'logs'),
+                        detail='轮转策略：单文件超过 50MB 自动归档；保留 30 天；总量上限 500MB。'); pause()
+        elif n == 6:
+            archives = [f for f in files if f.name != role + '.log']
+            if not archives:
+                result_info('没有可清理的轮转归档。'); pause(); continue
+            total = sum(f.stat().st_size for f in archives if f.exists())
+            if not confirm(f'将删除 {len(archives)} 个归档文件（约 {total // 1024 // 1024} MB），当前日志保留。'
+                           '此操作不可恢复，确认继续？', danger=True):
+                result_info('已取消。'); pause(); continue
             removed = 0
-            for item in files:
-                if item.name == role + '.log': continue
+            for item in archives:
                 unlink_quiet(item); removed += 1
             result_ok(f'已清理 {removed} 个轮转归档，当前日志保留。'); pause()
-        elif n == 6: diagnostics(role); pause()
-        elif n == 7:
+        elif n == 7: diagnostics(role); pause()
+        elif n == 8:
             report = diagnostics_report(role)
-            section('诊断报告（JSON）')
-            print(json.dumps(report, ensure_ascii=False, indent=2))
-            print(RULE)
+            target = ROOT / 'logs' / ('diagnostics-' + dt.datetime.now().strftime('%Y%m%d-%H%M%S') + '.json')
+            atomic(target, json.dumps(report, ensure_ascii=False, indent=2) + '\n')
+            result_ok('诊断报告已导出：', detail=str(target))
             pause()
 
 def autostart(role):
@@ -2453,11 +2649,10 @@ def delete_profile_id(pid):
 def mapping_command(argv, flags=None):
     """mapping list/add/edit/enable/disable/delete [--profile <id>]."""
     flags = flags or {}
-    # --profile overrides the active profile for read/写 target.
+    explicit = bool(flags.get('profile'))
     pid = flags.get('profile') or require_active()
-    if flags.get('profile'):
-        # Validate the requested profile exists.
-        load_profile(pid)
+    if explicit:
+        load_profile(pid)   # 校验请求的 profile 存在
     items = mappings(pid)
     action = argv[0] if argv else 'menu'
     if action == 'list':
@@ -2465,7 +2660,7 @@ def mapping_command(argv, flags=None):
     if action == 'add':
         created = mapping_wizard()
         if created is None: return
-        items.append(created); save_mappings(pid, items); return
+        items.append(created); save_mappings(pid, items, explicit=explicit); return
     if action in ('edit', 'enable', 'disable', 'delete'):
         if len(argv) < 2: raise ValueError('需要映射名称：mapping ' + action + ' <name>')
         name_arg = argv[1]; index = next((i for i, item in enumerate(items) if item['name'] == name_arg), None)
@@ -2479,7 +2674,7 @@ def mapping_command(argv, flags=None):
         elif action == 'delete':
             if not confirm('确认删除映射 ' + name_arg + '？此操作不可撤销', danger=True): return
             items.pop(index)
-        save_mappings(pid, items); return
+        save_mappings(pid, items, explicit=explicit); return
     if action == 'menu': mapping_menu(); return
     raise ValueError('支持 mapping list/add/edit/enable/disable/delete')
 
@@ -2639,24 +2834,44 @@ def restore_upgrade_snapshot(directory):
     manifest = directory / 'manifest.json'
     if not manifest.exists(): raise ValueError('升级快照缺少 manifest.json')
     data = read_json(manifest, {})
-    restored = []
+    # Stage + verify everything first, then commit with rollback (SEC-5):
+    # a mid-way failure must never leave a half-restored manager.
+    staged = []
     for rel in data.get('files', []):
         relative = Path(rel)
         if relative.is_absolute() or '..' in relative.parts: raise ValueError('快照路径非法：' + rel)
         src = directory / 'install-root' / relative
         if not src.is_file(): raise ValueError('快照文件缺失：' + rel)
+        payload = src.read_bytes()
         expected = (data.get('sha256') or {}).get(rel)
-        if expected and hashlib.sha256(src.read_bytes()).hexdigest() != expected:
+        if expected and hashlib.sha256(payload).hexdigest() != expected:
             raise ValueError('快照文件校验失败：' + rel)
         dest = INSTALL_ROOT / relative
         if not _within(dest, INSTALL_ROOT): raise ValueError('目标路径非法：' + rel)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_name(dest.name + '.restore')
-        tmp.write_bytes(src.read_bytes())
-        os.replace(str(tmp), str(dest))
-        os.chmod(str(dest), 0o755 if (rel.endswith('.sh') or rel.endswith('.ps1')) else 0o644)
-        restored.append(rel)
-    return restored
+        mode = 0o755 if (rel.endswith('.sh') or rel.endswith('.ps1')) else 0o644
+        staged.append((dest, payload, mode))
+    backups = {}
+    committed = []
+    try:
+        for dest, payload, mode in staged:
+            if dest.exists(): backups[dest] = (dest.read_bytes(), dest.stat().st_mode & 0o777)
+            else: backups[dest] = None
+            # 先登记再写：chmod/os.replace 中途失败时该文件也必须回滚。
+            committed.append(dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_name(dest.name + '.restore')
+            tmp.write_bytes(payload); os.replace(str(tmp), str(dest)); os.chmod(str(dest), mode)
+    except BaseException:
+        for dest in committed:
+            old = backups.get(dest)
+            try:
+                if old is None: unlink_quiet(dest)
+                else:
+                    tmp = dest.with_name(dest.name + '.rollback')
+                    tmp.write_bytes(old[0]); os.replace(str(tmp), str(dest)); os.chmod(str(dest), old[1])
+            except OSError: pass
+        raise
+    return [str(d.relative_to(INSTALL_ROOT)) for d, _, _ in staged]
 
 def _service_manager():
     """Return 'systemd' / 'openrc' / '' for the running host."""

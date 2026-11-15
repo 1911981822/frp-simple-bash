@@ -3,7 +3,8 @@
 param(
     [Parameter(Mandatory=$true)][ValidateSet('frps','frpc')][string]$Component,
     [ValidateSet('v0.72.0')][string]$Version = 'v0.72.0',
-    [string]$WinSWSha256 = ''
+    [string]$WinSWSha256 = '',
+    [switch]$NoStart
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -22,7 +23,7 @@ $native = Join-Path $root 'native'
 $bin = Join-Path $root 'bin'
 $services = Join-Path $root 'services'
 $repo = 'https://raw.githubusercontent.com/1911981822/frp-simple-bash/main'
-$ManagerVersion = 'v1.0.0-rc.2'
+$ManagerVersion = 'v1.0.0-rc.3'
 $mirror = if (Test-Path Env:FRP_MIRROR_URL) { [string]$env:FRP_MIRROR_URL } else { 'https://download.sueiyuan.top' }
 if ($mirror -eq 'off') { $mirror = '' }
 if ($mirror -and $mirror -notmatch '^https://') { throw 'Mirror URL must use HTTPS, or be empty/off.' }
@@ -36,7 +37,7 @@ function Get-HttpsFile([string]$Url, [string]$Destination) {
         $request.AllowAutoRedirect = $false
         $request.Timeout = 120000
         $request.ReadWriteTimeout = 120000
-        $request.UserAgent = 'frp-simple-bash/v1.0.0-rc.2'
+        $request.UserAgent = 'frp-simple-bash/v1.0.0-rc.3'
         $response = $request.GetResponse()
         try {
             $status = [int]$response.StatusCode
@@ -100,6 +101,25 @@ Set-Acl -LiteralPath $data -AclObject $acl
 # Descendants inherit this restricted ACL, including any existing configuration.
 & icacls.exe (Join-Path $data '*') /reset /T /C | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Cannot protect configuration ACL.' }
+function Get-ReleaseManifest {
+    # Mirror release manifest (same origin as source.tar.gz); empty on failure.
+    if (-not $script:ReleaseManifest) {
+        $script:ReleaseManifest = @{}
+        try {
+            $tmp = Join-Path ([IO.Path]::GetTempPath()) ('frp-manifest-' + [Guid]::NewGuid() + '.txt')
+            Save-Download @(Download-Urls "frp-simple-bash/releases/$ManagerVersion/SHA256SUMS.txt" "$repo/SHA256SUMS.txt") $tmp
+            foreach ($line in (Get-Content -LiteralPath $tmp)) {
+                $parts = $line.Trim() -split '\s+'
+                if ($parts.Count -ge 2 -and $parts[0] -match '^[a-fA-F0-9]{64}$') {
+                    $script:ReleaseManifest[$parts[1].TrimStart('*')] = $parts[0].ToLowerInvariant()
+                }
+            }
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        } catch { Write-Warning 'Release manifest unavailable; manager files cannot be verified.' }
+    }
+    return $script:ReleaseManifest
+}
+
 function Save-RepositoryFile([string]$relative) {
     $dest = Join-Path $root $relative
     New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
@@ -107,8 +127,14 @@ function Save-RepositoryFile([string]$relative) {
     if ((Test-Path $local) -and ([IO.Path]::GetFullPath($local) -ne [IO.Path]::GetFullPath($dest))) {
         Copy-Item -LiteralPath $local -Destination $dest -Force
     } elseif (-not (Test-Path $local)) {
-        $urls = @(Download-Urls "frp-simple-bash/releases/$ManagerVersion/$($relative.Replace('\','/'))" "$repo/$($relative.Replace('\','/'))")
-        Save-Download $urls $dest
+        $rel = $relative.Replace('\','/')
+        $urls = @(Download-Urls "frp-simple-bash/releases/$ManagerVersion/$rel" "$repo/$rel")
+        $manifest = Get-ReleaseManifest
+        $expected = if ($manifest.ContainsKey($rel)) { [string]$manifest[$rel] } else { '' }
+        if (-not $expected) {
+            Write-Warning ("No SHA256 in release manifest for {0}; downloading unverified (mirror fallback)." -f $rel)
+        }
+        Save-Download $urls $dest $expected
     }
 }
 foreach ($relative in @('install-frps.ps1','install-frpc.ps1','install-windows.ps1','lib/manager.py','bin/frps.ps1','bin/frpc.ps1','bin/frps.cmd','bin/frpc.cmd','uninstall-frps.ps1','uninstall-frpc.ps1','uninstall-windows.ps1')) { Save-RepositoryFile $relative }
@@ -189,8 +215,12 @@ if (-not (Test-Path $config)) {
 if (Test-Path $config) {
     & (Join-Path $native "$Component.exe") verify -c $config
     if ($LASTEXITCODE -ne 0) { throw 'Native configuration verification failed; service was not started.' }
-    Start-Service -Name $serviceId
-    (Get-Service -Name $serviceId).WaitForStatus('Running',[TimeSpan]::FromSeconds(30))
+    if ($NoStart) {
+        Write-Host "Service registered but not started (-NoStart)."
+    } else {
+        Start-Service -Name $serviceId
+        (Get-Service -Name $serviceId).WaitForStatus('Running',[TimeSpan]::FromSeconds(30))
+    }
 }
 } catch {
     $installError = $_

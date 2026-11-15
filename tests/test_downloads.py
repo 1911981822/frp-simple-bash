@@ -40,8 +40,10 @@ shutil.copyfile(fixtures[url],dest)
         mock.chmod(0o755)
     def tearDown(self): self.tmp.cleanup()
     def env(self, mirror='https://mirror.invalid'):
+        # 未校验的 GitHub main 回退现在默认被拒绝（SEC-2）；测试显式授权以便覆盖回退路径。
         return dict(os.environ, PATH=str(self.bin)+os.pathsep+os.environ['PATH'], FRP_MIRROR_URL=mirror,
-                    MOCK_LOG=str(self.log), MOCK_FIXTURES=json.dumps(self.fixtures), TMPDIR=str(self.root))
+                    MOCK_LOG=str(self.log), MOCK_FIXTURES=json.dumps(self.fixtures), TMPDIR=str(self.root),
+                    FRP_ALLOW_UNVERIFIED='1')
     def requests(self): return [json.loads(x) for x in self.log.read_text().splitlines()] if self.log.exists() else []
     def file(self, name, content):
         p=self.root/name; p.write_bytes(content); return str(p)

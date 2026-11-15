@@ -1,5 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-entry="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+entry="${BASH_SOURCE[0]}"
+# readlink -f 在旧版 BSD/macOS 上不存在；此时手工逐跳解析软链。
+if readlink -f / >/dev/null 2>&1; then
+  entry="$(readlink -f -- "$entry" 2>/dev/null || printf '%s' "$entry")"
+else
+  for _hop in 1 2 3 4 5; do
+    [ -L "$entry" ] || break
+    _target="$(readlink -- "$entry")"
+    case "$_target" in
+      /*) entry="$_target" ;;
+      *)  entry="$(dirname -- "$entry")/$_target" ;;
+    esac
+  done
+fi
 base="$(cd -- "$(dirname -- "$entry")/.." && pwd)"
 exec python3 "$base/lib/manager.py" frps "$@"

@@ -29,7 +29,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.5'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.6'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -508,6 +508,51 @@ def apply(pid):
     if running('frpc'): set_pending(True)
     audit('frpc-config-written', pid)
 
+def service_uptime(role):
+    """Seconds the service process has been running, or None if unknown."""
+    if os.name == 'nt': return None
+    try:
+        if shutil.which('systemctl') and Path('/run/systemd/system').exists():
+            out = run_cmd(['systemctl', 'show', '-p', 'MainPID', '--value', role],
+                          capture_output=True, text=True, timeout=10)
+            pid = out.stdout.strip()
+        elif sys.platform == 'darwin':
+            out = run_cmd(['launchctl', 'print', 'system/' + 'frp-simple-bash.' + role],
+                          capture_output=True, text=True, timeout=10)
+            found = re.search(r'\bpid = (\d+)', out.stdout or '')
+            pid = found.group(1) if found else ''
+        else:
+            return None
+        if not pid or not pid.isdigit() or pid == '0': return None
+        out = run_cmd(['ps', '-o', 'etimes=', '-p', pid], capture_output=True, text=True, timeout=10)
+        value = (out.stdout or '').strip()
+        return int(value) if value.isdigit() else None
+    except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
+        return None
+
+def refresh_pending(role='frpc'):
+    """Clear a stale pending flag when the running process already reloaded the config.
+
+    `pending` used to be a plain boolean that only service() cleared, so a restart
+    done outside this menu (systemctl, a reboot) left 「有修改等待重启」 forever.
+    Inference: if the process started AFTER frpc.toml was last modified, it has
+    necessarily loaded that config — so the flag is stale.
+    """
+    if role != 'frpc': return
+    try:
+        s = state()
+        if not s.get('pending'): return
+        cfg = ROOT / 'frpc.toml'
+        if not cfg.exists(): return
+        uptime = service_uptime('frpc')
+        if uptime is None: return
+        age = time.time() - cfg.stat().st_mtime
+        if age > uptime + 1:      # 进程启动时刻晚于配置修改时刻（留 1 秒容差）
+            set_pending(False)
+            audit('pending-auto-cleared')
+    except (ValueError, OSError, KeyError, TypeError):
+        pass
+
 def set_current(pid):
     s = state(); s['active_profile_id'] = pid; save_json(ROOT / 'state.json', s); audit('profile-selected', pid)
 
@@ -784,50 +829,67 @@ def wait_connection(pid, timeout=30):
 def switch(pid):
     """Switch the active profile.
 
-    Only the config write is transactional. Interactive confirmation, service
-    start/stop and the 30s connection probe stay OUTSIDE the lock so a long
-    wait cannot block other terminals, and a failed start is compensated
-    instead of leaving frpc stopped (详细设计 §15.2(4)).
+    关键改动（修复「切换后连接不上、并且当前连接被切断」）：
+    - 切换前先探测新服务端可达性，不可达时明确告警，避免切完才发现连不上；
+    - 运行中的 frpc 不再同步 stop→start，而是走 restart_safely()，这样即使
+      用户正通过映射端口 SSH 登录，也不会被自己的切换动作切断；
+    - 用户放弃重启时回退运行配置与 active，保持「配置=运行」一致。
     """
     previous = active()
     try: old_label = label(load_profile(previous)) if previous else '（无）'
     except (ValueError, OSError, KeyError, TypeError): old_label = '（无）'
-    new_label = label(load_profile(pid))
+    new_profile = load_profile(pid)
+    new_label = label(new_profile)
     content = render(pid); verify('frpc', content)
     was_running = running('frpc')
+    host = new_profile.get('server_addr', '')
+    port_value = int(new_profile.get('server_port', 7000))
+    if host and not port_reachable(host, port_value):
+        if not confirm(f'新服务端 {host}:{port_value} 当前不可达（地址/端口错误或被防火墙拦截）。'
+                       '仍要切换？', danger=True):
+            result_info('已取消切换，当前配置保持不变。'); return
     if was_running and not confirm('切换将中断当前连接，确认继续？'): return
     old = (ROOT / 'frpc.toml').read_bytes() if (ROOT / 'frpc.toml').exists() else None
-    if was_running: service('frpc', 'stop')
     try:
         with lock(), transaction():
             atomic(ROOT / 'frpc.toml', content); set_current(pid); mark_hash('frpc')
     except Exception:
-        # Restore the previous runtime config and bring the old service back.
         if old is not None: atomic(ROOT / 'frpc.toml', old.decode('utf-8'))
+        mark_hash('frpc')
         if was_running:
             try: service('frpc', 'start')
             except (ValueError, OSError) as exc:
                 result_error('切换失败且旧服务未能自动恢复：' + str(exc),
-                             hint='请手动执行「启动 frpc」，或从「备份与恢复配置」恢复。')
+                             hint='请手动执行「启动」，或从「备份与恢复配置」恢复。')
         raise
-    if was_running:
-        try:
-            service('frpc', 'start')
-        except (ValueError, OSError) as exc:
-            # Target profile stays active (per doc), but the service is down:
-            # compensate by restoring the previous runtime config.
-            if old is not None: atomic(ROOT / 'frpc.toml', old.decode('utf-8'))
-            mark_hash('frpc'); set_pending(False)   # 回退后同步哈希，避免误报外部修改
-            try: service('frpc', 'start')
-            except (ValueError, OSError): pass
-            result_error('切换到 ' + new_label + ' 后启动失败：' + str(exc),
-                         hint='已回退运行配置并尝试恢复旧服务；当前 active 仍为 ' + new_label +
-                              '，请检查其配置后重试，或重新切换到其他服务端。')
-            return
-        wait_connection(pid)
-    else:
+    if not was_running:
         set_pending(False)
-        result_info('已切换当前配置，frpc 保持停止。', detail=f'当前服务端：{old_label} → {new_label}')
+        result_info('已切换当前配置，frpc 保持停止。',
+                    detail=f'当前服务端：{old_label} → {new_label}')
+        return
+    outcome = restart_safely('frpc')
+    if outcome == 'cancelled':
+        # 没重启就等于没生效：回退运行配置与 active，避免"配置指向新、进程跑旧"
+        if old is not None: atomic(ROOT / 'frpc.toml', old.decode('utf-8'))
+        mark_hash('frpc'); set_pending(False)
+        if previous: set_current(previous)
+        result_info('已取消切换，运行配置与当前服务端保持不变。')
+        return
+    if outcome == 'scheduled':
+        result_info('已切换到「' + new_label + '」，将在后台重启生效。',
+                    detail='若你正通过映射端口 SSH 登录，本连接会断开；重连后新服务端已生效。')
+        return
+    if not wait_connection(pid):
+        # 新服务端连不上：回退运行配置并恢复旧服务，active 保持新服务端（与设计一致）
+        if old is not None: atomic(ROOT / 'frpc.toml', old.decode('utf-8'))
+        mark_hash('frpc'); set_pending(False)
+        try: service('frpc', 'restart')
+        except (ValueError, OSError): pass
+        result_error('切换到「' + new_label + '」后连接失败，已回退运行配置并恢复旧服务。',
+                     hint='请检查该服务端的地址/端口/token 与防火墙后重试，或重新切换到其他服务端。')
+        return
+    result_ok(f'已切换到「{new_label}」。',
+              detail=f'当前服务端：{old_label} → {new_label}；连接正常。')
 
 CANCEL_KEYS = ('q', 'Q')
 BACK_KEYS = ('b', 'B')
@@ -2366,6 +2428,10 @@ def schedule_detached_restart(role, delay=2):
     subprocess.Popen(['/bin/sh', '-c', script],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
+    # 重启已排期：pending 立刻清掉，否则「有修改等待重启」会一直显示
+    # （延迟重启走的是独立进程，不会再经过 service() 的清 pending 逻辑）。
+    if role == 'frpc':
+        set_pending(False)
     audit('service-restart-scheduled')
 
 def _has_enabled_mappings():
@@ -2416,6 +2482,7 @@ def main_menu(role):
     _CURRENT_ROLE = role
     while True:
         clear_screen()
+        refresh_pending(role)
         try:
             data = status(role)
             profile = data.get('active_profile') or {}
@@ -3206,6 +3273,7 @@ def run(argv=None):
     if sys.platform == 'darwin' and role == 'frps':
         err('E001', 'macOS 仅支持客户端 frpc，不提供 frps 服务端；如需 frps 请在 Linux 服务器上运行。')
     initialize()
+    refresh_pending(role)      # 清掉「重启发生在菜单外」留下的过期 pending
     cmd = argv.pop(0) if argv else 'menu'
     if cmd == 'status':
         _args, flags = _parse_flags(argv)

@@ -1224,4 +1224,65 @@ class ManagerTests(unittest.TestCase):
         self.assertNotIn('查看当前状态', shown)
         self.assertIn('0 = 退出程序', shown)
 
+    # ---- 切换服务端 / pending 修复 ----
+    def test_detached_restart_clears_pending(self):
+        m.save_json(m.ROOT / 'state.json', {'active_profile_id': '', 'pending': True})
+        with patch.object(m, '_restart_command', return_value=['systemctl','restart','frpc']), \
+             patch.object(m.subprocess, 'Popen'), patch.object(m, 'audit'):
+            m.schedule_detached_restart('frpc')
+        self.assertFalse(m.state()['pending'])
+    def test_refresh_pending_clears_when_process_is_newer(self):
+        pid = self.create(); m.set_current(pid)
+        m.save_json(m.ROOT / 'state.json', {'active_profile_id': pid, 'pending': True})
+        cfg = m.ROOT / 'frpc.toml'
+        m.atomic(cfg, '# c\n')
+        old = 10000
+        import os as _os
+        _os.utime(cfg, (m.time.time() - old, m.time.time() - old))
+        with patch.object(m, 'service_uptime', return_value=5):   # 进程 5 秒前启动，配置 10000 秒前改
+            m.refresh_pending('frpc')
+        self.assertFalse(m.state()['pending'])
+    def test_refresh_pending_keeps_when_process_older(self):
+        pid = self.create(); m.set_current(pid)
+        m.save_json(m.ROOT / 'state.json', {'active_profile_id': pid, 'pending': True})
+        cfg = m.ROOT / 'frpc.toml'; m.atomic(cfg, '# c\n')
+        with patch.object(m, 'service_uptime', return_value=99999):  # 进程比配置更老 → 未加载
+            m.refresh_pending('frpc')
+        self.assertTrue(m.state()['pending'])
+    def test_switch_aborts_when_new_server_unreachable(self):
+        a = self.create('A'); b = self.create('B'); m.set_current(a); m.apply(a)
+        before = (m.ROOT / 'frpc.toml').read_bytes()
+        with patch.object(m, 'port_reachable', return_value=False), \
+             patch.object(m, 'running', return_value=True), \
+             patch.object(m, 'confirm', return_value=False), \
+             contextlib.redirect_stdout(io.StringIO()):
+            m.switch(b)
+        self.assertEqual((m.ROOT / 'frpc.toml').read_bytes(), before)
+        self.assertEqual(m.active(), a)
+    def test_switch_uses_safe_restart_not_sync_stop(self):
+        a = self.create('A'); b = self.create('B'); m.set_current(a); m.apply(a)
+        calls = []
+        with patch.object(m, 'port_reachable', return_value=True), \
+             patch.object(m, 'running', return_value=True), \
+             patch.object(m, 'confirm', return_value=True), \
+             patch.object(m, 'service', side_effect=lambda r, act: calls.append(act)), \
+             patch.object(m, 'restart_safely', return_value='scheduled') as sr, \
+             contextlib.redirect_stdout(io.StringIO()):
+            m.switch(b)
+        self.assertEqual(calls, [])           # 不再同步 stop/start
+        sr.assert_called_once()
+        self.assertEqual(m.active(), b)
+        self.assertFalse(m.state()['pending'])
+    def test_switch_cancelled_restart_rolls_back(self):
+        a = self.create('A'); b = self.create('B'); m.set_current(a); m.apply(a)
+        before = (m.ROOT / 'frpc.toml').read_bytes()
+        with patch.object(m, 'port_reachable', return_value=True), \
+             patch.object(m, 'running', return_value=True), \
+             patch.object(m, 'confirm', return_value=True), \
+             patch.object(m, 'restart_safely', return_value='cancelled'), \
+             contextlib.redirect_stdout(io.StringIO()):
+            m.switch(b)
+        self.assertEqual((m.ROOT / 'frpc.toml').read_bytes(), before)
+        self.assertEqual(m.active(), a)
+
 if __name__ == '__main__': unittest.main()

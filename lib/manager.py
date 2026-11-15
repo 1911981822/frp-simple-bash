@@ -29,7 +29,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.3'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.4'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -1083,9 +1083,9 @@ def choose(items, title='请选择', back_label='返回上一级', groups=None):
         idx = n
     print(f'  0) {back_label}')
     if back_label in ('退出', '退出程序'):
-        print('  ' + _dim('0 或 q = 退出程序    回车 = 刷新'))
+        print('  ' + _dim('0 = 退出程序    回车 = 刷新'))
     else:
-        print('  ' + _dim(f'回车/0 = {back_label}    q = 退出程序'))
+        print('  ' + _dim(f'回车/0 = {back_label}'))
     while True:
         try:
             v = input(f'\n  请选择 [0-{idx}]：')
@@ -1093,12 +1093,8 @@ def choose(items, title='请选择', back_label='返回上一级', groups=None):
             raise QuitProgram()
         v = v.strip()
         at_root = back_label in ('退出', '退出程序')
-        # 统一规则（全程序唯一，无死循环/无静默退出）：
-        #   q     = 退出程序（任何层级，明确意图）
-        #   0     = 返回上一级（主菜单中即为退出）
-        #   空回车 = 返回上一级；主菜单中只重绘，避免连按回车误退
-        if v in CANCEL_KEYS:
-            raise QuitProgram()
+        # 统一规则：0 = 退一层（主菜单=退出程序）；空回车 = 退一层（主菜单=刷新）。
+        # 菜单层不再把 q 当作退出键（q 仅用于输入框取消本次操作）。
         if v == '0':
             return 0
         if v == '':
@@ -1106,7 +1102,7 @@ def choose(items, title='请选择', back_label='返回上一级', groups=None):
             return 0
         if v.isdecimal() and 0 <= int(v) <= idx:
             return int(v)
-        result_error('无效编号', f'请输入 0-{idx} 的数字；回车或 0 返回上一级，q 退出程序。')
+        result_error('无效编号', f'请输入 0-{idx} 的数字；回车或 0 返回上一级。')
 
 def require_active():
     pid = active()
@@ -2284,7 +2280,7 @@ def show_status(role, data=None):
     """Render a status screen. Accepts a precomputed status dict so the menu
     does not pay for status() (and its API probes) twice."""
     if data is None: data = status(role)
-    section('frps 服务端管理' if role == 'frps' else 'frpc 客户端管理')
+    section('当前状态')
     print(_kv('状态', color_state(SERVICE_STATES.get(str(data['service_state']).lower(), data['service_state']))))
     print(_kv('版本', data['version']))
     print(_kv('配置文件', data['config_path']))
@@ -2407,8 +2403,10 @@ def service_feedback(role, action):
     return state_value
 
 def main_menu(role):
+    """Main menu. 进入后先显示《当前状态》，再进入操作菜单。"""
     global _CURRENT_ROLE
     _CURRENT_ROLE = role
+    show_full_status = True
     while True:
         clear_screen()
         try:
@@ -2418,77 +2416,141 @@ def main_menu(role):
         except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError):
             result_error('配置无法读取；请检查配置文件或从 backups 恢复，服务管理仍可使用。')
             alias = '配置错误'
-            data = {'component': role, 'version': VERSION, 'service_state': 'unknown', 'config_path': str(ROOT / (role + '.toml')), 'pending': False}
+            data = {'component': role, 'version': VERSION, 'service_state': 'unknown',
+                    'config_path': str(ROOT / (role + '.toml')), 'pending': False}
         if role == 'frpc':
-            items = ['查看当前状态', '启动 frpc', '停止 frpc', '重启 frpc', '新建 frps 服务端', '查看服务端列表', '切换服务端', '修改当前 frps 配置', f'修改当前 frps（{_shorten(alias, 12)}）端口映射', '查看日志与连接诊断', '备份与恢复配置', '设置/取消开机自启动', '卸载 frpc', '升级 frpc']
-            groups = {0: '── 服务控制 ──', 4: '── 服务端与映射 ──', 9: '── 运维 ──', 12: '── 危险操作 ──'}
+            short = _shorten(alias, 12)
+            items = [
+                '启动', '停止', '重启',
+                '新建服务端', '查看服务端',
+                f'切换服务端（当前 {short}）',
+                f'修改服务端（{short}）配置',
+                '删除服务端/数据',
+                f'管理（{short}）端口映射',
+                '显示所有映射',
+                '查看日志与连接诊断', '备份与恢复配置', '设置/取消开机自启动',
+                '卸载 frpc', '升级 frpc',
+            ]
+            groups = {0: '── 服务控制 ──', 3: '── 服务端管理（FRPS） ──',
+                      8: '── 端口映射管理 ──', 10: '── 运维 ──', 13: '── 危险操作 ──'}
         else:
-            items = ['查看服务信息（状态、版本、路径）', '启动 frps', '停止 frps', '重启 frps', '查看客户端连接信息', '修改服务端配置', '查看日志与连接诊断', '备份与恢复配置', '设置/取消开机自启动', '卸载 frps', '升级 frps']
-            groups = {0: '── 服务控制 ──', 4: '── 配置与连接 ──', 6: '── 运维 ──', 9: '── 危险操作 ──'}
-        status_bar(role, data)
+            items = [
+                '启动', '停止', '重启',
+                '查看客户端连接信息', '修改服务端配置',
+                '查看日志与连接诊断', '备份与恢复配置', '设置/取消开机自启动',
+                '卸载 frps', '升级 frps',
+            ]
+            groups = {0: '── 服务控制 ──', 3: '── 配置与连接 ──',
+                      5: '── 运维 ──', 8: '── 危险操作 ──'}
+        if show_full_status:
+            show_status(role, data)
+            show_full_status = False
+        else:
+            status_bar(role, data)
         if role == 'frpc' and not profiles():
-            # 新用户第一个动作常是「启动」，但没服务端时必然失败(E011)。
-            # 先给三步引导，避免误以为安装失败。
             print('  ' + _tag('[提示]') + ' 还没有服务端配置，建议按顺序：')
-            print('    ① 新建 frps 服务端（本菜单 5）  →  ② 添加端口映射（本菜单 9）  →  ③ 启动并验证（本菜单 2）')
+            print('    ① 新建服务端（本菜单 4）  →  ② 管理端口映射（本菜单 9）  →  ③ 启动并验证（本菜单 1）')
             print(RULE)
-        n = choose(items, '请选择操作' if role == 'frps' else 'frpc 客户端操作', '退出', groups=groups)
+        n = choose(items, 'frpc 客户端操作' if role == 'frpc' else 'frps 服务端操作', '退出', groups=groups)
         if not n: return
-        # Sub-menus pause themselves; every other result gets exactly one
-        # pause so the user can actually read it before the menu redraws.
-        # Terminal operations (uninstall/upgrade) leave the menu entirely.
         needs_pause = True
         terminal = False
         try:
             if role == 'frpc':
-                if n == 1: show_status(role, data)
-                elif n in (2, 3, 4):
-                    # 只有启动需要已配置的服务端；停止/重启不依赖 profile，
-                    # 否则 profile 损坏时连服务都停不掉（FUNC-4）。
-                    if n == 2: require_active()
-                    if n == 2 or confirm(items[n-1] + '？'):
-                        if n == 2:
-                            service_feedback(role, 'start'); wait_connection(active())
-                        elif n == 3:
-                            service_feedback(role, 'stop')
-                            result_info('frpc 已停止，当前配置和 profile 保留。')
-                        elif restart_safely(role) == 'restarted':
-                            wait_connection(active())
-                elif n == 5: profile_wizard()
-                elif n == 6: list_profiles()
-                elif n == 7:
+                if n == 1:
+                    require_active()
+                    service_feedback(role, 'start'); wait_connection(active())
+                elif n == 2:
+                    service_feedback(role, 'stop')
+                    result_info('frpc 已停止，当前配置和 profile 保留。')
+                elif n == 3:
+                    if restart_safely(role) == 'restarted': wait_connection(active())
+                elif n == 4: profile_wizard()
+                elif n == 5: list_profiles()
+                elif n == 6:
                     pid = select_profile()
                     if pid: switch(pid)
-                    else: needs_pause = False  # user pressed 0 to go back; don't ask again
-                elif n == 8: edit_profile(); needs_pause = False
+                    else: needs_pause = False
+                elif n == 7: edit_profile(); needs_pause = False
+                elif n == 8: delete_server_menu(); needs_pause = False
                 elif n == 9: mapping_menu(); needs_pause = False
-                elif n == 10: logs_and_diagnostics_menu(role); needs_pause = False
-                elif n == 11: backup_menu(); needs_pause = False
-                elif n == 12:
+                elif n == 10: show_all_mappings()
+                elif n == 11: logs_and_diagnostics_menu(role); needs_pause = False
+                elif n == 12: backup_menu(); needs_pause = False
+                elif n == 13:
                     if not autostart(role): needs_pause = False
-                elif n == 13: terminal = uninstall_menu(role)
-                elif n == 14: terminal = upgrade(role)
+                elif n == 14: terminal = uninstall_menu(role)
+                elif n == 15: terminal = upgrade(role)
             else:
-                if n == 1:
-                    result_info('正在刷新服务信息。')
-                    show_status(role, data)
-                elif n in (2,3,4):
-                    if n == 2 or confirm(items[n-1] + '？'):
-                        if n == 4: restart_safely(role)
-                        else: service_feedback(role, {2:'start', 3:'stop'}[n])
-                elif n == 5: server_clients()
-                elif n == 6: frps_config_menu(); needs_pause = False
-                elif n == 7: logs_and_diagnostics_menu(role); needs_pause = False
-                elif n == 8: backup_menu(); needs_pause = False
-                elif n == 9:
+                if n == 1: service_feedback(role, 'start')
+                elif n == 2:
+                    service_feedback(role, 'stop')
+                    result_info('frps 已停止。')
+                elif n == 3: restart_safely(role)
+                elif n == 4: server_clients()
+                elif n == 5: frps_config_menu(); needs_pause = False
+                elif n == 6: logs_and_diagnostics_menu(role); needs_pause = False
+                elif n == 7: backup_menu(); needs_pause = False
+                elif n == 8:
                     if not autostart(role): needs_pause = False
-                elif n == 10: terminal = uninstall_menu(role)
-                elif n == 11: terminal = upgrade(role)
-        except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as e: result_error(str(e))
+                elif n == 9: terminal = uninstall_menu(role)
+                elif n == 10: terminal = upgrade(role)
+        except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as e:
+            result_error(str(e))
         if terminal:
             return
         if needs_pause:
             pause()
+
+
+def delete_server_menu():
+    """先选服务端，再选「清空映射」或「删除服务端」两种删除方式。"""
+    ps = profiles()
+    if not ps:
+        result_info('暂无服务端，请先新建。'); return
+    n = choose([label(p) + (' [当前]' if p['id'] == active() else '') for p in ps],
+               '选择要处理的服务端')
+    if not n: return
+    target = ps[n - 1]
+    mode = choose([f'清空「{target["name"]}」的全部端口映射（保留服务端）',
+                   f'删除「{target["name"]}」（服务端与全部映射一并删除）'],
+                  '删除方式')
+    if not mode: return
+    if mode == 1:
+        count = len(mappings(target['id']))
+        if count == 0:
+            result_info('该服务端当前没有映射。'); return
+        if not confirm(f'将清空 {count} 条映射，服务端配置保留；此操作不可恢复，确认继续？',
+                       danger=True): return
+        save_mappings(target['id'], [], explicit=True)
+        if target['id'] == active():
+            apply(target['id'])
+        result_ok(f'已清空 {count} 条映射，服务端「{target["name"]}」保留。')
+        return
+    delete_profile_id(target['id'])
+
+def show_all_mappings():
+    """Read-only overview: every profile and every mapping under it."""
+    ps = profiles()
+    if not ps:
+        result_info('暂无服务端，请先新建。'); return
+    section('所有服务端的端口映射')
+    total = 0
+    for p in ps:
+        rows = mappings(p['id'])
+        total += len(rows)
+        mark = ' [当前]' if p['id'] == active() else ''
+        print('  ' + label(p) + mark + f'（{len(rows)} 条）')
+        if not rows:
+            print('     （无映射）')
+        for m in rows:
+            local = f'{m.get("local_ip", "127.0.0.1")}:{m["local_port"]}'
+            if m['type'] in ('tcp', 'udp'): remote = str(m.get('remote_port', '-'))
+            else: remote = m.get('domain', '-')
+            state = color_state('启用' if m.get('enabled', True) else '停用')
+            print('     - {0}  {1}  {2} → {3}  {4}'.format(m['name'], m['type'], local, remote, state))
+    print(RULE)
+    result_info(f'共 {len(ps)} 个服务端、{total} 条映射。')
 
 def log_files(role):
     base = ROOT / 'logs'

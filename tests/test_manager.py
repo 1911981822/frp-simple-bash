@@ -133,22 +133,21 @@ class ManagerTests(unittest.TestCase):
     def test_server_menu_refreshes_once_and_hides_secrets(self):
         m.atomic(m.ROOT / 'frps.toml', m.toml({'bindPort':7000,'auth.token':'do-not-print-token','webServer.addr':'127.0.0.1','webServer.port':7500,'webServer.user':'admin','webServer.password':'do-not-print-password'}))
         output=io.StringIO()
-        with contextlib.redirect_stdout(output), patch('builtins.input', side_effect=['1','0']): m.main_menu('frps')
+        with contextlib.redirect_stdout(output), patch('builtins.input', side_effect=['0']): m.main_menu('frps')
         shown=output.getvalue()
-        self.assertEqual(shown.count('frps 服务端管理'), 1)
-        self.assertEqual(shown.count('状态'.ljust(10)), 1)
-        self.assertIn('[提示] 正在刷新服务信息。', shown)
-        self.assertIn('监听'.ljust(10) + '0.0.0.0:7000', shown)
+        self.assertEqual(shown.count('当前状态'), 1)
+        self.assertIn('监听', shown); self.assertIn('0.0.0.0:7000', shown)
         self.assertIn('Dashboard', shown); self.assertIn('http://127.0.0.1:7500', shown)
-        self.assertIn('1) 查看服务信息（状态、版本、路径）', shown)
+        self.assertNotIn('查看服务信息（状态、版本、路径）', shown)
+        self.assertIn('1) 启动', shown)
         self.assertNotIn('2) 查看版本信息', shown)
         self.assertNotIn('3) 查看安装路径', shown)
         for hidden in ('"component"','do-not-print-token','do-not-print-password'): self.assertNotIn(hidden,shown)
     def test_frpc_menu_labels_and_json_status(self):
         pid=self.create();m.set_current(pid)
         output=io.StringIO()
-        with contextlib.redirect_stdout(output), patch('builtins.input', side_effect=['1','0']): m.main_menu('frpc')
-        shown=output.getvalue();self.assertEqual(shown.count('frpc 客户端管理'),1)
+        with contextlib.redirect_stdout(output), patch('builtins.input', side_effect=['0']): m.main_menu('frpc')
+        shown=output.getvalue();self.assertEqual(shown.count('当前状态'),1)
         self.assertIn('生产服务器（[::1]:7000）',shown)
         self.assertIn('连接状态', shown); self.assertIn('已停止', shown);self.assertNotIn('"component"',shown)
         output=io.StringIO()
@@ -212,9 +211,10 @@ class ManagerTests(unittest.TestCase):
     def test_choose_blank_and_zero_mean_back(self):
         with patch('builtins.input', side_effect=['']): self.assertEqual(m.choose(['x']), 0)
         with patch('builtins.input', side_effect=['0']): self.assertEqual(m.choose(['x']), 0)
-    def test_choose_q_quits_program(self):
-        with patch('builtins.input', side_effect=['q']):
-            with self.assertRaises(m.QuitProgram): m.choose(['x'])
+    def test_choose_q_is_invalid_not_quit(self):
+        # 菜单层 q 已不再作为退出键：视为无效输入后重试，按 0 返回
+        with patch('builtins.input', side_effect=['q', '0']):
+            self.assertEqual(m.choose(['x']), 0)
     def test_path_traversal_rejected(self):
         with self.assertRaises(ValueError): m.pdir('../escape')
     def test_lock_exclusion(self):
@@ -345,12 +345,12 @@ class ManagerTests(unittest.TestCase):
     def test_ask_q_returns_none(self):
         with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', return_value='q'):
             self.assertIsNone(m.ask('字段'))
-    def test_edit_profile_q_cancel_does_not_write(self):
+    def test_edit_profile_q_does_not_write(self):
         pid = self.create(); m.set_current(pid); m.apply(pid)
         before = {p: p.read_bytes() for p in m.managed_paths()}
-        # 菜单层 q = 退出程序（QuitProgram），不得写入任何文件
-        with patch('builtins.input', return_value='q'):
-            with self.assertRaises(m.QuitProgram): m.edit_profile()
+        # 菜单层 q 现在是无效输入（重问），随后按 0 返回，不得写入任何文件
+        with patch('builtins.input', side_effect=['q', '0']):
+            m.edit_profile()
         self.assertEqual({p: p.read_bytes() for p in m.managed_paths()}, before)
     def test_edit_profile_blank_token_clears(self):
         pid = self.create(); m.set_current(pid); m.apply(pid)
@@ -1182,5 +1182,45 @@ class ManagerTests(unittest.TestCase):
     def test_shorten_keeps_display_width(self):
         s = m._shorten('一二三四五六七八九十', 8)
         self.assertLessEqual(m._display_width(s), 8)
+
+    # ---- 菜单改版：删除服务端/数据、显示所有映射 ----
+    def test_delete_server_menu_clear_mappings_keeps_profile(self):
+        pid = self.create('A'); m.set_current(pid)
+        with patch.object(m, 'apply'):
+            m.save_mappings(pid, [self.mapping()])
+        # 选服务端 1 → 方式 1（清空映射）→ YES 确认
+        with patch('builtins.input', side_effect=['1', '1', 'YES']), \
+             patch.object(m, 'apply'), contextlib.redirect_stdout(io.StringIO()):
+            m.delete_server_menu()
+        self.assertEqual(m.mappings(pid), [])
+        self.assertTrue((m.ROOT / 'profiles' / pid).exists())
+    def test_delete_server_menu_delete_profile(self):
+        pid = self.create('A'); m.set_current(pid)
+        with patch('builtins.input', side_effect=['1', '2', 'YES', 'YES']), \
+             patch.object(m, 'running', return_value=False), contextlib.redirect_stdout(io.StringIO()):
+            m.delete_server_menu()
+        self.assertFalse((m.ROOT / 'profiles' / pid).exists())
+    def test_show_all_mappings_lists_every_profile(self):
+        a = self.create('A'); b = self.create('B'); m.set_current(a)
+        with patch.object(m, 'apply'):
+            m.save_mappings(a, [self.mapping('ssh')])
+            m.save_mappings(b, [self.mapping('web', 6001)], explicit=True)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out): m.show_all_mappings()
+        shown = out.getvalue()
+        self.assertIn('A（', shown); self.assertIn('B（', shown)   # 两个服务端都列出
+        self.assertIn('ssh', shown); self.assertIn('web', shown)
+        self.assertIn('共 2 个服务端、2 条映射', shown)
+    def test_main_menu_new_numbering(self):
+        out = io.StringIO()
+        with patch('builtins.input', side_effect=['0']), contextlib.redirect_stdout(out):
+            m.main_menu('frpc')
+        shown = out.getvalue()
+        self.assertIn('1) 启动', shown)
+        self.assertIn('8) 删除服务端/数据', shown)
+        self.assertIn('9) 管理', shown)
+        self.assertIn('10) 显示所有映射', shown)
+        self.assertNotIn('查看当前状态', shown)
+        self.assertIn('0 = 退出程序', shown)
 
 if __name__ == '__main__': unittest.main()

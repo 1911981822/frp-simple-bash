@@ -29,7 +29,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.6'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.7'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -288,7 +288,10 @@ def _clear_stale_lock(p):
         info = read_json(owner, {}) if owner.exists() else {}
         pid = info.get('pid')
         age = time.time() - float(info.get('time', 0))
-        if age > 300 or not _pid_alive(pid):
+        # 只在持有者进程确实不存活时回收；否则慢操作（大备份/慢盘）会被
+        # 另一终端强抢锁，出现两个写者（BUG-4-3）。Windows 无法探活时用年龄兜底。
+        dead = not _pid_alive(pid)
+        if dead or (os.name == 'nt' and age > 1800):
             shutil.rmtree(p)
             return True
     except (OSError, ValueError, TypeError):
@@ -508,25 +511,67 @@ def apply(pid):
     if running('frpc'): set_pending(True)
     audit('frpc-config-written', pid)
 
-def service_uptime(role):
-    """Seconds the service process has been running, or None if unknown."""
-    if os.name == 'nt': return None
+def _parse_etime(text):
+    """Parse `ps -o etime` output: MM:SS / HH:MM:SS / DD-HH:MM:SS → seconds."""
+    s = str(text or '').strip()
+    if not s: return None
+    days = 0
+    if '-' in s:
+        head, s = s.split('-', 1)
+        try: days = int(head)
+        except ValueError: return None
+    parts = s.split(':')
+    try: nums = [int(x) for x in parts]
+    except ValueError: return None
+    if len(nums) == 2: h, m, sec = 0, nums[0], nums[1]
+    elif len(nums) == 3: h, m, sec = nums
+    else: return None
+    return days * 86400 + h * 3600 + m * 60 + sec
+
+def _service_pid(role):
+    """Best-effort service PID for the current platform."""
     try:
+        if os.name == 'nt': return None
         if shutil.which('systemctl') and Path('/run/systemd/system').exists():
             out = run_cmd(['systemctl', 'show', '-p', 'MainPID', '--value', role],
                           capture_output=True, text=True, timeout=10)
-            pid = out.stdout.strip()
-        elif sys.platform == 'darwin':
-            out = run_cmd(['launchctl', 'print', 'system/' + 'frp-simple-bash.' + role],
+            pid = (out.stdout or '').strip()
+            return pid if pid.isdigit() and pid != '0' else None
+        if sys.platform == 'darwin':
+            out = run_cmd(['launchctl', 'print', 'system/frp-simple-bash.' + role],
                           capture_output=True, text=True, timeout=10)
             found = re.search(r'\bpid = (\d+)', out.stdout or '')
-            pid = found.group(1) if found else ''
-        else:
-            return None
-        if not pid or not pid.isdigit() or pid == '0': return None
+            return found.group(1) if found else None
+        # OpenRC / 其他：pidof 或 pidfile
+        if shutil.which('pidof'):
+            out = run_cmd(['pidof', role], capture_output=True, text=True, timeout=10)
+            pid = (out.stdout or '').strip().split()[0] if (out.stdout or '').strip() else ''
+            if pid.isdigit(): return pid
+        for candidate in (Path('/run') / (role + '.pid'), Path('/var/run') / (role + '.pid')):
+            if candidate.is_file():
+                try:
+                    pid = candidate.read_text().strip()
+                    if pid.isdigit(): return pid
+                except OSError: pass
+        return None
+    except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
+        return None
+
+def service_uptime(role):
+    """Seconds the service process has been running, or None if unknown.
+
+    `ps -o etimes` is GNU-only (busybox/macOS lack it), so fall back to parsing
+    `ps -o etime`. Without this fallback refresh_pending() silently never worked
+    on macOS/Windows/OpenRC (BUG-3-2).
+    """
+    pid = _service_pid(role)
+    if not pid: return None
+    try:
         out = run_cmd(['ps', '-o', 'etimes=', '-p', pid], capture_output=True, text=True, timeout=10)
         value = (out.stdout or '').strip()
-        return int(value) if value.isdigit() else None
+        if value.isdigit(): return int(value)
+        out = run_cmd(['ps', '-o', 'etime=', '-p', pid], capture_output=True, text=True, timeout=10)
+        return _parse_etime(out.stdout)
     except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
         return None
 
@@ -579,6 +624,14 @@ def service(role, action):
     elif shutil.which('rc-service'):
         if action in ('enable', 'disable'):
             result = run_cmd(['rc-update', 'add' if action == 'enable' else 'del', role, 'default'], capture_output=True, text=True, timeout=30)
+        elif action == 'status':
+            # rc-service 打印人类可读文本（如 " * status: started"），必须归一化，
+            # 否则 running() 永远为 False，会连锁破坏启动反馈/pending/切换/删除（BUG-3-1）。
+            result = run_cmd(['rc-service', role, 'status'], capture_output=True, text=True, timeout=30)
+            text = (result.stdout or '').lower()
+            if 'status: started' in text or 'status: starting' in text: return 'started'
+            if 'status: stopped' in text or 'status: crashed' in text: return 'stopped'
+            return 'started' if result.returncode == 0 else 'stopped'
         else: result = run_cmd(['rc-service', role, action], capture_output=True, text=True, timeout=30)
     elif sys.platform == 'darwin' and shutil.which('launchctl'):
         # launchd: label frp-simple-bash.<role>, plist in /Library/LaunchDaemons.
@@ -618,7 +671,10 @@ def service(role, action):
     if action == 'status': return result.stdout.strip() or 'stopped'
     if result.returncode: err('E007', '服务操作失败：' + result.stderr.strip())
     if action in ('start', 'stop', 'restart'): audit('service-' + action)
-    if role == 'frpc' and action in ('start', 'restart'):
+    # 只有 restart 会重新加载配置；`start` 对已在运行的单元是 no-op，
+    # 无条件清 pending 会把"未生效"误标成"已生效"（BUG-2-9）。
+    # 启动一个原本停止的服务时，由 refresh_pending() 依据进程启动时间自动校正。
+    if role == 'frpc' and action == 'restart':
         set_pending(False)
 
 def fail(message): raise ValueError(message)
@@ -708,6 +764,12 @@ def _login_state_from_log():
                  'x509:', 'tls: failed to verify', 'no certificates')
     auth_error = max(low.rfind(x) for x in auth_marks)
     tls_error = max(low.rfind(x) for x in tls_marks)
+    # 认证/TLS 失败若发生在最后一次成功登录之后，必须优先报失败；否则服务端
+    # 改 token 后界面会一直显示"连接中"，要等 30 秒超时（BUG-4-2）。
+    if auth_error > success:
+        return {'state': 'auth-failed', 'detail': 'token 或认证参数不匹配'}
+    if tls_error > success:
+        return {'state': 'tls-failed', 'detail': 'TLS 证书或信任配置错误'}
     if success >= 0 and success > failure:
         return {'state': 'connected', 'source': 'frpc-log'}
     # Only infer auth/TLS failure when there is no successful login this process.
@@ -721,6 +783,7 @@ def _login_state_from_log():
     return None
 
 _CONN_CACHE = {}
+_CONN_CACHE_MAX = 8   # 长时间开着菜单时避免字典无界增长（BUG-4-4）
 
 def connection(pid, fresh=False):
     """Resolve frpc connection state. A short-lived cache keeps menu redraws
@@ -738,6 +801,9 @@ def connection(pid, fresh=False):
             return dict(hit[1])
     result = _connection_uncached(pid)
     _CONN_CACHE[key] = (now, dict(result))
+    if len(_CONN_CACHE) > _CONN_CACHE_MAX:
+        for stale in sorted(_CONN_CACHE, key=lambda k: _CONN_CACHE[k][0])[:len(_CONN_CACHE) - _CONN_CACHE_MAX]:
+            _CONN_CACHE.pop(stale, None)
     return result
 
 def _connection_uncached(pid):
@@ -796,7 +862,12 @@ def wait_connection(pid, timeout=30):
         result = connection(pid, fresh=True)
         state = result['state']
         if state == 'connected':
-            result_ok('已连接服务端。')
+            enabled = [m for m in mappings(pid) if m.get('enabled', True)]
+            if enabled:
+                result_ok('已连接服务端，' + str(len(enabled)) + ' 条映射已生效。')
+            else:
+                result_info('已连接服务端，但当前没有启用的端口映射，外部仍无法访问。',
+                            detail='下一步：主菜单 9「管理端口映射」→ 新增端口映射。')
             return True
         if state in ('auth-failed', 'tls-failed'):
             result_error('连接失败：' + result.get('detail', state) + '；保留当前 profile。',
@@ -806,15 +877,15 @@ def wait_connection(pid, timeout=30):
         # the real reason instead of waiting out the whole timeout.
         if state == 'stopped' and not running('frpc'):
             result_error('frpc 未在运行，连接检测无法继续；已保留当前 profile。',
-                         hint='先通过「启动 frpc」启动服务；若启动失败请查看「日志与连接诊断」→ 最近 50 行日志。')
+                         hint='先在主菜单按 1「启动」；若启动失败请看「查看日志与连接诊断」（主菜单 11）。')
             return False
         if state == 'proxy-error':
             result_error('frpc 已登录，但有映射未就绪（proxy-error）；已保留当前 profile。',
-                         hint='检查映射的本地服务是否在运行、远程端口是否被占用；菜单「修改端口映射」查看详情。')
+                         hint='检查映射的本地服务是否在运行、远程端口是否被占用；用主菜单 9「管理端口映射」查看。')
             return False
         if state == 'config-error':
             result_error('配置错误，无法建立连接；已保留当前 profile。',
-                         hint='检查「修改当前 frps 配置」中的地址/端口/token/TLS；或从「备份与恢复配置」恢复。')
+                         hint='检查主菜单 7「修改服务端配置」中的地址/端口/token/TLS；或从「备份与恢复配置」恢复。')
             return False
         remaining = max(0, int(deadline - time.monotonic()))
         if remaining == 0:
@@ -880,13 +951,20 @@ def switch(pid):
                     detail='若你正通过映射端口 SSH 登录，本连接会断开；重连后新服务端已生效。')
         return
     if not wait_connection(pid):
-        # 新服务端连不上：回退运行配置并恢复旧服务，active 保持新服务端（与设计一致）
+        # 新服务端连不上：把「运行配置 + active」一起回退到旧服务端，
+        # 避免出现"active 指向 B、进程跑着 A"的假象（BUG-2-8）。
         if old is not None: atomic(ROOT / 'frpc.toml', old.decode('utf-8'))
+        set_current(previous if previous else '')
         mark_hash('frpc'); set_pending(False)
+        restarted = True
         try: service('frpc', 'restart')
-        except (ValueError, OSError): pass
-        result_error('切换到「' + new_label + '」后连接失败，已回退运行配置并恢复旧服务。',
-                     hint='请检查该服务端的地址/端口/token 与防火墙后重试，或重新切换到其他服务端。')
+        except (ValueError, OSError) as exc:
+            restarted = False
+            result_error('切换失败且旧服务未能重启：' + str(exc),
+                         hint='请手动执行「启动」，或从「备份与恢复配置」恢复。')
+        result_error('切换到「' + new_label + '」后连接失败，已回退到「' + old_label + '」。',
+                     hint='请检查该服务端的地址/端口/token 与防火墙后重试。'
+                          + ('' if restarted else '（旧服务重启失败，请手动启动）'))
         return
     result_ok(f'已切换到「{new_label}」。',
               detail=f'当前服务端：{old_label} → {new_label}；连接正常。')
@@ -944,8 +1022,9 @@ def _dim(text):
 _GOOD_WORDS = ('运行中', '已连接', '已启用', '启用', '成功', '可达', '正常', '在线',
                '已设置', '已保存', '已生效', '通过', '当前')
 _BAD_WORDS = ('已停止', '未运行', '已断开', '未连接', '停用', '失败', '不可达',
-              '异常', '离线', '未设置', '错误', '不通过', '未启用', '拒绝')
-_WARN_WORDS = ('连接中', '启动中', '停止中', '待确认', '未知', '部分', '等待', '重启中')
+              '异常', '离线', '未设置', '错误', '不通过', '未启用', '拒绝', '无法访问')
+_WARN_WORDS = ('连接中', '启动中', '停止中', '待确认', '待重启', '未选择', '未就绪', '未配置',
+               '未安装', '连接超时', '尚未生成', '未知', '部分', '等待', '重启中')
 
 def color_state(text):
     """Colour a status word by meaning; returns text unchanged when colour is off.
@@ -961,14 +1040,6 @@ def color_state(text):
         for w in sorted(words, key=len, reverse=True):
             if w in s: return '\033[1;' + code + 'm' + s + '\033[0m'
     return s
-
-def _state_color(text, good=None):
-    """Color a short state label; no-op when colors are off."""
-    if not UI_COLOR:
-        return text
-    if good is None:
-        good = text in ('运行中', '已连接', '运行中')
-    return '\033[1;' + ('32' if good else '31') + 'm' + text + '\033[0m'
 
 def _display_width(text):
     """Approximate terminal width: CJK/fullwidth count as 2; ANSI escapes as 0."""
@@ -996,7 +1067,16 @@ def _wrap_text(text, width):
         buf = ''
         used = 0
         last_break = -1  # index in buf of the last good break point
-        for ch in raw:
+        i = 0
+        while i < len(raw):
+            ch = raw[i]
+            # ANSI 转义序列不占显示宽度，整体原样带进 buf（着色后换行才不会错位）
+            if ch == '\033' and i + 1 < len(raw) and raw[i + 1] == '[':
+                end = raw.find('m', i + 2)
+                if end < 0: end = len(raw) - 1
+                buf += raw[i:end + 1]
+                i = end + 1
+                continue
             w = 2 if ord(ch) > 0x2E7F else 1
             if used + w > width and buf:
                 cut = last_break + 1 if last_break >= 0 else len(buf)
@@ -1008,6 +1088,7 @@ def _wrap_text(text, width):
             used += w
             if ch.isspace() or unicodedata.category(ch).startswith('P'):
                 last_break = len(buf) - 1
+            i += 1
         lines.append(buf)
     return lines
 
@@ -1041,7 +1122,9 @@ def ask(prompt, default=None, secret=False, example=None, allow_back=False, allo
     """
     hint = ''
     if example: hint += f'（例：{example}）'
-    if default: hint += f'（回车使用 {default}）'
+    if default:
+        hint += f'（回车使用 {default}）'
+        if allow_empty: hint += '（输入 - 清除）'
     elif allow_empty: hint += '（留空请直接回车）'
     if secret: hint += '（输入不回显）'
     if allow_back: hint += '（b 上一步）'
@@ -1062,10 +1145,14 @@ def ask(prompt, default=None, secret=False, example=None, allow_back=False, allo
         if allow_back and v in BACK_KEYS:
             return '__BACK__'
         if not v:
-            if allow_empty: return ''
+            # 默认值优先：提示里写着「回车使用 X」时，空行必须返回 X，
+            # 否则会出现「回车＝清空/禁用」的静默数据丢失（BUG-2-2）。
             if default is not None: return default
+            if allow_empty: return ''
             print('  ' + _tag('[提示]') + ' 此项不能为空，请重新输入。')
             continue
+        if allow_empty and v in ('-', 'clear', 'CLEAR'):
+            return ''
         return v
 
 def confirm(prompt, danger=False):
@@ -1097,10 +1184,17 @@ def _report(title, lines):
     for raw in lines:
         text = str(raw)
         low = text
-        if any(w in low for w in ('不可达', '失败', '异常', '未启用', '未通过')): mark = '✗ '
-        elif any(w in low for w in ('可达', '成功', '通过', '已设置')): mark = '✓ '
-        else: mark = ''
-        for line in _wrap_text(mark + text, inner - 2):
+        if any(w in low for w in ('不可达', '失败', '异常', '未启用', '未通过', '错误')):
+            mark, code = '✗ ', '31'
+        elif any(w in low for w in ('可达', '成功', '通过', '已设置', '正常', '在线')):
+            mark, code = '✓ ', '32'
+        elif any(w in low for w in ('建议', '注意', '警告', '未检测', '未就绪', '未配置')):
+            mark, code = '! ', '33'
+        else:
+            mark, code = '', ''
+        text = mark + text
+        if UI_COLOR and code: text = '\033[1;' + code + 'm' + text + '\033[0m'
+        for line in _wrap_text(text, inner - 2):
             print('│' + _pad_line(' ' + line, inner) + '│')
     print('└' + '─' * inner + '┘')
 
@@ -1130,46 +1224,53 @@ def result_error(message, hint=None, role=None):
 def choose(items, title='请选择', back_label='返回上一级', groups=None, prelude=None):
     """Numbered menu with optional visual group headers (numbering stays continuous).
 
-    统一交互规则（全程序唯一规范）：
-      0 或 空回车 → 返回上一级
-      q          → 退出程序
-      数字        → 执行对应操作
+    统一交互规则（全程序唯一，无冗余）：
+      0    → 返回上一级；主菜单中需**连按两次 0** 才退出（防误触，无弹窗打断）
+      数字 → 执行对应操作
+      回车 → 只重印提示行，不重绘、不返回
+      b    → 等同于 0（子菜单内）
     """
-    section(title)
-    if prelude is not None:
-        prelude()
-    idx = 0
-    for n, item in enumerate(items, 1):
-        if groups and (n - 1) in groups:
-            print()
-            print('  ' + groups[n - 1])
-        print(f'  {n}) {item}')
-        idx = n
-    print(f'  0) {back_label}')
-    if back_label in ('退出', '退出程序'):
-        print('  ' + _dim('0 = 退出程序    回车 = 刷新'))
-    else:
-        print('  ' + _dim(f'回车/0 = {back_label}'))
+    idx = len(items)
+    at_root = back_label in ('退出', '退出程序')
+    exit_armed = False   # 主菜单第一次按 0 只"上膛"，第二次才退出
+
+    def _draw():
+        section(title)
+        if prelude is not None:
+            prelude()
+        width = len(str(idx))
+        for n, item in enumerate(items, 1):
+            if groups and (n - 1) in groups:
+                print()
+                print('  ' + _dim(groups[n - 1]))
+            print(f'  {n:>{width}}) {item}')
+        print(f'  {0:>{width}}) {back_label}')
+        tail = '0 = 退出程序（连按两次）' if at_root else f'0 = {back_label}'
+        print('  ' + _dim(tail))
+
+    _draw()
     while True:
         try:
             v = input(f'\n  请选择 [0-{idx}]：')
         except EOFError:
             raise QuitProgram()
         v = v.strip()
-        at_root = back_label in ('退出', '退出程序')
-        # 统一规则：0 = 退一层（主菜单=退出程序）；空回车 = 退一层（主菜单=刷新）。
-        # 菜单层不再把 q 当作退出键（q 仅用于输入框取消本次操作）。
-        if v == '0':
-            # 主菜单的 0 会结束程序；先确认，避免从子菜单连按两次 0 误退出。
-            if at_root and not confirm('确认退出程序？'):
-                continue
+        if v == '0' or (v in BACK_KEYS and not at_root):
+            if at_root:
+                if not exit_armed:
+                    exit_armed = True
+                    print('  ' + _dim('再按一次 0 退出程序（按其他任意内容可取消）'))
+                    continue
+                return 0
             return 0
         if v == '':
-            if at_root: continue
-            return 0
+            exit_armed = False   # 回车是最常见的"取消"，必须一并解除退出待确认
+            print('  ' + _dim(f'可用键：1-{idx} 执行，0 = {back_label}'))
+            continue
+        exit_armed = False
         if v.isdecimal() and 0 <= int(v) <= idx:
             return int(v)
-        result_error('无效编号', f'请输入 0-{idx} 的数字；回车或 0 返回上一级。')
+        result_error('无效编号', f'请输入 0-{idx} 的数字；0 返回上一级，回车刷新提示。')
 
 def require_active():
     pid = active()
@@ -1186,12 +1287,17 @@ def list_profiles():
     ps = profiles()
     section('服务端列表')
     if not ps:
-        result_info('暂无服务端，请从主菜单「新建 frps 服务端」添加。')
+        result_info('暂无服务端，请从主菜单 4「新建服务端」添加。')
     else:
         for p in ps:
-            mark = ' [当前]' if p['id'] == active() else ''
-            try: conn = CONNECTION_STATES.get(connection(p['id'])['state'], '待确认')
-            except (ValueError, OSError, KeyError, TypeError): conn = '待确认'
+            is_active = p['id'] == active()
+            mark = ' ' + color_state('[当前]') if is_active else ''
+            # 非当前 profile 没有独立进程，显示"运行中"是假象（BUG-2-14）
+            if not is_active:
+                conn = '未运行'
+            else:
+                try: conn = CONNECTION_STATES.get(connection(p['id'])['state'], '待确认')
+                except (ValueError, OSError, KeyError, TypeError): conn = '待确认'
             print(f'  • {label(p)}{mark}  [{len(mappings(p["id"]))} 个映射]  ' + color_state(conn))
     print(RULE)
 
@@ -1245,6 +1351,8 @@ def profile_wizard():
                     # Step back into the main wizard's last field.
                     back = ask('Dashboard 用户名（留空关闭远程查询）', default=s['dashboard_username'], allow_back=True)
                     if back is None: return
+                    if back == '__BACK__':
+                        return   # 最外层再按 b：退出 Dashboard 子步骤，不能把哨兵值写进配置
                     s['dashboard_username'] = back
                     if not s['dashboard_username']:
                         p.pop('dashboard_addr', None); p.pop('dashboard_scheme', None)
@@ -1270,7 +1378,7 @@ def profile_wizard():
         return
     pid = create_profile(p, s)
     if not active() or confirm('设为当前服务端？'): switch(pid)
-    result_ok('服务端已创建。', detail=f'名称：{p["name"]}；地址：{p["server_addr"]}:{p["server_port"]}；端口映射请从主菜单「修改端口映射」单独设置。')
+    result_ok('服务端已创建。', detail=f'名称：{p["name"]}；地址：{p["server_addr"]}:{p["server_port"]}；端口映射请用主菜单 9「管理端口映射」添加。')
     if active() == pid and not running('frpc') and confirm('立即启动 frpc 并检查连接？'):
         service('frpc', 'start'); wait_connection(pid)
 
@@ -1327,6 +1435,26 @@ def _prune_backups(base):
     for path in drop:
         shutil.rmtree(str(path), ignore_errors=True)
 
+_BACKUP_REASONS = {
+    'change': '自动保存前快照',
+    'frpc-config': '写入客户端配置前',
+    'frps-change': '改动服务端配置前',
+    'pre-restore': '恢复配置前',
+    'pre-delete': '删除服务端前',
+    'upgrade': '升级前快照',
+}
+
+def backup_reason_text(reason):
+    """Human-readable backup reason (falls back to the raw code)."""
+    return _BACKUP_REASONS.get(str(reason), str(reason))
+
+def backup_time_text(raw):
+    """'20261115-230102' -> '2026-11-15 23:01'."""
+    s = str(raw)
+    if len(s) >= 13 and s[8:9] == '-' and s[:8].isdigit():
+        return f'{s[:4]}-{s[4:6]}-{s[6:8]} {s[9:11]}:{s[11:13]}'
+    return s
+
 def list_backups():
     """Return backup directories newest first, validated to live under ROOT/backups."""
     base = ROOT / 'backups'
@@ -1352,7 +1480,9 @@ def restore_backup(directory):
     if directory.is_symlink() or directory.resolve().parent != base: raise ValueError('备份路径非法')
     manifest = directory / 'manifest.json'
     if not manifest.exists(): raise ValueError('备份缺少 manifest.json，拒绝恢复')
-    files = read_json(manifest, {}).get('files') or []
+    manifest_data = read_json(manifest, {})
+    files = manifest_data.get('files') or []
+    digests = manifest_data.get('sha256') or {}
     if not files: raise ValueError('备份清单为空')
     restored = []
     with lock(), transaction():
@@ -1361,6 +1491,12 @@ def restore_backup(directory):
             if relative.is_absolute() or '..' in relative.parts: raise ValueError('备份清单包含非法路径')
             source = directory / relative
             if not source.is_file() or source.is_symlink(): raise ValueError('备份文件缺失：' + str(relative))
+            # 备份完整性校验：摘要不符说明文件被截断/篡改，拒绝写入（BUG-5-1）
+            expected = digests.get(str(relative)) or digests.get(relative.as_posix())
+            if expected:
+                actual = hashlib.sha256(source.read_bytes()).hexdigest()
+                if actual != expected:
+                    raise ValueError('备份文件校验失败（可能已损坏）：' + str(relative))
             target = ROOT / relative
             if not _within(target, ROOT): raise ValueError('目标路径非法')
             atomic(target, source.read_text(encoding='utf-8'))
@@ -1376,13 +1512,20 @@ def backup_menu():
     clear_screen()
     while True:
         items = list_backups()[:20]
-        labels = [f'{item["time"]}  {item["reason"]}  文件 {len(item["files"])} 个' for item in items]
-        if not items:
-            result_info('暂无备份可恢复。')
-            pause()
-            return
+        labels = [f'{backup_time_text(item["time"])}  {backup_reason_text(item["reason"])}  文件 {len(item["files"])} 个'
+                  for item in items]
+        labels.append('【立即创建一份手动备份】')
         n = choose(labels, '配置备份与恢复')
         if not n: return
+        if n == len(labels):
+            try:
+                directory = backup(managed_paths(), 'manual')
+                result_ok('已创建手动备份：', detail=str(directory))
+            except MENU_ERRORS as exc:
+                result_error('创建备份失败：' + str(exc))
+            pause(); continue
+        if not items:
+            result_info('暂无备份可恢复；可先创建一份手动备份。'); pause(); continue
         chosen = items[n-1]
         result_info('将恢复：' + str(chosen['path']), detail='\n'.join('• ' + r for r in chosen['files'][:20]))
         if not confirm('确认用此备份覆盖当前配置？当前文件会先再次备份'):
@@ -1391,7 +1534,7 @@ def backup_menu():
             backup(managed_paths(), 'pre-restore')
             restored = restore_backup(chosen['path'])
             result_ok(f'已恢复 {len(restored)} 个文件。')
-            if running('frps'): result_info('frps 正在运行；请确认后重启以使用恢复的配置。')
+            if running('frps'): result_info('frps ' + color_state('正在运行') + '；请确认后重启以使用恢复的配置。')
         except MENU_ERRORS as exc: result_error(str(exc))
         pause()
 
@@ -1438,7 +1581,7 @@ def diagnostics(role):
     ok = True
     lines.append('[诊断] ' + ('frps 服务端' if role == 'frps' else 'frpc 客户端'))
     state_value = service(role, 'status').strip().lower()
-    lines.append(f'  服务状态：{state_value or "未知"}')
+    lines.append('  服务状态：' + color_state(SERVICE_STATES.get(str(state_value).lower(), state_value or '未知')))
     if state_value not in ('active', 'started', 'running'): ok = False; lines.append('  建议：先启动服务，再执行诊断。')
     config = ROOT / (role + '.toml')
     if not config.exists(): ok = False; lines.append('  配置：不存在，请先完成配置。')
@@ -1505,8 +1648,10 @@ def save_mappings(pid, items, explicit=False):
         for m in items: validate_mapping(m)
         path = pdir(pid) / 'mappings.toml'; old = path.read_text(encoding='utf-8')
         backup([path]); atomic(path, toml({'schema_version': 1, 'mappings': items}))
-        try: mappings(pid); apply(pid)
-        except Exception: atomic(path, old); raise
+        # 只有当前服务端才允许覆写全局运行配置 frpc.toml；否则会把正在运行的
+        # 客户端配置换成另一个服务端的地址/token（BUG-2-1）。
+        # apply() 的校验失败必须抛出，由 transaction() 回滚（不能吞）。
+        if pid == active(): apply(pid)
         audit('mappings-saved', pid)
     result_ok('端口映射配置已保存。',
               detail=(f'映射数量：{before_count} → {len(items)}；'
@@ -1521,25 +1666,28 @@ def mapping_wizard(old=None):
     wizard (需求 §13.1 / 详细 §15.2(1)).
     """
     m = dict(old or {})
+    # 默认值必须取「当前值」，否则编辑既有映射时一路回车会把 tcp/udp、
+    # 本地地址、启用状态全部静默改掉（BUG-2-3）。
     fields = [
         ('name', '映射名称', None, lambda v: v),
-        ('type', '类型 tcp/udp/http/https', 'tcp', lambda v: v.lower()),
-        ('local_ip', '本地地址', '127.0.0.1', lambda v: v),
+        ('type', '类型 tcp/udp/http/https', m.get('type', 'tcp'), lambda v: v.lower()),
+        ('local_ip', '本地地址', m.get('local_ip', '127.0.0.1'), lambda v: v),
         ('local_port', '本地端口', None, port),
         ('remote_or_domain', '远程端口/域名', None, lambda v: v),
-        ('enabled', '启用？[Y/n]', 'y', lambda v: v.lower() != 'n'),
+        ('enabled', '启用？[Y/n]', 'y' if m.get('enabled', True) else 'n', lambda v: v.lower() != 'n'),
     ]
     while True:
         i = 0
         while i < len(fields):
             key, prompt, default, convert = fields[i]
             if key == 'remote_or_domain':
-                # 同一字段按类型含义不同，提示必须随之变化（UX-20）
+                # 同一字段按类型含义不同，提示与默认值都必须随之变化（UX-20 / BUG-2-3）
                 if m.get('type') in ('tcp', 'udp'):
                     prompt = '远程端口（1-65535，映射到 frps 后对外暴露的端口）'
+                    default = str(m['remote_port']) if m.get('remote_port') else None
                 else:
                     prompt = '域名（例 nas.example.com；需 frps 已配置 vhostHTTPPort/vhostHTTPSPort）'
-                default = None
+                    default = m.get('domain') or None
             value = ask(prompt, default=default if default is not None else m.get(key),
                         allow_back=(i > 0))
             if value is None: return None
@@ -1592,17 +1740,28 @@ def show_mappings(items, pid=None):
     section('当前服务端端口映射')
     online = _proxy_status_map(pid) if pid else {}
     rows = []
+    try:
+        prof = load_profile(pid) if pid else {}
+    except (ValueError, OSError, KeyError, TypeError):
+        prof = {}
+    server_addr = str(prof.get('server_addr', '') or '')
     for n, m in enumerate(items, 1):
         local = f'{m.get("local_ip", "127.0.0.1")}:{m["local_port"]}'
-        if m['type'] in ('tcp', 'udp'): remote = str(m.get('remote_port', '-'))
-        else: remote = m.get('domain', '-')
+        if m['type'] in ('tcp', 'udp'):
+            remote = str(m.get('remote_port', '-'))
+            external = (server_addr + ':' + remote) if server_addr and remote != '-' else '-'
+        else:
+            remote = m.get('domain', '-')
+            scheme = 'https' if m['type'] == 'https' else 'http'
+            external = (scheme + '://' + remote) if remote != '-' else '-'
         enabled = '启用' if m.get('enabled', True) else '停用'
         if not m.get('enabled', True): state = '停用'
         elif not online: state = '—'
         else: state = '在线' if online.get(str(m.get('name', ''))) else '未就绪'
-        rows.append([n, m['name'][:18], m['type'], local, remote, color_state(enabled), color_state(state)])
-    print(_table(['序号', '名称', '类型', '本地地址', '远端', '启用', '状态'],
-                 rows, [6, 20, 6, 22, 20, 6, 8]))
+        rows.append([n, m['name'][:16], m['type'], local, remote, external[:26],
+                     color_state(enabled), color_state(state)])
+    print(_table(['序号', '名称', '类型', '本地地址', '远端', '外部地址', '启用', '状态'],
+                 rows, [6, 18, 6, 20, 14, 28, 6, 8]))
     if not online:
         result_info('（映射在线状态需 frpc 运行且本机管理端口可访问，当前无法读取）')
     print(RULE)
@@ -1631,7 +1790,9 @@ def mapping_menu():
                 elif n == 4:
                     old_state = items[index-1].get('enabled', True)
                     items[index-1]['enabled'] = not old_state
-                    result_info('已切换映射状态：' + ('启用 → 停用' if old_state else '停用 → 启用') + '。')
+                    result_info('已切换映射状态：'
+                                + color_state('启用' if old_state else '停用') + ' → '
+                                + color_state('停用' if old_state else '启用') + '。')
                 elif n == 5:
                     name = items[index-1]['name']
                     if not confirm('确认删除映射 ' + name + '？此操作不可撤销', danger=True):
@@ -1650,7 +1811,7 @@ def profile_summary(p, s):
     print('  业务端口：' + str(p['server_port']))
     print('  Dashboard：' + color_state(('已启用，端口 ' + str(p.get('dashboard_port', 7500))) if web_user else '未启用'))
     print('  TLS：' + color_state('已启用' if p.get('tls_enable', True) else '未启用'))
-    print('  token：' + ('已设置' if s.get('token') else '未设置'))
+    print('  token：' + color_state('已设置' if s.get('token') else '未设置'))
     print('  本地管理端口：' + str(p.get('admin_port', 7400)))
     print('  映射数量：' + str(len(mappings(p['id'])) if p.get('id') else 0))
 
@@ -1677,10 +1838,16 @@ def edit_profile():
             return False
 
     while True:
+        # 标题里直接显示未保存状态，用户随时知道"还没保存"（UX-14）
+        title = label(p) + ('（有未保存修改）' if is_dirty() else '')
         try:
-            n = choose(['查看连接配置', '修改服务端名称', '修改服务器地址', '修改服务器端口', '修改 token', '修改 TLS 配置', '修改 Dashboard/API', '修改传输协议', '修改日志级别与保留天数', '保存并返回', '删除当前服务端及全部映射'], label(p))
-        except QuitProgram:
-            # 未保存修改在退出前必须确认，否则整段编辑静默丢失（UX-08）
+            n = choose(['查看连接配置', '修改服务端名称', '修改服务器地址', '修改服务器端口',
+                        '修改 token', '修改 TLS 配置', '修改 Dashboard/API', '修改传输协议',
+                        '修改日志级别与保留天数', '保存并返回', '删除当前服务端（危险）'],
+                       title)
+        except (QuitProgram, KeyboardInterrupt):
+            # 未保存修改在退出前必须确认，否则整段编辑静默丢失（UX-08）；
+            # Ctrl-C 走的是 KeyboardInterrupt，必须一并处理（BUG-4-5）。
             if is_dirty() and not confirm('有未保存的修改，确认退出并放弃？'): continue
             raise
         if not n:
@@ -1703,17 +1870,20 @@ def edit_profile():
         elif n == 5:
             store(s, 'token', ask('新 token（留空清除）', secret=True, allow_empty=True))
         elif n == 6:
-            v = ask('启用 TLS？[Y/n]', 'y')
+            # 默认值必须反映当前设置，否则回车会把 tls_enable=False 静默打开（BUG-2-4）
+            v = ask('启用 TLS？[Y/n]', 'y' if p.get('tls_enable', True) else 'n')
             if v is not None:
                 p['tls_enable'] = v.lower() != 'n'
                 for key in ('certFile', 'keyFile', 'trustedCaFile'):
                     store(s, 'tls_' + key, ask('可选 ' + key + ' 路径', s.get('tls_' + key, ''), allow_empty=True))
         elif n == 7:
-            v = ask('Dashboard/API 端口', '7500')
+            v = ask('Dashboard/API 端口', str(p.get('dashboard_port', 7500)))
             if v is not None:
                 field(lambda: p.__setitem__('dashboard_port', port(v)))
-                store(p, 'dashboard_addr', ask('Dashboard 主机', p['server_addr'], allow_empty=True))
-                store(s, 'dashboard_username', ask('Dashboard 用户名（留空关闭）', allow_empty=True))
+                store(p, 'dashboard_addr', ask('Dashboard 主机', p.get('dashboard_addr', p['server_addr']),
+                                               allow_empty=True))
+                store(s, 'dashboard_username', ask('Dashboard 用户名（输入 - 关闭远程查询）',
+                                                   s.get('dashboard_username', ''), allow_empty=True))
                 if s.get('dashboard_username'):
                     store(s, 'dashboard_password', ask('密码', secret=True, allow_empty=True))
                 else:
@@ -2003,7 +2173,13 @@ def save_frps_config(data, restart=True):
         atomic(ROOT / 'frps.toml', content); mark_hash('frps')
     if restart and running('frps') and confirm('配置已保存，重启 frps 生效？'):
         outcome = restart_safely('frps')
-        if outcome == 'restarted' and not running('frps'):
+        if outcome == 'cancelled':
+            result_info('frps 配置已保存；未重启，将在下次重启后生效。')
+            return
+        if outcome == 'scheduled':
+            result_info('frps 配置已保存；已排期后台重启，稍后生效。')
+            return
+        if not running('frps'):
             raise ValueError('frps 重启失败；已保留新配置，请查看日志并恢复备份')
         result_ok('frps 配置已保存并生效。')
     else:
@@ -2080,7 +2256,7 @@ def frps_config_menu():
                 save_frps_config(data)
             elif n == 5:
                 for key in ('vhostHTTPPort', 'vhostHTTPSPort'):
-                    value = ask(key + '（留空禁用）', str(data.get(key, '')), allow_empty=True)
+                    value = ask(key + '（回车保留，输入 - 禁用）', str(data.get(key, '')), allow_empty=True)
                     if value is None: break
                     if value: data[key] = port(value)
                     else: data.pop(key, None)
@@ -2088,7 +2264,7 @@ def frps_config_menu():
                     save_frps_config(data)
             elif n == 6:
                 for key in ('kcpBindPort', 'quicBindPort', 'tcpmuxHTTPConnectPort'):
-                    value = ask(key + '（留空禁用）', str(data.get(key, '')), allow_empty=True)
+                    value = ask(key + '（回车保留，输入 - 禁用）', str(data.get(key, '')), allow_empty=True)
                     if value is None: break
                     if value: data[key] = port(value)
                     else: data.pop(key, None)
@@ -2171,8 +2347,10 @@ def server_clients():
     online_c = sum(1 for c in clients if c.get('online'))
     online_p = sum(1 for x in proxies if str(x.get('status', {}).get('phase', '')).lower() in ('online', 'running'))
     section('客户端连接概览')
-    print(_kv('客户端', f'{len(clients)} 个（在线 {online_c}，离线 {len(clients) - online_c}）'))
-    print(_kv('代理', f'{len(proxies)} 个（在线 {online_p}，未就绪 {len(proxies) - online_p}）'))
+    print(_kv('客户端', '{0} 个（{1}，{2}）'.format(
+        len(clients), color_state('在线 %d' % online_c), color_state('离线 %d' % (len(clients) - online_c)))))
+    print(_kv('代理', '{0} 个（{1}，{2}）'.format(
+        len(proxies), color_state('在线 %d' % online_p), color_state('未就绪 %d' % (len(proxies) - online_p)))))
     print(RULE)
     if not clients and not proxies:
         result_info('暂无客户端连接。'); return
@@ -2195,10 +2373,13 @@ def server_clients():
             if more.strip() == '0': break
     if proxies:
         section('代理状态')
+        phase_map = {'online': '在线', 'running': '在线', 'offline': '离线',
+                     'new': '新建', 'waiting': '等待中', 'start': '启动中',
+                     'closed': '已关闭', 'error': '异常'}
         for n, item in enumerate(proxies[:20], 1):
             status = item.get('status', {})
             phase = str(status.get('phase', '未知'))
-            phase_text = color_state('在线' if phase.lower() in ('online', 'running') else phase)
+            phase_text = color_state(phase_map.get(phase.lower(), phase))
             print(f'  {n}. {item.get("name", "未知")} [{phase_text}] 类型={item.get("spec", {}).get("type", "未知")}')
             print('     今日流量：入 {0} / 出 {1}，连接数 {2}'.format(
                 _human_bytes(status.get('todayTrafficIn', 0)),
@@ -2218,7 +2399,6 @@ def import_external(role):
     if s.get(role + '_hash') == digest: return
     result_info('检测到外部运行配置修改。')
     n = choose(['导入外部修改', '保留管理器配置', '查看变更字段（隐藏敏感值）'], '配置同步')
-    if n is None: raise ValueError('已取消；外部文件保持原样')
     if n == 0: return
     config = read_toml(path) if n != 2 else {}
     if n == 3:
@@ -2338,16 +2518,18 @@ def status_bar(role, data):
             except (ValueError, OSError, KeyError, TypeError): count = '映射数未知'
             parts += [label(profile), color_state(translated), count]
         else:
-            parts.append('未选择服务端' if not data.get('profile_error') else '配置异常')
+            parts.append(color_state('未选择服务端' if not data.get('profile_error') else '配置异常'))
     if data.get('pending'):
-        parts.append('有待重启修改')
+        parts.append(color_state('有待重启修改'))
     print('  ' + ' | '.join(str(p) for p in parts if p))
 
 def _status_body(role, data):
-    """Print the status fields and the 'needs attention' list (no title)."""
+    """Print the compact status fields and the 'needs attention' list (no title).
+
+    只保留 4-5 行：版本号与配置路径对终端用户价值低，却每次占 2 行，
+    会把 24 行 SSH 窗口里的「启动/停止」挤出屏幕；它们放在诊断/升级里查看即可。
+    """
     print(_kv('状态', color_state(SERVICE_STATES.get(str(data['service_state']).lower(), data['service_state']))))
-    print(_kv('版本', data['version']))
-    print(_kv('配置文件', data['config_path']))
     if role == 'frps':
         path = ROOT / 'frps.toml'
         if path.exists():
@@ -2364,7 +2546,7 @@ def _status_body(role, data):
                 if web.get('addr', '127.0.0.1') in ('127.0.0.1', '::1'):
                     print(_kv('管理访问', '仅本机'))
             else: print(_kv('Dashboard', color_state('未启用')))
-        else: print(_kv('状态说明', '尚未生成配置，请先修改服务端配置'))
+        else: print(_kv('状态说明', color_state('尚未生成配置，请先修改服务端配置')))
     else:
         p = data.get('active_profile')
         if p:
@@ -2373,7 +2555,7 @@ def _status_body(role, data):
             print(_kv('连接状态', color_state(CONNECTION_STATES.get(connection_data['state'], connection_data['state']))))
             try: print(_kv('映射数量', str(len(mappings(p['id'])))))
             except (ValueError, OSError, KeyError, TypeError): print(_kv('映射数量', '不可读'))
-            if data.get('pending'): print(_kv('生效', '有修改等待重启'))
+            if data.get('pending'): print(_kv('生效', color_state('有修改等待重启')))
     # Surface only what needs attention; normal details stay compact.
     concerns = []
     state = str(data['service_state']).lower()
@@ -2385,13 +2567,13 @@ def _status_body(role, data):
             concerns.append('连接未就绪（' + CONNECTION_STATES.get(conn, conn) + '）：检查 token / TLS / 服务端可达性')
         if data.get('profile_error'):
             concerns.append('当前服务端配置损坏：' + str(data['profile_error']) + '；可从「备份与恢复配置」恢复或重新选择服务端')
-        if data.get('pending'):
-            concerns.append('有配置修改等待重启后生效')
+        # 「生效：有修改等待重启」已在上面一行显示，这里不再重复（避免同一事实出现两次）
     if concerns:
         print()
         head = '\033[1;31m需关注\033[0m' if UI_COLOR else '需关注'
         print('  ' + head + '（以下事项需要处理）：')
-        for c in concerns: print('    - ' + c)
+        for c in concerns:
+            print('    - ' + color_state(c) if UI_COLOR else '    - ' + c)
 
 def show_status(role, data=None):
     """Render a standalone status screen (title + body + rule)."""
@@ -2428,18 +2610,22 @@ def schedule_detached_restart(role, delay=2):
     subprocess.Popen(['/bin/sh', '-c', script],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
-    # 重启已排期：pending 立刻清掉，否则「有修改等待重启」会一直显示
-    # （延迟重启走的是独立进程，不会再经过 service() 的清 pending 逻辑）。
-    if role == 'frpc':
-        set_pending(False)
+    # 不在这里清 pending：重启尚未真正发生，提前清会把"未生效"误标成"已生效"。
+    # 进程真正重启后，refresh_pending() 会依据「进程启动时间 > 配置修改时间」自动清除。
     audit('service-restart-scheduled')
 
 def _has_enabled_mappings():
-    """True when any profile has an enabled mapping (a tunnel may be in use)."""
+    """True when the ACTIVE profile has an enabled mapping (a tunnel may be in use).
+
+    只看当前运行的 profile：非当前 profile 的映射不会影响本次重启。
+    读取失败时保守返回 True，宁可多问一次"延迟重启"也不要切断 SSH（BUG-4-1）。
+    """
+    pid = active()
+    if not pid: return False
     try:
-        return any(m.get('enabled', True) for p in profiles() for m in mappings(p['id']))
+        return any(m.get('enabled', True) for m in mappings(pid))
     except (ValueError, OSError, KeyError, TypeError):
-        return False
+        return True
 
 def restart_safely(role, delay=2):
     """Restart with an SSH-tunnel-safe path.
@@ -2473,7 +2659,8 @@ def service_feedback(role, action):
     if state_value in expected:
         result_ok(f'{labels[action]}成功：当前状态为 {"运行中" if action != "stop" else "已停止"}。')
     else:
-        result_error(f'{labels[action]}请求已发送，但当前服务状态为：{state_value or "未知"}。请查看日志。')
+        result_error(f'{labels[action]}请求已发送，但当前服务状态为：'
+                     + color_state(SERVICE_STATES.get(str(state_value).lower(), state_value or '未知')) + '。请查看日志。')
     return state_value
 
 def main_menu(role):
@@ -2610,7 +2797,11 @@ def show_all_mappings():
     section('所有服务端的端口映射')
     total = 0
     for p in ps:
-        rows = mappings(p['id'])
+        try:
+            rows = mappings(p['id'])
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            print('  ' + label(p) + '  ' + color_state('映射不可读：' + str(exc)))
+            continue
         total += len(rows)
         mark = ' [当前]' if p['id'] == active() else ''
         print('  ' + label(p) + mark + f'（{len(rows)} 条）')
@@ -2737,7 +2928,8 @@ def autostart(role):
         label = '启用' if n == 1 else '取消'
     service(role, action)
     current = service(role, 'status')
-    result_ok(f'已设置 {role} 启动类型为「{label}」；当前运行状态：{current or "未知"}。')
+    result_ok(f'已设置 {role} 启动类型为「{label}」；当前运行状态：'
+              + color_state(SERVICE_STATES.get(str(current).lower(), current or '未知')) + '。')
     return True
 
 def _clear_runtime_state():
@@ -2756,10 +2948,10 @@ def _after_profile_removed(was_active):
     if remaining:
         names = '、'.join(p['name'] for p in remaining)
         result_info('已删除当前服务端。剩余服务端：' + names,
-                    detail='请从主菜单「切换服务端」选择一个，或「新建 frps 服务端」。')
+                    detail='请用主菜单 6「切换服务端」选择一个，或 4「新建服务端」。')
     else:
         result_info('已删除当前服务端，当前没有可用服务端。',
-                    detail='请从主菜单「新建 frps 服务端」创建后再启动 frpc。')
+                    detail='请先用主菜单 4「新建服务端」创建，再回到 1「启动」。')
 
 def delete_profile_id(pid):
     p = load_profile(pid)
@@ -2768,17 +2960,26 @@ def delete_profile_id(pid):
     # second one never leaves frpc stopped (LOGIC-2).
     if was_active and running('frpc'):
         if not confirm('删除当前服务端将停止 frpc，确认继续？', danger=True): return
-    if not confirm('删除 ' + label(p) + ' 及其全部端口映射？此操作不额外备份，不可撤销',
-                   danger=True): return
-    if was_active and running('frpc'): service('frpc', 'stop')
+    if not confirm('删除 ' + label(p) + ' 及其全部端口映射？删除前会自动备份，可从「备份与恢复配置」恢复。'
+                   '确认继续？', danger=True): return
+    was_frpc_running = bool(was_active and running('frpc'))
     with lock(), transaction():
         folder = pdir(pid)
+        # 删除前留一份快照，让"撤销"有真实落点（UX-13）
+        try:
+            backup([folder / 'profile.toml', folder / 'secrets.toml', folder / 'mappings.toml'], 'pre-delete')
+        except (ValueError, OSError):
+            pass
         if folder.parent != ROOT / 'profiles': raise ValueError('删除路径错误')
         shutil.rmtree(folder)
         if was_active:
             set_current(''); unlink_quiet(ROOT / 'frpc.toml')
             _clear_runtime_state()
         rebuild_index(); audit('profile-deleted')
+    # 事务成功后才停服务：万一事务失败，也不会留下"服务已停但配置还在"的半状态（BUG-2-13）
+    if was_frpc_running:
+        try: service('frpc', 'stop')
+        except (ValueError, OSError): pass
     _after_profile_removed(was_active)
 
 def mapping_command(argv, flags=None):
@@ -2800,6 +3001,10 @@ def mapping_command(argv, flags=None):
         if len(argv) < 2: raise ValueError('需要映射名称：mapping ' + action + ' <name>')
         name_arg = argv[1]; index = next((i for i, item in enumerate(items) if item['name'] == name_arg), None)
         if index is None: err('E012', '映射不存在：' + name_arg)
+        # 非交互环境（管道/脚本）必须显式 --yes，否则不能"确认失败后静默成功退出"（BUG-2-7）
+        skip_confirm = bool(flags.get('yes'))
+        if not TEST and not skip_confirm and not sys.stdin.isatty():
+            err('E015', '非交互环境下的写操作需要 --yes 明确授权。')
         if action == 'edit':
             edited = mapping_wizard(items[index])
             if edited is None: return
@@ -2807,7 +3012,7 @@ def mapping_command(argv, flags=None):
         elif action == 'enable': items[index]['enabled'] = True
         elif action == 'disable': items[index]['enabled'] = False
         elif action == 'delete':
-            if not confirm('确认删除映射 ' + name_arg + '？此操作不可撤销', danger=True): return
+            if not skip_confirm and not confirm('确认删除映射 ' + name_arg + '？此操作不可撤销', danger=True): return
             items.pop(index)
         save_mappings(pid, items, explicit=explicit); return
     if action == 'menu': mapping_menu(); return
@@ -2920,11 +3125,16 @@ def _latest_manager_version(mirror):
         err('E017', '镜像站返回了非法的最新版本号：' + version)
     return version
 
+# 与 upgrade() 实际写入范围保持一致（含 bin/ 与 templates/），否则回滚不完整（BUG-2-10）
 UPGRADE_FILES = (
     'lib/manager.py', 'lib/download.sh', 'install-common.sh',
     'install-frps.sh', 'install-frpc.sh', 'install-windows.ps1',
     'install-frps.ps1', 'install-frpc.ps1', 'uninstall.sh',
     'uninstall-frps.ps1', 'uninstall-frpc.ps1', 'uninstall-windows.ps1',
+    'bin/frps', 'bin/frpc', 'bin/frps.ps1', 'bin/frpc.ps1',
+    'bin/frps.cmd', 'bin/frpc.cmd',
+    'templates/frps.service', 'templates/frpc.service',
+    'templates/frps.openrc', 'templates/frpc.openrc', 'templates/frpc.plist',
 )
 
 def upgrade_snapshot():
@@ -3079,8 +3289,10 @@ def refresh_units(roles=None, yes=False):
             directory.mkdir(parents=True, mode=0o700)
             if old is not None:
                 (directory / (role + '.service.old')).write_bytes(old)
+            # manifest 记录的必须是磁盘上真实存在的文件名（BUG-2-11）
             atomic(directory / 'manifest.json', json.dumps(
-                {'files': [role], 'reason': 'unit-refresh'}, ensure_ascii=False, indent=2) + '\n')
+                {'files': [(role + '.service.old')] if old is not None else [],
+                 'reason': 'unit-refresh'}, ensure_ascii=False, indent=2) + '\n')
         except OSError: pass
     reload_note = ''
     if refreshed:
@@ -3230,6 +3442,9 @@ def _parse_flags(argv):
             # Normalize flag key: strip leading dashes, and map '-'-joined
             # names to '_' so readers can use a single stable key.
             flags[item.lstrip('-').replace('-', '_')] = True; i += 1; continue
+        if item.startswith('-') and item != '-':
+            # 未知参数必须报错，否则 `frpc start --bogus` 会被静默接受（BUG-1-1）
+            raise ValueError('未知参数：' + item + '；可用参数：' + ', '.join(CLI_FLAGS))
         args.append(item); i += 1
     return args, flags
 

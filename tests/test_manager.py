@@ -133,7 +133,7 @@ class ManagerTests(unittest.TestCase):
     def test_server_menu_refreshes_once_and_hides_secrets(self):
         m.atomic(m.ROOT / 'frps.toml', m.toml({'bindPort':7000,'auth.token':'do-not-print-token','webServer.addr':'127.0.0.1','webServer.port':7500,'webServer.user':'admin','webServer.password':'do-not-print-password'}))
         output=io.StringIO()
-        with contextlib.redirect_stdout(output), patch('builtins.input', side_effect=['0','y']): m.main_menu('frps')
+        with contextlib.redirect_stdout(output), patch('builtins.input', side_effect=['0','0']): m.main_menu('frps')
         shown=output.getvalue()
         self.assertEqual(shown.count('frps 服务端操作'), 1)
         self.assertIn('状态', shown); self.assertIn('监听', shown); self.assertIn('0.0.0.0:7000', shown)
@@ -146,9 +146,9 @@ class ManagerTests(unittest.TestCase):
     def test_frpc_menu_labels_and_json_status(self):
         pid=self.create();m.set_current(pid)
         output=io.StringIO()
-        with contextlib.redirect_stdout(output), patch('builtins.input', side_effect=['0','y']): m.main_menu('frpc')
+        with contextlib.redirect_stdout(output), patch('builtins.input', side_effect=['0','0']): m.main_menu('frpc')
         shown=output.getvalue();self.assertEqual(shown.count('frpc 客户端操作'),1)
-        self.assertIn('状态', shown); self.assertIn('版本', shown)
+        self.assertIn('状态', shown); self.assertIn('连接状态', shown)
         self.assertIn('生产服务器（[::1]:7000）',shown)
         self.assertIn('连接状态', shown); self.assertIn('已停止', shown);self.assertNotIn('"component"',shown)
         output=io.StringIO()
@@ -156,7 +156,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue())['component'],'frpc')
     def test_frps_status_independent_of_broken_client_profile(self):
         m.save_json(m.ROOT/'state.json',{'active_profile_id':'invalid'})
-        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', side_effect=['0','y']):m.main_menu('frps')
+        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', side_effect=['0','0']):m.main_menu('frps')
     def test_unicode_name_and_unique_rename(self):
         pid = self.create(); self.assertIn('[::1]:7000', m.label(m.load_profile(pid)))
         with self.assertRaises(ValueError): self.create()
@@ -209,9 +209,12 @@ class ManagerTests(unittest.TestCase):
         # 统一交互：空回车=返回(0)，0=返回，q=退出程序，非法值重试
         with patch('builtins.input', side_effect=['-1', 'text', '999', '1']):
             self.assertEqual(m.choose(['x']), 1)
-    def test_choose_blank_and_zero_mean_back(self):
-        with patch('builtins.input', side_effect=['']): self.assertEqual(m.choose(['x']), 0)
+    def test_choose_zero_means_back(self):
+        # 统一交互：0 = 返回上一级
         with patch('builtins.input', side_effect=['0']): self.assertEqual(m.choose(['x']), 0)
+    def test_choose_blank_refreshes_then_zero_returns(self):
+        # 回车 = 刷新菜单（不再等同于返回），之后按 0 才返回
+        with patch('builtins.input', side_effect=['', '0']): self.assertEqual(m.choose(['x']), 0)
     def test_choose_q_is_invalid_not_quit(self):
         # 菜单层 q 已不再作为退出键：视为无效输入后重试，按 0 返回
         with patch('builtins.input', side_effect=['q', '0']):
@@ -436,7 +439,7 @@ class ManagerTests(unittest.TestCase):
         self.assertIsNone(json.loads(out.getvalue())['active_profile'])
     def test_main_menu_survives_broken_profile(self):
         m.save_json(m.ROOT / 'state.json', {'active_profile_id': 'invalid'})
-        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', side_effect=['0','y']):
+        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', side_effect=['0','0']):
             m.main_menu('frpc')  # must not raise UnboundLocalError
 
     # ---- Transaction / lock / robustness ----
@@ -547,7 +550,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(calls, [])  # no second status() / API probe
     def test_menu_status_action_pauses(self):
         m.atomic(m.ROOT / 'frps.toml', m.toml({'bindPort': 7000}))
-        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', side_effect=['1', '0', 'y']), \
+        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', side_effect=['1', '0', '0']), \
              patch.object(m, 'service', return_value='active'), patch.object(m, 'pause') as paused:
             m.main_menu('frps')
         self.assertGreaterEqual(paused.call_count, 1)
@@ -834,7 +837,7 @@ class ManagerTests(unittest.TestCase):
              patch.object(m, 'running', return_value=False):
             m.delete_profile_id(pid)
         self.assertEqual(m.profiles(), [])
-        self.assertIn('新建 frps 服务端', out.getvalue())
+        self.assertIn('新建服务端', out.getvalue())
 
     # ---- FLOW F1: switch must compensate on start failure ----
     def test_switch_start_failure_restores_old_runtime(self):
@@ -899,7 +902,7 @@ class ManagerTests(unittest.TestCase):
     def test_status_bar_survives_broken_mappings_file(self):
         pid = self.create(); m.set_current(pid)
         (m.pdir(pid) / 'mappings.toml').write_text('this is not toml\n')
-        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', side_effect=['0','y']):
+        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', side_effect=['0','0']):
             m.main_menu('frpc')  # must not raise / exit
     def test_broken_profile_reports_config_error(self):
         m.save_json(m.ROOT / 'state.json', {'active_profile_id': 'deadbeefdeadbeefdeadbeef'})
@@ -1214,7 +1217,7 @@ class ManagerTests(unittest.TestCase):
         self.assertIn('共 2 个服务端、2 条映射', shown)
     def test_main_menu_new_numbering(self):
         out = io.StringIO()
-        with patch('builtins.input', side_effect=['0','y']), contextlib.redirect_stdout(out):
+        with patch('builtins.input', side_effect=['0','0']), contextlib.redirect_stdout(out):
             m.main_menu('frpc')
         shown = out.getvalue()
         self.assertIn('1) 启动', shown)
@@ -1225,12 +1228,13 @@ class ManagerTests(unittest.TestCase):
         self.assertIn('0 = 退出程序', shown)
 
     # ---- 切换服务端 / pending 修复 ----
-    def test_detached_restart_clears_pending(self):
+    def test_detached_restart_keeps_pending_until_process_restarts(self):
+        # 重启尚未真正发生，不能提前清 pending；进程重启后由 refresh_pending 校正
         m.save_json(m.ROOT / 'state.json', {'active_profile_id': '', 'pending': True})
         with patch.object(m, '_restart_command', return_value=['systemctl','restart','frpc']), \
              patch.object(m.subprocess, 'Popen'), patch.object(m, 'audit'):
             m.schedule_detached_restart('frpc')
-        self.assertFalse(m.state()['pending'])
+        self.assertTrue(m.state()['pending'])
     def test_refresh_pending_clears_when_process_is_newer(self):
         pid = self.create(); m.set_current(pid)
         m.save_json(m.ROOT / 'state.json', {'active_profile_id': pid, 'pending': True})
@@ -1284,5 +1288,67 @@ class ManagerTests(unittest.TestCase):
             m.switch(b)
         self.assertEqual((m.ROOT / 'frpc.toml').read_bytes(), before)
         self.assertEqual(m.active(), a)
+
+    # ---- 第三轮审查修复回归 ----
+    def test_save_mappings_for_non_active_does_not_touch_runtime_config(self):
+        a = self.create('A'); b = self.create('B'); m.set_current(a); m.apply(a)
+        runtime_before = (m.ROOT / 'frpc.toml').read_bytes()
+        with patch.object(m, 'running', return_value=True):
+            m.save_mappings(b, [self.mapping()], explicit=True)
+        self.assertEqual((m.ROOT / 'frpc.toml').read_bytes(), runtime_before)
+        self.assertEqual(m.active(), a)
+        self.assertEqual(len(m.mappings(b)), 1)
+    def test_ask_blank_uses_default_even_when_allow_empty(self):
+        # BUG-2-2: 提示写着「回车使用 X」时空行必须返回 X，不能清空
+        with patch('builtins.input', side_effect=['']):
+            self.assertEqual(m.ask('端口', '8080', allow_empty=True), '8080')
+        # 显式清除需要输入 -
+        with patch('builtins.input', side_effect=['-']):
+            self.assertEqual(m.ask('端口', '8080', allow_empty=True), '')
+    def test_mapping_wizard_keeps_current_values_on_enter(self):
+        old = {'name': 'keep', 'type': 'udp', 'local_ip': '192.168.1.5', 'local_port': 53,
+               'remote_port': 6000, 'enabled': False}
+        with patch('builtins.input', side_effect=['', '', '', '', '', '']), \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = m.mapping_wizard(old)
+        self.assertEqual(result['type'], 'udp')
+        self.assertEqual(result['local_ip'], '192.168.1.5')
+        self.assertFalse(result['enabled'])
+        self.assertEqual(result['remote_port'], 6000)
+    def test_openrc_status_is_normalized(self):
+        fake = type('R', (), {'returncode': 0, 'stdout': ' * status: started\n', 'stderr': ''})()
+        with patch.object(m.os, 'name', 'posix'), patch.object(m.sys, 'platform', 'linux'), \
+             patch.object(m.shutil, 'which', side_effect=lambda x: '/usr/sbin/' + x if x == 'rc-service' else None), \
+             patch.object(m, 'run_cmd', return_value=fake), patch.object(m, 'TEST', False):
+            self.assertEqual(m.service('frpc', 'status'), 'started')
+    def test_parse_etime_variants(self):
+        self.assertEqual(m._parse_etime('05:30'), 330)
+        self.assertEqual(m._parse_etime('1:02:03'), 3723)
+        self.assertEqual(m._parse_etime('2-03:04:05'), 183845)
+        self.assertIsNone(m._parse_etime(''))
+    def test_service_uptime_falls_back_to_etime(self):
+        etimes_fail = type('R', (), {'returncode': 1, 'stdout': '', 'stderr': 'etimes: keyword not found'})()
+        etime_ok = type('R', (), {'returncode': 0, 'stdout': '10:00\n', 'stderr': ''})()
+        with patch.object(m, '_service_pid', return_value='123'), \
+             patch.object(m, 'run_cmd', side_effect=[etimes_fail, etime_ok]):
+            self.assertEqual(m.service_uptime('frpc'), 600)
+    def test_has_enabled_mappings_ignores_other_profiles(self):
+        a = self.create('A'); b = self.create('B'); m.set_current(a)
+        with patch.object(m, 'apply'):
+            m.save_mappings(b, [self.mapping()], explicit=True)
+        self.assertFalse(m._has_enabled_mappings())   # B 有映射但 A 没有
+    def test_restore_backup_rejects_corrupted_file(self):
+        pid = self.create(); m.set_current(pid); m.apply(pid)
+        directory = m.backup(m.managed_paths(), 'corrupt-test')
+        import json as _json
+        manifest = _json.loads((directory / 'manifest.json').read_text())
+        target_rel = manifest['files'][0]
+        (directory / target_rel).write_bytes(b'corrupted')
+        with self.assertRaises(ValueError):
+            m.restore_backup(directory)
+    def test_unknown_cli_flag_is_rejected(self):
+        with patch.object(m, 'initialize'), patch.object(m.os, 'geteuid', return_value=0):
+            with self.assertRaises(ValueError):
+                m.run(['frpc', 'start', '--bogus'])
 
 if __name__ == '__main__': unittest.main()

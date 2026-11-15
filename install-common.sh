@@ -285,6 +285,7 @@ rollback_install() {
     fi
     echo '安装失败，已尝试恢复旧文件及先前运行状态；配置已保留。' >&2
   fi
+  [[ -n "${work:-}" && -d "$work" ]] && rm -rf -- "$work"
   exit "$exit_code"
 }
 trap rollback_install EXIT
@@ -316,10 +317,10 @@ else
   plist_label="frp-simple-bash.$component"
   plist_path="/Library/LaunchDaemons/$plist_label.plist"
   install -m 644 "$source_root/templates/$component.plist" "$plist_path"
-  # Load the service into launchd FIRST (bootstrap), then set the boot policy.
-  # enable/disable alone does NOT load the service; kickstart/print would fail
-  # with "Could not find service" without this step.
-  launchctl bootstrap "system" "$plist_path" >/dev/null 2>&1 || launchctl load "$plist_path" >/dev/null 2>&1 || true
+  # Only set the boot policy here. Do NOT bootstrap yet: the plist has
+  # RunAtLoad=true and the config does not exist until the wizard runs, so
+  # bootstrapping now would start frpc without a config (crash loop) and would
+  # also defeat --no-start. bootstrap happens after the config is verified.
   if ((autostart == 1)); then launchctl enable "system/$plist_label"; else launchctl disable "system/$plist_label"; fi
 fi
 if [[ ! -f "$config_root/$component.toml" ]]; then
@@ -331,9 +332,13 @@ if [[ -f "$config_root/$component.toml" ]]; then
     if ((start == 1)); then
       if [[ "$manager" == systemd ]]; then systemctl start "$component"
       elif [[ "$manager" == openrc ]]; then rc-service "$component" start
-      else launchctl kickstart "system/frp-simple-bash.$component"; fi
+      else
+        # launchd: load (bootstrap) only now that a valid config exists, then start.
+        launchctl bootstrap "system" "$plist_path" >/dev/null 2>&1 || launchctl load "$plist_path" >/dev/null 2>&1 || true
+        launchctl kickstart "system/frp-simple-bash.$component" >/dev/null 2>&1 || true
+      fi
     else
-      echo '服务已注册但按 --no-start 保持停止。'
+      echo '服务已注册但按 --no-start 保持停止（macOS 也不会 bootstrap 加载）。'
     fi
   else
     echo '配置校验失败，服务未启动。' >&2
@@ -342,4 +347,6 @@ if [[ -f "$config_root/$component.toml" ]]; then
 else echo '配置尚未创建，服务已注册但保持停止。'; fi
 install_ok=1
 trap - EXIT
+# 成功路径也要删临时目录：上面的 trap 已被替换/清除，原清理 trap 不会执行。
+[[ -n "${work:-}" && -d "$work" ]] && rm -rf -- "$work"
 printf '安装完成。输入 %s 打开数字菜单。防火墙只检测提示，请自行检查业务端口和映射端口规则。\n' "$component"

@@ -13,6 +13,10 @@ while (($#)); do
   esac
 done
 [[ "$(id -u)" == 0 ]] || { echo '需要 root 权限' >&2; exit 1; }
+# 参数合法性必须在任何删除动作之前校验，否则漏写 --yes 会留下「删了一半」的状态。
+if ((purge == 1 && yes == 0)); then
+  echo '--purge 必须同时提供 --yes，避免误删。' >&2; exit 2
+fi
 if ((yes == 0)); then
   read -r -p "卸载 $role（默认保留配置和日志）？输入 YES 确认：" answer
   [[ "$answer" == YES ]] || { echo '已取消。'; exit 0; }
@@ -55,7 +59,6 @@ native="/opt/frp-simple-bash/native/$role"
 [[ "$native" == /opt/frp-simple-bash/native/frps || "$native" == /opt/frp-simple-bash/native/frpc ]] || exit 1
 rm -f -- "$native"
 if ((purge == 1)); then
-  ((yes == 1)) || { echo '--purge 必须同时提供 --yes，避免误删。' >&2; exit 2; }
   other=$([[ "$role" == frps ]] && echo frpc || echo frps)
   config_root=/etc/frp
   [[ -d "$config_root" && -f "$config_root/state.json" ]] || { echo '配置目录不是本项目目录，拒绝清理。' >&2; exit 1; }

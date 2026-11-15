@@ -35,7 +35,7 @@ class ManagerTests(unittest.TestCase):
         clients={'total':1,'items':[{'hostname':'内网机器','clientID':'c1','version':'0.72.0','clientIP':'127.0.0.1','online':True,'status':{'proxyCount':2}}]}
         proxies={'total':1,'items':[{'name':'web','spec':{'type':'tcp'},'status':{'phase':'online','todayTrafficIn':1,'todayTrafficOut':2,'curConns':3}}]}
         with patch.object(m,'api',side_effect=[clients,proxies]), contextlib.redirect_stdout(io.StringIO()) as output: m.server_clients()
-        shown=output.getvalue();self.assertIn('内网机器 [在线]',shown);self.assertIn('代理数量=2',shown);self.assertIn('web [online]',shown);self.assertNotIn('password',shown)
+        shown=output.getvalue();self.assertIn('内网机器 [在线]',shown);self.assertIn('代理数量=2',shown);self.assertIn('web [在线]',shown);self.assertNotIn('password',shown)
     def test_backup_and_restore_roundtrip(self):
         pid=self.create();m.set_current(pid);m.save_mappings(pid,[self.mapping()])
         directory=m.backup(m.managed_paths(),'test-snapshot')
@@ -137,7 +137,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(shown.count('状态'.ljust(10)), 1)
         self.assertIn('[提示] 正在刷新服务信息。', shown)
         self.assertIn('监听'.ljust(10) + '0.0.0.0:7000', shown)
-        self.assertIn('Dashboard http://127.0.0.1:7500', shown)
+        self.assertIn('Dashboard', shown); self.assertIn('http://127.0.0.1:7500', shown)
         self.assertIn('1) 查看服务信息（状态、版本、路径）', shown)
         self.assertNotIn('2) 查看版本信息', shown)
         self.assertNotIn('3) 查看安装路径', shown)
@@ -148,7 +148,7 @@ class ManagerTests(unittest.TestCase):
         with contextlib.redirect_stdout(output), patch('builtins.input', side_effect=['1','0']): m.main_menu('frpc')
         shown=output.getvalue();self.assertEqual(shown.count('frpc 客户端管理'),1)
         self.assertIn('生产服务器（[::1]:7000）',shown)
-        self.assertIn('连接状态'.ljust(10) + '已停止', shown);self.assertNotIn('"component"',shown)
+        self.assertIn('连接状态', shown); self.assertIn('已停止', shown);self.assertNotIn('"component"',shown)
         output=io.StringIO()
         with contextlib.redirect_stdout(output):m.run(['frpc','status','--json'])
         self.assertEqual(json.loads(output.getvalue())['component'],'frpc')
@@ -204,7 +204,15 @@ class ManagerTests(unittest.TestCase):
             with self.assertRaises(ValueError): m.import_external('frpc')
         self.assertEqual((m.ROOT / 'frpc.toml').read_text(), content)
     def test_choose_retries_invalid(self):
-        with patch('builtins.input', side_effect=['', '-1', 'text', '999', '1']): self.assertEqual(m.choose(['x']), 1)
+        # 统一交互：空回车=返回(0)，0=返回，q=退出程序，非法值重试
+        with patch('builtins.input', side_effect=['-1', 'text', '999', '1']):
+            self.assertEqual(m.choose(['x']), 1)
+    def test_choose_blank_and_zero_mean_back(self):
+        with patch('builtins.input', side_effect=['']): self.assertEqual(m.choose(['x']), 0)
+        with patch('builtins.input', side_effect=['0']): self.assertEqual(m.choose(['x']), 0)
+    def test_choose_q_quits_program(self):
+        with patch('builtins.input', side_effect=['q']):
+            with self.assertRaises(m.QuitProgram): m.choose(['x'])
     def test_path_traversal_rejected(self):
         with self.assertRaises(ValueError): m.pdir('../escape')
     def test_lock_exclusion(self):
@@ -338,8 +346,9 @@ class ManagerTests(unittest.TestCase):
     def test_edit_profile_q_cancel_does_not_write(self):
         pid = self.create(); m.set_current(pid); m.apply(pid)
         before = {p: p.read_bytes() for p in m.managed_paths()}
+        # 菜单层 q = 退出程序（QuitProgram），不得写入任何文件
         with patch('builtins.input', return_value='q'):
-            m.edit_profile()
+            with self.assertRaises(m.QuitProgram): m.edit_profile()
         self.assertEqual({p: p.read_bytes() for p in m.managed_paths()}, before)
     def test_edit_profile_blank_token_clears(self):
         pid = self.create(); m.set_current(pid); m.apply(pid)
@@ -1066,5 +1075,69 @@ class ManagerTests(unittest.TestCase):
              patch.object(m, 'initialize'), patch.object(m, 'status', return_value={'component': 'frpc'}), \
              contextlib.redirect_stdout(io.StringIO()):
             m.run(['frpc', 'status'])
+
+    # ---- 统一交互 / 状态着色 / SSH 安全重启 ----
+    def test_color_state_good_bad_warn(self):
+        with patch.object(m, 'UI_COLOR', True):
+            self.assertIn('\033[1;32m', m.color_state('运行中'))
+            self.assertIn('\033[1;31m', m.color_state('已停止'))
+            self.assertIn('\033[1;33m', m.color_state('连接中'))
+            self.assertEqual(m.color_state('随便什么'), '随便什么')
+        with patch.object(m, 'UI_COLOR', False):
+            self.assertEqual(m.color_state('运行中'), '运行中')
+    def test_schedule_detached_restart_uses_new_session(self):
+        with patch.object(m, '_restart_command', return_value=['systemctl', 'restart', 'frpc']), \
+             patch.object(m.subprocess, 'Popen') as popen, \
+             patch.object(m, 'audit'):
+            m.schedule_detached_restart('frpc', delay=3)
+        kwargs = popen.call_args[1]
+        self.assertTrue(kwargs.get('start_new_session'))
+        script = popen.call_args[0][0][2]
+        self.assertIn('sleep 3', script)
+        self.assertIn('systemctl', script)
+    def test_restart_safely_non_tty_schedules(self):
+        with patch.object(m, '_is_tty', return_value=False), \
+             patch.object(m, 'schedule_detached_restart') as sched, \
+             patch.object(m, 'service_feedback') as fb, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(m.restart_safely('frpc'), 'scheduled')
+        sched.assert_called_once(); fb.assert_not_called()
+    def test_has_enabled_mappings(self):
+        pid = self.create(); m.set_current(pid)
+        self.assertFalse(m._has_enabled_mappings())
+        with patch.object(m, 'apply'):
+            m.save_mappings(pid, [self.mapping()])
+        self.assertTrue(m._has_enabled_mappings())
+
+    # ---- 审查修复回归：颜色反转 / restore 安全 / 删除确认顺序 ----
+    def test_color_state_negatives_are_red(self):
+        with patch.object(m, 'UI_COLOR', True):
+            for w in ('未启用', '不可达', '不通过', '未设置', '已停止'):
+                self.assertIn('\033[1;31m', m.color_state(w), w)
+            for w in ('已启用', '可达', '通过', '运行中'):
+                self.assertIn('\033[1;32m', m.color_state(w), w)
+    def test_restore_rejects_outside_backups(self):
+        import tempfile
+        evil = Path(tempfile.mkdtemp())
+        m.save_json(evil / 'manifest.json', {'reason': 'upgrade', 'files': [], 'sha256': {}})
+        with self.assertRaises(ValueError):
+            m.restore_upgrade_snapshot(evil)
+    def test_delete_profile_cancel_second_confirm_keeps_service(self):
+        pid = self.create(); m.set_current(pid)
+        calls = []
+        with patch.object(m, 'running', return_value=True), \
+             patch.object(m, 'service', side_effect=lambda r, a: calls.append(a)), \
+             patch.object(m, 'confirm', side_effect=[True, False]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            m.delete_profile_id(pid)
+        self.assertNotIn('stop', calls)          # 取消后不得停服
+        self.assertTrue((m.ROOT / 'profiles' / pid).exists())
+    def test_upgrade_accepts_positional_version(self):
+        seen = {}
+        def fake_upgrade(role, target=None, yes=False): seen['target'] = target; return False
+        with patch.object(m, 'upgrade', side_effect=fake_upgrade), \
+             patch.object(m, 'initialize'), patch.object(m.os, 'geteuid', return_value=0):
+            m.run(['frpc', 'upgrade', 'v9.9.9'])
+        self.assertEqual(seen['target'], 'v9.9.9')
 
 if __name__ == '__main__': unittest.main()

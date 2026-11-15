@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-FRP_MANAGER_VERSION='v1.0.0-rc.1'
+FRP_MANAGER_VERSION='v1.0.0-rc.2'
 base="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
 if [[ -f "$base/install-common.sh" && -f "$base/lib/manager.py" && -f "$base/lib/download.sh" ]]; then
   exec bash "$base/install-common.sh" frps "$@"
 fi
-for tool in curl tar sha256sum; do command -v "$tool" >/dev/null || { echo "Missing dependency: $tool" >&2; exit 1; }; done
+for tool in curl tar; do command -v "$tool" >/dev/null || { echo "Missing dependency: $tool" >&2; exit 1; }; done
+# macOS 自带 shasum 而没有 sha256sum；两者其一即可。
+if command -v sha256sum >/dev/null; then sha_cmd=sha256sum
+elif command -v shasum >/dev/null; then sha_cmd=shasum
+else echo "Missing dependency: sha256sum or shasum" >&2; exit 1; fi
 work="$(mktemp -d)"
 cleanup() { [[ -n "${work:-}" && "$work" != / && -d "$work" ]] && rm -rf -- "$work"; }
 trap cleanup EXIT
@@ -20,9 +24,16 @@ if [[ -n "$mirror" ]] && fetch "$mirror/frp-simple-bash/releases/$FRP_MANAGER_VE
   fetch "$mirror/frp-simple-bash/releases/$FRP_MANAGER_VERSION/SHA256SUMS.txt" "$work/SHA256SUMS.txt" || { echo 'Mirror manifest unavailable; refusing unchecked bundle.' >&2; exit 1; }
   expected="$(awk '$2 == "source.tar.gz" || $2 == "*source.tar.gz" {print $1}' "$work/SHA256SUMS.txt")"
   [[ "$expected" =~ ^[a-fA-F0-9]{64}$ ]] || { echo 'Invalid source bundle manifest.' >&2; exit 1; }
-  printf '%s  %s\n' "$expected" "$work/source.tar.gz" | sha256sum -c - >/dev/null || { echo 'Source SHA256 mismatch; stopped without fallback.' >&2; exit 1; }
+  if [[ "$sha_cmd" == sha256sum ]]; then
+    printf '%s  %s\n' "$expected" "$work/source.tar.gz" | sha256sum -c - >/dev/null || { echo 'Source SHA256 mismatch; stopped without fallback.' >&2; exit 1; }
+  else
+    actual="$(shasum -a 256 "$work/source.tar.gz" | awk '{print $1}')"
+    [[ "$actual" == "$expected" ]] || { echo 'Source SHA256 mismatch; stopped without fallback.' >&2; exit 1; }
+  fi
   source_kind=mirror
 else
+  echo 'WARNING: mirror unavailable; falling back to UNVERIFIED GitHub main source.' >&2
+  echo '         (no SHA256 pin for this path — proceed only if you trust the network.)' >&2
   fetch 'https://codeload.github.com/1911981822/frp-simple-bash/tar.gz/refs/heads/main' "$work/source.tar.gz" || { echo 'All source downloads failed.' >&2; exit 1; }
 fi
 # Only a completed, verified (for mirror) archive reaches extraction.

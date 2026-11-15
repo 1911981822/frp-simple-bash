@@ -133,10 +133,10 @@ class ManagerTests(unittest.TestCase):
     def test_server_menu_refreshes_once_and_hides_secrets(self):
         m.atomic(m.ROOT / 'frps.toml', m.toml({'bindPort':7000,'auth.token':'do-not-print-token','webServer.addr':'127.0.0.1','webServer.port':7500,'webServer.user':'admin','webServer.password':'do-not-print-password'}))
         output=io.StringIO()
-        with contextlib.redirect_stdout(output), patch('builtins.input', side_effect=['0']): m.main_menu('frps')
+        with contextlib.redirect_stdout(output), patch('builtins.input', side_effect=['0','y']): m.main_menu('frps')
         shown=output.getvalue()
-        self.assertEqual(shown.count('当前状态'), 1)
-        self.assertIn('监听', shown); self.assertIn('0.0.0.0:7000', shown)
+        self.assertEqual(shown.count('frps 服务端操作'), 1)
+        self.assertIn('状态', shown); self.assertIn('监听', shown); self.assertIn('0.0.0.0:7000', shown)
         self.assertIn('Dashboard', shown); self.assertIn('http://127.0.0.1:7500', shown)
         self.assertNotIn('查看服务信息（状态、版本、路径）', shown)
         self.assertIn('1) 启动', shown)
@@ -146,8 +146,9 @@ class ManagerTests(unittest.TestCase):
     def test_frpc_menu_labels_and_json_status(self):
         pid=self.create();m.set_current(pid)
         output=io.StringIO()
-        with contextlib.redirect_stdout(output), patch('builtins.input', side_effect=['0']): m.main_menu('frpc')
-        shown=output.getvalue();self.assertEqual(shown.count('当前状态'),1)
+        with contextlib.redirect_stdout(output), patch('builtins.input', side_effect=['0','y']): m.main_menu('frpc')
+        shown=output.getvalue();self.assertEqual(shown.count('frpc 客户端操作'),1)
+        self.assertIn('状态', shown); self.assertIn('版本', shown)
         self.assertIn('生产服务器（[::1]:7000）',shown)
         self.assertIn('连接状态', shown); self.assertIn('已停止', shown);self.assertNotIn('"component"',shown)
         output=io.StringIO()
@@ -155,7 +156,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue())['component'],'frpc')
     def test_frps_status_independent_of_broken_client_profile(self):
         m.save_json(m.ROOT/'state.json',{'active_profile_id':'invalid'})
-        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input',return_value='0'):m.main_menu('frps')
+        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', side_effect=['0','y']):m.main_menu('frps')
     def test_unicode_name_and_unique_rename(self):
         pid = self.create(); self.assertIn('[::1]:7000', m.label(m.load_profile(pid)))
         with self.assertRaises(ValueError): self.create()
@@ -435,7 +436,7 @@ class ManagerTests(unittest.TestCase):
         self.assertIsNone(json.loads(out.getvalue())['active_profile'])
     def test_main_menu_survives_broken_profile(self):
         m.save_json(m.ROOT / 'state.json', {'active_profile_id': 'invalid'})
-        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', return_value='0'):
+        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', side_effect=['0','y']):
             m.main_menu('frpc')  # must not raise UnboundLocalError
 
     # ---- Transaction / lock / robustness ----
@@ -546,7 +547,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(calls, [])  # no second status() / API probe
     def test_menu_status_action_pauses(self):
         m.atomic(m.ROOT / 'frps.toml', m.toml({'bindPort': 7000}))
-        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', side_effect=['1', '0']), \
+        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', side_effect=['1', '0', 'y']), \
              patch.object(m, 'service', return_value='active'), patch.object(m, 'pause') as paused:
             m.main_menu('frps')
         self.assertGreaterEqual(paused.call_count, 1)
@@ -898,7 +899,7 @@ class ManagerTests(unittest.TestCase):
     def test_status_bar_survives_broken_mappings_file(self):
         pid = self.create(); m.set_current(pid)
         (m.pdir(pid) / 'mappings.toml').write_text('this is not toml\n')
-        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', return_value='0'):
+        with contextlib.redirect_stdout(io.StringIO()), patch('builtins.input', side_effect=['0','y']):
             m.main_menu('frpc')  # must not raise / exit
     def test_broken_profile_reports_config_error(self):
         m.save_json(m.ROOT / 'state.json', {'active_profile_id': 'deadbeefdeadbeefdeadbeef'})
@@ -1213,7 +1214,7 @@ class ManagerTests(unittest.TestCase):
         self.assertIn('共 2 个服务端、2 条映射', shown)
     def test_main_menu_new_numbering(self):
         out = io.StringIO()
-        with patch('builtins.input', side_effect=['0']), contextlib.redirect_stdout(out):
+        with patch('builtins.input', side_effect=['0','y']), contextlib.redirect_stdout(out):
             m.main_menu('frpc')
         shown = out.getvalue()
         self.assertIn('1) 启动', shown)

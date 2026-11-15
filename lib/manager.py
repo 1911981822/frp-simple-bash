@@ -29,7 +29,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.4'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.5'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -1065,7 +1065,7 @@ def result_error(message, hint=None, role=None):
     except (ValueError, OSError): pass
     _box('[失败]', message, '\n'.join(lines) if lines else None)
 
-def choose(items, title='请选择', back_label='返回上一级', groups=None):
+def choose(items, title='请选择', back_label='返回上一级', groups=None, prelude=None):
     """Numbered menu with optional visual group headers (numbering stays continuous).
 
     统一交互规则（全程序唯一规范）：
@@ -1074,6 +1074,8 @@ def choose(items, title='请选择', back_label='返回上一级', groups=None):
       数字        → 执行对应操作
     """
     section(title)
+    if prelude is not None:
+        prelude()
     idx = 0
     for n, item in enumerate(items, 1):
         if groups and (n - 1) in groups:
@@ -1096,6 +1098,9 @@ def choose(items, title='请选择', back_label='返回上一级', groups=None):
         # 统一规则：0 = 退一层（主菜单=退出程序）；空回车 = 退一层（主菜单=刷新）。
         # 菜单层不再把 q 当作退出键（q 仅用于输入框取消本次操作）。
         if v == '0':
+            # 主菜单的 0 会结束程序；先确认，避免从子菜单连按两次 0 误退出。
+            if at_root and not confirm('确认退出程序？'):
+                continue
             return 0
         if v == '':
             if at_root: continue
@@ -2276,11 +2281,8 @@ def status_bar(role, data):
         parts.append('有待重启修改')
     print('  ' + ' | '.join(str(p) for p in parts if p))
 
-def show_status(role, data=None):
-    """Render a status screen. Accepts a precomputed status dict so the menu
-    does not pay for status() (and its API probes) twice."""
-    if data is None: data = status(role)
-    section('当前状态')
+def _status_body(role, data):
+    """Print the status fields and the 'needs attention' list (no title)."""
     print(_kv('状态', color_state(SERVICE_STATES.get(str(data['service_state']).lower(), data['service_state']))))
     print(_kv('版本', data['version']))
     print(_kv('配置文件', data['config_path']))
@@ -2328,6 +2330,12 @@ def show_status(role, data=None):
         head = '\033[1;31m需关注\033[0m' if UI_COLOR else '需关注'
         print('  ' + head + '（以下事项需要处理）：')
         for c in concerns: print('    - ' + c)
+
+def show_status(role, data=None):
+    """Render a standalone status screen (title + body + rule)."""
+    if data is None: data = status(role)
+    section('当前状态')
+    _status_body(role, data)
     print(RULE)
     return data
 
@@ -2406,7 +2414,6 @@ def main_menu(role):
     """Main menu. 进入后先显示《当前状态》，再进入操作菜单。"""
     global _CURRENT_ROLE
     _CURRENT_ROLE = role
-    show_full_status = True
     while True:
         clear_screen()
         try:
@@ -2442,16 +2449,15 @@ def main_menu(role):
             ]
             groups = {0: '── 服务控制 ──', 3: '── 配置与连接 ──',
                       5: '── 运维 ──', 8: '── 危险操作 ──'}
-        if show_full_status:
-            show_status(role, data)
-            show_full_status = False
-        else:
-            status_bar(role, data)
-        if role == 'frpc' and not profiles():
-            print('  ' + _tag('[提示]') + ' 还没有服务端配置，建议按顺序：')
-            print('    ① 新建服务端（本菜单 4）  →  ② 管理端口映射（本菜单 9）  →  ③ 启动并验证（本菜单 1）')
-            print(RULE)
-        n = choose(items, 'frpc 客户端操作' if role == 'frpc' else 'frps 服务端操作', '退出', groups=groups)
+        def _prelude(_role=role, _data=data):
+            # 状态块紧跟菜单标题显示（用户要求的布局）
+            _status_body(_role, _data)
+            if _role == 'frpc' and not profiles():
+                print()
+                print('  ' + _tag('[提示]') + ' 还没有服务端配置，建议按顺序：')
+                print('    ① 新建服务端（本菜单 4）  →  ② 管理端口映射（本菜单 9）  →  ③ 启动并验证（本菜单 1）')
+        n = choose(items, 'frpc 客户端操作' if role == 'frpc' else 'frps 服务端操作',
+                   '退出', groups=groups, prelude=_prelude)
         if not n: return
         needs_pause = True
         terminal = False

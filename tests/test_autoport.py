@@ -609,13 +609,29 @@ class AutoPortTests(unittest.TestCase):
         self.assertEqual(report['removed'], [{'port': 6000, 'proto': 'tcp'}])
 
     def test_menu_has_core_items_only(self):
+        """主菜单只保留 4 项核心功能。"""
         out = io.StringIO()
         with patch('builtins.input', side_effect=['0']), \
              contextlib.redirect_stdout(out):
             m.auto_port_menu()
         shown = out.getvalue()
-        for label in ('查看待放行端口', '立即同步并放行', '查看已放行端口',
-                      '查看在线客户端', '管理白名单', '宝塔 API 设置'):
+        for label in ('查看待放行端口', '同步并放行', '白名单管理', '宝塔 API 设置'):
+            self.assertIn(label, shown, label)
+        # 状态块只显示两行（放行方式 + 白名单/自动同步合并）
+        self.assertIn('放行方式', shown)
+        self.assertIn('白名单', shown)
+        self.assertNotIn('定时同步', shown)
+
+    def test_whitelist_menu_covers_auto_sync_and_revert(self):
+        """白名单子菜单承载：已放行查看、自动同步开关、撤销。"""
+        cfg = m.auto_port_config()
+        out = io.StringIO()
+        with patch('builtins.input', side_effect=['0']), \
+             contextlib.redirect_stdout(out):
+            m.whitelist_menu(cfg)
+        shown = out.getvalue()
+        for label in ('添加客户端', '移除客户端', '查看已放行端口',
+                      '开启自动同步', '撤销全部自动放行'):
             self.assertIn(label, shown, label)
 
 if __name__ == '__main__':

@@ -30,7 +30,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.15'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.16'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -4294,41 +4294,33 @@ def auto_port_report_lines(report, plan_only=False):
     return lines
 
 def auto_port_menu():
-    """端口自动开通：白名单 → 同步实际映射 → 调宝塔 API 或列清单手动放行。"""
+    """端口自动开通：4 项主菜单。
+
+    核心逻辑：读 frps 实际在线映射 → 有宝塔 API 就调 API 放行，没 API 就列清单手动加。
+    """
     clear_screen()
     while True:
         cfg = auto_port_config()
         panel = panel_config()
         api_ready = panel_api_ready(panel)
-        has_panel = bool(panel_detect())
-        opened = auto_port_state().get('opened') or []
+        enabled = cfg['enabled']
 
         def _prelude():
-            print('  ' + _kv('功能', color_state('已启用') if cfg['enabled'] else color_state('未启用')))
             if api_ready:
                 print('  ' + _kv('放行方式', color_state('宝塔 API 自动')))
-            elif has_panel:
-                print('  ' + _kv('放行方式', color_state('手动（未配宝塔 API）')))
             else:
-                print('  ' + _kv('放行方式', '系统防火墙直连'))
-            print('  ' + _kv('白名单', ('%d 个客户端' % len(cfg['allow_clients']))
-                             if cfg['allow_clients'] else color_state('空（不会放行任何端口）')))
-            print('  ' + _kv('已放行', '%d 个端口' % len(opened)))
-            print('  ' + _kv('定时同步', color_state(ports_timer_status())))
+                print('  ' + _kv('放行方式', color_state('手动（未配宝塔 API）')))
+            wl = len(cfg['allow_clients'])
+            auto = color_state('自动同步开') if enabled else color_state('自动同步关')
+            print('  ' + _kv('白名单', ('%d 个客户端' % wl) if wl else color_state('空')) + '    ' + auto)
 
         items = [
-            '查看待放行端口（同步预览）',
-            '立即同步并放行',
-            '查看已放行端口',
-            '查看在线客户端（拿 clientID）',
-            '管理白名单',
-            '启用自动同步' if not cfg['enabled'] else '关闭自动同步',
-            '宝塔 API 设置（可选）',
-            '撤销全部自动放行',
+            '查看待放行端口',
+            '同步并放行',
+            '白名单管理',
+            '宝塔 API 设置',
         ]
-        groups = {0: '── 同步 ──', 3: '── 白名单 ──',
-                  5: '── 自动同步 ──', 6: '── 宝塔 API ──', 7: '── 危险操作 ──'}
-        n = choose(items, '端口自动开通', '返回上一级', groups=groups, prelude=_prelude)
+        n = choose(items, '端口自动开通', '返回上一级', prelude=_prelude)
         if not n: return
         try:
             if n == 1:
@@ -4338,34 +4330,66 @@ def auto_port_menu():
                 _apply_ports(cfg, panel)
                 pause()
             elif n == 3:
-                _show_opened_ports()
-                pause()
+                whitelist_menu(cfg); pause()
             elif n == 4:
-                _show_online_clients(cfg)
-                pause()
-            elif n == 5:
-                _manage_whitelist(cfg); pause()
-            elif n == 6:
-                if cfg['enabled']:
+                panel_config_menu(); needs_pause = False
+        except MENU_ERRORS as exc:
+            result_error(str(exc)); pause()
+
+def whitelist_menu(cfg):
+    """白名单管理：加/减客户端 + 开关自动同步 + 查看已放行 + 撤销。"""
+    while True:
+        clear_screen()
+        cfg = auto_port_config()
+        enabled = cfg['enabled']
+        opened = auto_port_state().get('opened') or []
+        print('  ' + _kv('白名单', ', '.join(cfg['allow_clients']) if cfg['allow_clients']
+                         else color_state('空（不会放行任何端口）')))
+        print('  ' + _kv('已放行', '%d 个端口' % len(opened)))
+        print('  ' + _kv('自动同步', color_state(ports_timer_status())))
+        print(RULE)
+        items = [
+            '添加客户端',
+            '移除客户端',
+            '查看已放行端口',
+            '关闭自动同步' if enabled else '开启自动同步',
+            '撤销全部自动放行',
+        ]
+        groups = {0: '── 白名单 ──', 2: '── 已放行 ──', 3: '── 自动同步 ──', 4: '── 危险操作 ──'}
+        n = choose(items, '白名单与同步', '返回', groups=groups)
+        if not n: return
+        try:
+            if n == 1:
+                auto_port_add_client(cfg); pause()
+            elif n == 2:
+                if not cfg['allow_clients']:
+                    result_info('白名单为空。'); pause(); continue
+                index = choose(cfg['allow_clients'], '选择要移除的客户端')
+                if not index: continue
+                removed = cfg['allow_clients'].pop(index - 1)
+                save_auto_port_config(cfg)
+                result_ok('已移除：' + removed); pause()
+            elif n == 3:
+                _show_opened_ports(); pause()
+            elif n == 4:
+                if enabled:
                     cfg['enabled'] = False; save_auto_port_config(cfg)
                     ports_timer_remove(); ports_audit('disable', result='ok')
                     result_info('已关闭自动同步。已放行的端口保持不变。')
                 else:
-                    if not confirm('启用后每 15 秒自动同步一次，把新映射的端口放行。确认？',
+                    if not cfg['allow_clients']:
+                        result_error('白名单为空，先添加客户端。'); pause(); continue
+                    if not confirm('开启后每 15 秒自动同步一次，把新映射端口放行。确认？',
                                    danger=True):
                         result_info('已取消。'); pause(); continue
                     if ports_enable(cfg, yes=True):
-                        result_ok('已启用自动同步。')
-                        _apply_ports(cfg, panel)
+                        result_ok('已开启自动同步。')
                 pause()
-            elif n == 7:
-                panel_config_menu(); needs_pause = False
-            elif n == 8:
-                if not confirm('将删除本工具放行的全部端口（不会动你自己加的规则）。确认？',
-                               danger=True):
+            elif n == 5:
+                if not confirm('将删除本工具放行的全部端口并关闭自动同步。确认？', danger=True):
                     result_info('已取消。'); pause(); continue
                 removed = ports_revert()
-                result_ok('已撤销 %d 个端口。' % len(removed)); pause()
+                result_ok('已撤销 %d 个端口，并关闭自动同步。' % len(removed)); pause()
         except MENU_ERRORS as exc:
             result_error(str(exc)); pause()
 

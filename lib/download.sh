@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Download helpers: a successful HTTP transfer is not a successful checksum.
-FRP_MANAGER_VERSION='v1.0.0-rc.15'
+FRP_MANAGER_VERSION='v1.0.0-rc.16'
 frp_mirror_url() {
   local value="${FRP_MIRROR_URL-https://download.sueiyuan.top}"
   case "$value" in ''|off|OFF) return 0 ;; esac

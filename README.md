@@ -74,6 +74,9 @@ sudo frps ports plan             # 预览将增删哪些端口（不执行）
 sudo frps ports clients discover # 发现当前在线的 clientID
 sudo frps ports clients add <clientID>
 sudo frps ports revert --yes     # 撤销全部自动放行并关闭功能
+sudo frps ports firewall status  # 检测本机防火墙（发行版/推荐/是否启用）
+sudo frps ports firewall plan    # 打印启用计划（不执行）
+sudo frps ports firewall enable  # 启用防火墙（先放行 SSH，避免自锁）
 ```
 
 **安全边界（必读）**：
@@ -87,6 +90,8 @@ sudo frps ports revert --yes     # 撤销全部自动放行并关闭功能
 | 端口冲突 | 被其它进程占用的端口一律不放行并给出原因 |
 | 审计 | `/etc/frp/logs/ports-audit.jsonl` 记录每次开关 |
 | 一键撤销 | 只删本工具添加的规则，不动你自己加的 |
+| 多发行版兼容 | 自动探测 ufw / firewalld / iptables / nftables / Windows 防火墙，按"谁真正生效"选择 |
+| 启用引导 | 没开防火墙时给出命令；`frps ports firewall enable` 会**先放行 SSH** 再启用，避免自锁 |
 
 > ⚠️ 本功能**不做端口区间限制**，且云安全组需你手工配置。
 > 如果安全组全开而系统防火墙未启用，服务器等于全端口暴露——

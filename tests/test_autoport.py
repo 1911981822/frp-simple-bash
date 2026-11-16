@@ -241,7 +241,9 @@ class AutoPortTests(unittest.TestCase):
         def fake(args_list, **kwargs):
             calls.append(list(args_list))
             return type('R', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
-        with patch.object(m, 'firewall_backend', return_value=(backend, True)), \
+        detected = {'backend': backend, 'active': True, 'available': [backend],
+                    'family': 'debian', 'preferred': 'ufw', 'detail': {}}
+        with patch.object(m, 'firewall_detect', return_value=detected), \
              patch.object(m, 'run_cmd', side_effect=fake):
             fn(*args)
         return calls
@@ -267,7 +269,9 @@ class AutoPortTests(unittest.TestCase):
         self.assertIn('frp-simple-bash:auto', flat)
 
     def test_add_refuses_inactive_firewall(self):
-        with patch.object(m, 'firewall_backend', return_value=('ufw', False)):
+        detected = {'backend': 'ufw', 'active': False, 'available': ['ufw'],
+                    'family': 'debian', 'preferred': 'ufw', 'detail': {}}
+        with patch.object(m, 'firewall_detect', return_value=detected):
             with self.assertRaises(ValueError):
                 m.firewall_add_port(6000, 'tcp')
 
@@ -289,6 +293,156 @@ class AutoPortTests(unittest.TestCase):
             self.assertFalse(m.ports_timer_install(self.cfg()))
             self.assertFalse(m.ports_timer_remove())
             self.assertIn('不适用', m.ports_timer_status())
+
+
+    # ---- 防火墙兼容层（多发行版） ----
+
+    def _detect_with(self, handlers, available=('ufw', 'firewall-cmd', 'nft', 'iptables'),
+                     osr=None):
+        """Run firewall_detect with TEST disabled and stubbed commands."""
+        os_release = osr if osr is not None else {'ID': 'debian', 'ID_LIKE': 'debian'}
+        def fake_run(args_list, **kwargs):
+            key = ' '.join(args_list)
+            return type('R', (), {'returncode': 0, 'stdout': handlers.get(key, ''),
+                                  'stderr': ''})()
+        def fake_which(name):
+            return '/usr/sbin/' + name if name in available else None
+        with patch.object(m, 'TEST', False), \
+             patch.object(m, 'os_release', return_value=os_release), \
+             patch.object(m, 'run_cmd', side_effect=fake_run), \
+             patch.object(m.shutil, 'which', side_effect=fake_which):
+            return m.firewall_detect()
+
+    def test_os_family_mapping(self):
+        cases = [({'ID': 'ubuntu'}, 'debian'), ({'ID': 'debian'}, 'debian'),
+                 ({'ID': 'centos'}, 'rhel'), ({'ID': 'rocky', 'ID_LIKE': 'rhel'}, 'rhel'),
+                 ({'ID': 'opensuse-leap', 'ID_LIKE': 'suse'}, 'suse'),
+                 ({'ID': 'alpine'}, 'alpine'), ({'ID': 'arch'}, 'arch'),
+                 ({'ID': 'weird'}, 'other')]
+        for release, expected in cases:
+            with patch.object(m, 'os_release', return_value=release):
+                self.assertEqual(m.os_family(), expected, release)
+
+    def test_preferred_firewall_per_family(self):
+        for release, expected in (({'ID': 'ubuntu'}, 'ufw'),
+                                  ({'ID': 'centos'}, 'firewalld'),
+                                  ({'ID': 'alpine'}, 'nftables')):
+            with patch.object(m, 'os_release', return_value=release):
+                self.assertEqual(m.preferred_firewall(), expected, release)
+
+    def test_detect_prefers_active_ufw_over_inactive_firewalld(self):
+        info = self._detect_with({'ufw status': 'Status: active\n',
+                                  'firewall-cmd --state': 'not running\n'})
+        self.assertEqual(info['backend'], 'ufw')
+        self.assertTrue(info['active'])
+        self.assertIn('firewalld', info['available'])
+
+    def test_detect_falls_back_to_running_firewalld(self):
+        info = self._detect_with({'ufw status': 'Status: inactive\n',
+                                  'firewall-cmd --state': 'running\n'})
+        self.assertEqual(info['backend'], 'firewalld')
+        self.assertTrue(info['active'])
+
+    def test_detect_falls_back_to_iptables_when_managers_inactive(self):
+        info = self._detect_with({'ufw status': 'Status: inactive\n',
+                                  'firewall-cmd --state': 'not running\n',
+                                  'iptables -S': '-P INPUT DROP\n-A INPUT -p tcp --dport 22 -j ACCEPT\n'})
+        self.assertEqual(info['backend'], 'iptables')
+        self.assertTrue(info['active'])
+
+    def test_detect_reports_none_active_when_all_installed_but_off(self):
+        info = self._detect_with({'ufw status': 'Status: inactive\n',
+                                  'firewall-cmd --state': 'not running\n',
+                                  'iptables -S': '-P INPUT ACCEPT\n',
+                                  'nft list ruleset': 'table inet filter {}\n'})
+        self.assertFalse(info['active'])
+        self.assertEqual(info['backend'], '')
+        self.assertEqual(sorted(info['available']), ['firewalld', 'iptables', 'nftables', 'ufw'])
+
+    def test_detect_nftables_when_policy_drop(self):
+        info = self._detect_with({'iptables -S': '',
+                                  'nft list ruleset': 'chain input { type filter hook input priority 0; policy drop; }\n'},
+                                 available=('nft',))
+        self.assertEqual(info['backend'], 'nftables')
+        self.assertTrue(info['active'])
+
+    def test_ssh_ports_strict_refuses_to_guess(self):
+        with patch.object(m, '_cmd_out', return_value=''), \
+             patch.object(m.Path, 'read_text', side_effect=OSError):
+            with self.assertRaises(ValueError):
+                m.ssh_listen_ports(strict=True)
+            self.assertEqual(m.ssh_listen_ports(strict=False), [22])
+
+    def test_ssh_ports_from_listening_sockets(self):
+        ss_out = ('LISTEN 0 128 0.0.0.0:2222 0.0.0.0:* users:(("sshd",pid=900,fd=3))\n'
+                  'LISTEN 0 128 [::]:22 [::]:* users:(("sshd",pid=900,fd=4))\n')
+        with patch.object(m, '_cmd_out', return_value=ss_out):
+            self.assertEqual(m.ssh_listen_ports(strict=True), [22, 2222])
+
+    def test_frps_keep_ports_includes_bind_and_vhost(self):
+        m.atomic(self.tmp / 'frps.toml', m.toml({
+            'bindPort': 7000, 'vhostHTTPPort': 8080, 'kcpBindPort': 7001,
+            'webServer.addr': '0.0.0.0', 'webServer.port': 7500}))
+        ports = m.frps_keep_ports()
+        self.assertIn((7000, 'tcp'), ports)
+        self.assertIn((8080, 'tcp'), ports)
+        self.assertIn((7001, 'tcp'), ports)
+        self.assertIn((7500, 'tcp'), ports)   # Dashboard 对外监听才需要放行
+
+    def test_enable_plan_puts_ssh_before_frps_and_enable(self):
+        with patch.object(m, 'os_release', return_value={'ID': 'debian'}), \
+             patch.object(m, 'firewall_detect', return_value={
+                 'backend': '', 'active': False, 'available': [], 'family': 'debian',
+                 'preferred': 'ufw', 'detail': {}}), \
+             patch.object(m, 'ssh_listen_ports', return_value=[22]), \
+             patch.object(m, 'frps_keep_ports', return_value=[(7000, 'tcp')]):
+            plan = m.firewall_enable_plan()
+        self.assertEqual(plan['target'], 'ufw')
+        self.assertEqual(plan['install_cmds'], [['apt-get', 'install', '-y', 'ufw']])
+        flat = [' '.join(c) for c in plan['allow_cmds']]
+        self.assertTrue(any('22/tcp' in c for c in flat))
+        self.assertTrue(any('7000/tcp' in c for c in flat))
+        self.assertIn('22', plan['notes'][0])
+        self.assertEqual(plan['enable_cmds'], [['ufw', '--force', 'enable']])
+
+    def test_enable_aborts_when_ssh_allow_fails(self):
+        plan = {'target': 'ufw', 'family': 'debian', 'installed': True,
+                'ssh_ports': [22], 'keep': [], 'install_cmds': [],
+                'allow_cmds': [['ufw', 'allow', '22/tcp']],
+                'enable_cmds': [['ufw', '--force', 'enable']], 'notes': []}
+        def fake_run(args_list, **kwargs):
+            code = 1 if args_list[:2] == ['ufw', 'allow'] else 0
+            return type('R', (), {'returncode': code, 'stdout': '', 'stderr': 'denied'})()
+        with patch.object(m, 'firewall_enable_plan', return_value=plan), \
+             patch.object(m, 'run_cmd', side_effect=fake_run):
+            with self.assertRaises(ValueError) as ctx:
+                m.firewall_enable(yes=True)
+        self.assertIn('SSH', str(ctx.exception))
+
+    def test_windows_backend_uses_netsh(self):
+        calls = self._capture('windows', m.firewall_add_port, 6000, 'tcp')
+        flat = ' '.join(calls[0])
+        self.assertTrue(calls[0][0] == 'netsh')
+        self.assertIn('advfirewall', flat)
+        self.assertIn('localport=6000', flat)
+        self.assertIn('action=allow', flat)
+
+    def test_nftables_add_refuses_unknown_table(self):
+        detected = {'backend': 'nftables', 'active': True, 'available': ['nftables'],
+                    'family': 'alpine', 'preferred': 'nftables', 'detail': {}}
+        with patch.object(m, 'firewall_detect', return_value=detected), \
+             patch.object(m, '_cmd_ok', return_value=False):
+            with self.assertRaises(ValueError) as ctx:
+                m.firewall_add_port(6000, 'tcp')
+        self.assertIn('nftables', str(ctx.exception))
+
+    def test_hint_text_guides_installed_but_inactive(self):
+        text = m._firewall_hint_text({'family': 'debian', 'preferred': 'ufw',
+                                      'available': ['ufw'], 'backend': ''})
+        self.assertIn('ports firewall enable', text)
+        text2 = m._firewall_hint_text({'family': 'alpine', 'preferred': 'nftables',
+                                       'available': [], 'backend': ''})
+        self.assertIn('alpine', text2)
 
 
 if __name__ == '__main__':

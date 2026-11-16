@@ -29,7 +29,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.8'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.9'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -3118,48 +3118,157 @@ def auto_port_state():
 def save_auto_port_state(st):
     save_json(auto_port_state_path(), st)
 
-# ---------------------------------------------------------------- 防火墙后端
+# ---------------------------------------------------------------- 防火墙兼容层
+# 目标：不同发行版用不同防火墙（ufw / firewalld / nftables / iptables / Windows），
+# 这里统一探测、统一操作，并对"未启用"的情况给出可执行的启用方案。
+
+def os_release():
+    """Parse /etc/os-release into a dict (best effort)."""
+    data = {}
+    try:
+        text = Path('/etc/os-release').read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return data
+    for line in text.splitlines():
+        if '=' in line:
+            key, value = line.split('=', 1)
+            data[key.strip()] = value.strip().strip('"').strip("'")
+    return data
+
+def os_family():
+    """Return 'debian' | 'rhel' | 'suse' | 'alpine' | 'arch' | 'windows' | 'other'."""
+    if os.name == 'nt': return 'windows'
+    rel = os_release()
+    joined = ((rel.get('ID') or '') + ' ' + (rel.get('ID_LIKE') or '')).lower()
+    for key, family in (('debian', 'debian'), ('ubuntu', 'debian'),
+                        ('rhel', 'rhel'), ('centos', 'rhel'), ('fedora', 'rhel'),
+                        ('rocky', 'rhel'), ('alma', 'rhel'), ('oracle', 'rhel'),
+                        ('suse', 'suse'), ('opensuse', 'suse'),
+                        ('alpine', 'alpine'), ('arch', 'arch'), ('manjaro', 'arch')):
+        if key in joined: return family
+    return 'other'
+
+def preferred_firewall():
+    """Distro-appropriate firewall manager to recommend."""
+    family = os_family()
+    if family == 'debian': return 'ufw'
+    if family in ('rhel', 'suse'): return 'firewalld'
+    if family == 'windows': return 'windows'
+    return 'nftables'          # alpine / arch / other 默认 nftables
+
+def _cmd_out(args, timeout=10):
+    try:
+        return (run_cmd(args, capture_output=True, text=True, timeout=timeout).stdout or '')
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ''
+
+def _cmd_ok(args, timeout=10):
+    try:
+        return run_cmd(args, capture_output=True, text=True, timeout=timeout).returncode == 0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+def _iptables_effective(rules):
+    """Meaningful host firewall = INPUT chain policy DROP/REJECT."""
+    for line in (rules or '').splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == '-P' and parts[1] == 'INPUT':
+            return parts[2].upper() in ('DROP', 'REJECT')
+    return False
+
+def _nft_effective(rules):
+    low = (rules or '').lower()
+    return 'hook input' in low and 'policy drop' in low
+
+def firewall_detect():
+    """Comprehensive firewall detection across distros.
+
+    Returns {
+      'backend': 'ufw'|'firewalld'|'nftables'|'iptables'|'windows'|'',
+      'active': bool,
+      'available': [已安装的管理器],
+      'family': os_family(),
+      'preferred': 推荐管理器,
+      'detail': {管理器: 'active'|'installed'|'missing'}
+    }
+    """
+    family = os_family()
+    preferred = preferred_firewall()
+    info = {'backend': '', 'active': False, 'available': [], 'family': family,
+            'preferred': preferred, 'detail': {}}
+    if TEST:
+        info.update({'backend': 'ufw', 'active': True, 'available': ['ufw']})
+        info['detail'] = {'ufw': 'active', 'simulated': 'test'}
+        return info
+    if family == 'windows':
+        out = _cmd_out(['netsh', 'advfirewall', 'show', 'allprofiles', 'state'])
+        active = 'ON' in (out or '').upper()
+        info['available'] = ['windows'] if shutil.which('netsh') else []
+        info['detail'] = {'windows': 'active' if active else 'installed'}
+        if active: info.update({'backend': 'windows', 'active': True})
+        return info
+
+    ufw_installed = bool(shutil.which('ufw'))
+    fwd_installed = bool(shutil.which('firewall-cmd'))
+    nft_installed = bool(shutil.which('nft'))
+    ipt_installed = bool(shutil.which('iptables'))
+    if ufw_installed: info['available'].append('ufw')
+    if fwd_installed: info['available'].append('firewalld')
+    if nft_installed: info['available'].append('nftables')
+    if ipt_installed: info['available'].append('iptables')
+
+    ufw_active = fwd_active = False
+    if ufw_installed:
+        ufw_active = 'status: active' in _cmd_out(['ufw', 'status']).lower()
+        info['detail']['ufw'] = 'active' if ufw_active else 'installed'
+    if fwd_installed:
+        fwd_active = _cmd_out(['firewall-cmd', '--state']).strip().lower() == 'running'
+        info['detail']['firewalld'] = 'active' if fwd_active else 'installed'
+    if ipt_installed:
+        info['detail']['iptables'] = 'active' if _iptables_effective(_cmd_out(['iptables', '-S'])) else 'installed'
+    if nft_installed:
+        info['detail']['nftables'] = 'active' if _nft_effective(_cmd_out(['nft', 'list', 'ruleset'])) else 'installed'
+
+    # 优先选"真正在生效"的那一个；高级管理器优先（ufw 管理 iptables，firewalld 管理 nft）
+    if ufw_active: info.update({'backend': 'ufw', 'active': True})
+    elif fwd_active: info.update({'backend': 'firewalld', 'active': True})
+    elif info['detail'].get('iptables') == 'active': info.update({'backend': 'iptables', 'active': True})
+    elif info['detail'].get('nftables') == 'active': info.update({'backend': 'nftables', 'active': True})
+    return info
 
 def firewall_backend():
-    """Return (backend, active). Backend is 'ufw' | 'firewalld' | 'iptables' | ''."""
-    if TEST: return ('ufw', True)
-    try:
-        if shutil.which('ufw'):
-            out = run_cmd(['ufw', 'status'], capture_output=True, text=True, timeout=10)
-            return ('ufw', 'status: active' in (out.stdout or '').lower())
-        if shutil.which('firewall-cmd'):
-            out = run_cmd(['firewall-cmd', '--state'], capture_output=True, text=True, timeout=10)
-            return ('firewalld', (out.stdout or '').strip() == 'running')
-        if shutil.which('iptables'):
-            out = run_cmd(['iptables', '-S'], capture_output=True, text=True, timeout=10)
-            return ('iptables', bool((out.stdout or '').strip()))
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    return ('', False)
+    """Compatibility wrapper: (backend, active)."""
+    info = firewall_detect()
+    return (info['backend'], info['active'])
 
 def firewall_port_open(port, proto):
-    """True when the backend already allows that port."""
-    backend, active = firewall_backend()
+    """True when the active backend already allows that port."""
+    info = firewall_detect()
+    backend, active = info['backend'], info['active']
     if not active: return False
     needle = '%d/%s' % (port, proto)
     try:
         if backend == 'ufw':
-            out = run_cmd(['ufw', 'status'], capture_output=True, text=True, timeout=10)
-            for line in (out.stdout or '').splitlines():
+            for line in _cmd_out(['ufw', 'status']).splitlines():
                 if line.strip().startswith(needle) and 'ALLOW' in line.upper():
                     return True
             return False
         if backend == 'firewalld':
-            out = run_cmd(['firewall-cmd', '--query-port=' + needle],
-                          capture_output=True, text=True, timeout=10)
-            return out.returncode == 0
+            return _cmd_ok(['firewall-cmd', '--query-port=' + needle])
+        if backend == 'windows':
+            return _cmd_ok(['netsh', 'advfirewall', 'firewall', 'show', 'rule',
+                            'name=' + _win_rule_name(port, proto)])
         if backend == 'iptables':
-            out = run_cmd(['iptables', '-C', 'INPUT', '-p', proto, '--dport', str(port), '-j', 'ACCEPT'],
-                          capture_output=True, text=True, timeout=10)
-            return out.returncode == 0
+            return _cmd_ok(['iptables', '-C', 'INPUT', '-p', proto, '--dport', str(port), '-j', 'ACCEPT'])
+        if backend == 'nftables':
+            out = _cmd_out(['nft', 'list', 'chain', 'inet', 'filter', 'input'])
+            return ('%s dport %d' % (proto, port)) in out and 'accept' in out.lower()
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
     return False
+
+def _win_rule_name(port, proto):
+    return 'frp-simple-bash-auto-%s-%d' % (proto, port)
 
 def _persist_iptables():
     """Best-effort persistence so rules survive a reboot."""
@@ -3173,12 +3282,13 @@ def _persist_iptables():
 
 def firewall_add_port(port, proto):
     """Allow one port in the detected backend. Raises ValueError on failure."""
-    backend, active = firewall_backend()
+    info = firewall_detect()
+    backend, active = info['backend'], info['active']
     if not backend:
-        raise ValueError('未检测到 ufw / firewalld / iptables，无法自动放行端口')
+        raise ValueError('未检测到防火墙（' + _firewall_hint_text(info) + '）')
     if not active:
-        raise ValueError('系统防火墙未启用（检测到 %s 但未运行），拒绝自动放行。'
-                         '安全组已全开时这会让服务器全端口暴露。' % backend)
+        raise ValueError('系统防火墙未启用（检测到 %s 但未运行）。' % backend
+                         + '请先执行 `frps ports firewall enable` 或手动启用后再同步。')
     needle = '%d/%s' % (port, proto)
     try:
         if backend == 'ufw':
@@ -3188,19 +3298,34 @@ def firewall_add_port(port, proto):
                           capture_output=True, text=True, timeout=20)
             if out.returncode == 0:
                 run_cmd(['firewall-cmd', '--reload'], capture_output=True, text=True, timeout=30)
-        else:
+        elif backend == 'windows':
+            protocol = 'TCP' if proto == 'tcp' else 'UDP'
+            out = run_cmd(['netsh', 'advfirewall', 'firewall', 'add', 'rule',
+                           'name=' + _win_rule_name(port, proto), 'dir=in', 'action=allow',
+                           'protocol=' + protocol, 'localport=' + str(port)],
+                          capture_output=True, text=True, timeout=20)
+        elif backend == 'iptables':
             out = run_cmd(['iptables', '-I', 'INPUT', '-p', proto, '--dport', str(port),
                            '-j', 'ACCEPT', '-m', 'comment', '--comment', 'frp-simple-bash:auto'],
                           capture_output=True, text=True, timeout=20)
             if out.returncode == 0: _persist_iptables()
+        else:  # nftables
+            if not _cmd_ok(['nft', 'list', 'table', 'inet', 'filter']):
+                raise ValueError('当前系统使用 nftables，但未找到标准 inet filter 表；'
+                                 '请手动放行 ' + needle + '，或安装 ufw/firewalld。')
+            out = run_cmd(['nft', 'add', 'rule', 'inet', 'filter', 'input',
+                           proto, 'dport', str(port), 'accept',
+                           'comment', '"frp-simple-bash:auto"'],
+                          capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.SubprocessError) as exc:
         raise ValueError('防火墙放行失败：' + str(exc))
     if out.returncode != 0:
-        raise ValueError('防火墙放行失败：' + (out.stderr or '').strip())
+        raise ValueError('防火墙放行失败：' + (out.stderr or out.stdout or '').strip())
 
 def firewall_del_port(port, proto):
     """Remove one port rule added by this tool."""
-    backend, active = firewall_backend()
+    info = firewall_detect()
+    backend, active = info['backend'], info['active']
     if not backend or not active: return
     needle = '%d/%s' % (port, proto)
     try:
@@ -3211,13 +3336,191 @@ def firewall_del_port(port, proto):
                           capture_output=True, text=True, timeout=20)
             if out.returncode == 0:
                 run_cmd(['firewall-cmd', '--reload'], capture_output=True, text=True, timeout=30)
-        else:
+        elif backend == 'windows':
+            run_cmd(['netsh', 'advfirewall', 'firewall', 'delete', 'rule',
+                     'name=' + _win_rule_name(port, proto)],
+                    capture_output=True, text=True, timeout=20)
+        elif backend == 'iptables':
             run_cmd(['iptables', '-D', 'INPUT', '-p', proto, '--dport', str(port),
                      '-j', 'ACCEPT', '-m', 'comment', '--comment', 'frp-simple-bash:auto'],
                     capture_output=True, text=True, timeout=20)
             _persist_iptables()
+        else:
+            run_cmd(['nft', 'delete', 'rule', 'inet', 'filter', 'input',
+                     proto, 'dport', str(port), 'accept'],
+                    capture_output=True, text=True, timeout=20)
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
+
+# ---------------------------------------------------------------- 防火墙启用引导
+
+def ssh_listen_ports(strict=True):
+    """Ports sshd actually listens on. strict=True refuses to guess.
+
+    误判 SSH 端口会在启用防火墙时把用户锁在服务器外面，所以这里要么拿到
+    权威结果（监听套接字 / sshd_config），要么直接拒绝自动启用。
+    """
+    ports = set()
+    detected = False
+    for line in _cmd_out(['ss', '-lntp']).splitlines():
+        if 'sshd' in line:
+            for match in re.finditer(r':(\d+)\b', line):
+                try: ports.add(int(match.group(1)))
+                except ValueError: pass
+            detected = True
+    if not detected:
+        try:
+            for line in Path('/etc/ssh/sshd_config').read_text(encoding='utf-8', errors='replace').splitlines():
+                stripped = line.strip()
+                if stripped.lower().startswith('port '):
+                    value = stripped.split()[1]
+                    if value.isdigit():
+                        ports.add(int(value)); detected = True
+        except OSError:
+            pass
+    if not ports:
+        if strict:
+            raise ValueError('无法确定 SSH 监听端口，拒绝自动启用防火墙（可能把你锁在服务器外）。'
+                             '请手动放行 SSH 端口后再启用。')
+        ports.add(22)
+    return sorted(ports)
+
+def frps_keep_ports():
+    """Ports frps itself needs before/after enabling a firewall."""
+    ports = []
+    try:
+        data = read_toml(ROOT / 'frps.toml') if (ROOT / 'frps.toml').exists() else {}
+    except (ValueError, OSError):
+        data = {}
+    def add(key, proto='tcp'):
+        value = data.get(key)
+        if isinstance(value, int) and 0 < value < 65536:
+            ports.append((value, proto))
+    add('bindPort')
+    for key in ('vhostHTTPPort', 'vhostHTTPSPort', 'tcpmuxHTTPConnectPort', 'kcpBindPort', 'quicBindPort'):
+        add(key)
+    web = data.get('webServer') or {}
+    if web.get('port') and str(web.get('addr', '127.0.0.1')) not in ('127.0.0.1', '::1'):
+        try: ports.append((int(web['port']), 'tcp'))
+        except (TypeError, ValueError): pass
+    # 已由本工具放行的映射端口也要保留
+    for rec in auto_port_state().get('opened') or []:
+        try: ports.append((int(rec['port']), str(rec.get('proto', 'tcp'))))
+        except (KeyError, TypeError, ValueError): continue
+    seen, unique = set(), []
+    for item in ports:
+        if item in seen: continue
+        seen.add(item); unique.append(item)
+    return unique
+
+def _install_command(manager):
+    """Distro-appropriate install command for a firewall manager."""
+    family = os_family()
+    package = {'ufw': 'ufw', 'firewalld': 'firewalld', 'nftables': 'nftables'}.get(manager, manager)
+    if manager == 'windows': return []
+    if family == 'debian': return ['apt-get', 'install', '-y', package]
+    if family == 'rhel': return ['dnf', 'install', '-y', package]
+    if family == 'suse': return ['zypper', '--non-interactive', 'install', package]
+    if family == 'alpine': return ['apk', 'add', package]
+    if family == 'arch': return ['pacman', '-S', '--noconfirm', package]
+    return []
+
+def firewall_enable_plan():
+    """Build a SAFE enable plan: SSH first, then frps ports, then activate."""
+    info = firewall_detect()
+    family = info['family']
+    target = info['preferred']
+    installed = target in info['available']
+    if not installed and target not in ('ufw', 'firewalld', 'nftables'):
+        raise ValueError('当前系统（%s）没有可自动启用的防火墙管理器，请手动配置。' % family)
+    ssh_ports = ssh_listen_ports(strict=True)
+    keep = frps_keep_ports()
+    install_cmds, allow_cmds, notes = [], [], []
+    if not installed:
+        cmd = _install_command(target)
+        if not cmd:
+            raise ValueError('无法为 %s 推断包管理器，请手动安装 %s。' % (family, target))
+        install_cmds.append(cmd)
+    for port in ssh_ports:
+        if target == 'ufw':
+            allow_cmds.append(['ufw', 'allow', '%d/tcp' % port])
+        elif target == 'firewalld':
+            allow_cmds.append(['firewall-cmd', '--permanent', '--add-port=%d/tcp' % port])
+        elif target == 'nftables':
+            allow_cmds.append(['nft', 'add', 'rule', 'inet', 'filter', 'input',
+                               'tcp', 'dport', str(port), 'accept'])
+    for port, proto in keep:
+        if target == 'ufw':
+            allow_cmds.append(['ufw', 'allow', '%d/%s' % (port, proto)])
+        elif target == 'firewalld':
+            allow_cmds.append(['firewall-cmd', '--permanent', '--add-port=%d/%s' % (port, proto)])
+        elif target == 'nftables':
+            allow_cmds.append(['nft', 'add', 'rule', 'inet', 'filter', 'input',
+                               proto, 'dport', str(port), 'accept'])
+    if target == 'ufw':
+        enable_cmds = [['ufw', '--force', 'enable']]
+    elif target == 'firewalld':
+        enable_cmds = [['systemctl', 'enable', '--now', 'firewalld']]
+    elif target == 'nftables':
+        enable_cmds = []
+        notes.append('nftables 没有"启用"开关：需要先把上面的规则写入 /etc/nftables.conf，'
+                     '再执行 systemctl enable --now nftables。')
+    else:
+        enable_cmds = []
+    notes.append('SSH 端口：' + ', '.join(str(p) for p in ssh_ports) + '（会最先放行，避免自锁）')
+    return {'target': target, 'family': family, 'installed': installed,
+            'ssh_ports': ssh_ports, 'keep': keep,
+            'install_cmds': install_cmds, 'allow_cmds': allow_cmds,
+            'enable_cmds': enable_cmds, 'notes': notes}
+
+def firewall_enable(yes=False):
+    """Install (if needed) and enable a firewall, SSH-safe.
+
+    Order is strictly: 放行 SSH → 放行 frps 端口 → 启用防火墙。
+    任一 SSH 放行失败即中止，绝不在没放行 SSH 的情况下启用。
+    """
+    plan = firewall_enable_plan()
+    if not yes and not confirm(
+            '将启用防火墙：' + plan['target'] + '\n'
+            '会先放行 SSH 端口 ' + ', '.join(str(p) for p in plan['ssh_ports']) + '，'
+            '再放行 frps 端口，最后启用。确认继续？', danger=True):
+        return {'ok': False, 'reason': 'cancelled', 'plan': plan}
+    for cmd in plan['install_cmds']:
+        out = run_cmd(cmd, capture_output=True, text=True, timeout=300)
+        if out.returncode != 0:
+            raise ValueError('安装失败：' + ' '.join(cmd) + ' — ' + (out.stderr or '').strip())
+    ssh_allowed = 0
+    for cmd in plan['allow_cmds']:
+        is_ssh = any((':%d' % port) in ' '.join(cmd) or ('%d/' % port) in ' '.join(cmd)
+                     for port in plan['ssh_ports'])
+        out = run_cmd(cmd, capture_output=True, text=True, timeout=30)
+        if out.returncode != 0 and is_ssh:
+            raise ValueError('放行 SSH 端口失败，已中止启用（未启用防火墙，安全）：'
+                             + (out.stderr or '').strip())
+        if is_ssh: ssh_allowed += 1
+    if ssh_allowed == 0:
+        raise ValueError('未能放行任何 SSH 端口，已中止启用。')
+    for cmd in plan['enable_cmds']:
+        out = run_cmd(cmd, capture_output=True, text=True, timeout=120)
+        if out.returncode != 0:
+            raise ValueError('启用失败：' + ' '.join(cmd) + ' — ' + (out.stderr or '').strip())
+    info = firewall_detect()
+    ports_audit('firewall-enable', result='ok' if info['active'] else 'inactive',
+                detail='%s family=%s ssh=%s' % (plan['target'], plan['family'],
+                                                ','.join(str(p) for p in plan['ssh_ports'])))
+    return {'ok': info['active'], 'reason': '' if info['active'] else 'not-active', 'plan': plan}
+
+def _firewall_hint_text(info):
+    """One-line guidance describing what to do about the missing firewall."""
+    family = info.get('family', 'other')
+    preferred = info.get('preferred', '')
+    available = info.get('available') or []
+    if available:
+        return '已安装 %s 但均未启用，可执行 `frps ports firewall enable`' % '/'.join(available)
+    if family == 'windows':
+        return 'Windows 防火墙未启用，可用 netsh advfirewall set allprofiles state on'
+    return ('当前发行版（%s）未安装防火墙；建议安装 %s 后执行 `frps ports firewall enable`'
+            % (family, preferred or 'ufw'))
 
 # ---------------------------------------------------------------- 端口占用检查
 
@@ -3329,7 +3632,9 @@ def ports_sync(apply_changes=True):
     backend, active = firewall_backend()
     report['backend'] = backend
     if apply_changes and not active:
-        raise ValueError('系统防火墙未启用（%s 未运行），拒绝自动放行端口。' % (backend or '无后端'))
+        info = firewall_detect()
+        raise ValueError('系统防火墙未启用，拒绝自动放行端口。\n  发行版：%s\n  %s'
+                         % (info.get('family', 'other'), _firewall_hint_text(info)))
     desired, skipped = ports_desired(cfg)
     report['skipped'] = skipped
     st = auto_port_state()
@@ -3568,7 +3873,8 @@ def auto_port_menu():
         print(RULE)
         items = ['查看状态明细', '预览变更计划（不执行）', '立即同步一次',
                  '关闭功能' if cfg['enabled'] else '启用功能',
-                 '管理客户端白名单', '查看已放行规则', '撤销全部自动放行']
+                 '管理客户端白名单', '查看已放行规则', '撤销全部自动放行',
+                 '防火墙检测与启用']
         n = choose(items, '端口自动开通', '返回上一级')
         if not n: return
         try:
@@ -3613,9 +3919,58 @@ def auto_port_menu():
                     result_info('已取消。'); pause(); continue
                 removed = ports_revert()
                 result_ok('已撤销 %d 条自动放行规则。' % len(removed)); pause()
+            elif n == 8:
+                auto_port_firewall_menu(); pause()
         except MENU_ERRORS as exc:
             result_error(str(exc)); pause()
 
+def auto_port_firewall_menu():
+    """防火墙检测与启用子菜单。"""
+    clear_screen()
+    while True:
+        info = firewall_detect()
+        print('  ' + _kv('发行版', info['family']))
+        print('  ' + _kv('推荐管理器', info['preferred']))
+        print('  ' + _kv('当前后端', (info['backend'] if info['active'] else color_state('未启用'))))
+        for name, state in sorted((info.get('detail') or {}).items()):
+            if name == 'simulated': continue
+            print('  ' + _pad_line('  - ' + name, 20) + color_state(state))
+        print(RULE)
+        if not info['active']:
+            result_info(_firewall_hint_text(info))
+        items = ['查看检测详情', '预览启用计划（不执行）', '一键启用（先放行 SSH，避免自锁）']
+        n = choose(items, '防火墙检测与启用', '返回上一级')
+        if not n: return
+        try:
+            if n == 1:
+                lines = ['发行版：%s' % info['family'],
+                         '推荐管理器：%s' % info['preferred'],
+                         '当前后端：%s（%s）' % (info['backend'] or '无', '运行中' if info['active'] else '未启用'),
+                         '已安装：%s' % (', '.join(info['available']) or '无')]
+                _report('防火墙检测详情', lines); pause()
+            elif n == 2:
+                plan = firewall_enable_plan()
+                lines = ['目标管理器：%s（发行版 %s）' % (plan['target'], plan['family'])]
+                if plan['install_cmds']:
+                    lines.append('安装命令：' + ' '.join(plan['install_cmds'][0]))
+                lines.append('先放行 SSH：' + ', '.join(str(p) for p in plan['ssh_ports']))
+                lines.append('再放行 frps 端口：'
+                             + (', '.join('%d/%s' % (p, t) for p, t in plan['keep']) or '无'))
+                lines.append('最后启用：' + (' '.join(plan['enable_cmds'][0]) if plan['enable_cmds'] else '见说明'))
+                for note in plan['notes']: lines.append('说明：' + note)
+                _report('启用计划（未执行）', lines); pause()
+            elif n == 3:
+                result = firewall_enable(yes=False)
+                if result['ok']:
+                    result_ok('防火墙已启用：' + result['plan']['target'])
+                    if auto_port_config()['enabled']:
+                        report = ports_sync(apply_changes=True)
+                        _report('同步结果', auto_port_report_lines(report))
+                else:
+                    result_info('已取消，未做任何修改。')
+                pause()
+        except MENU_ERRORS as exc:
+            result_error(str(exc)); pause()
 def auto_port_clients_menu():
     """Manage the clientID whitelist."""
     clear_screen()
@@ -3724,6 +4079,44 @@ def ports_command(argv, flags=None):
             result_ok(('已加入白名单：' if sub == 'add' else '已移除：') + target)
             return
         raise ValueError('支持 ports clients list|discover|add|remove')
+    if action == 'firewall':
+        sub = argv[1] if len(argv) > 1 else 'status'
+        info = firewall_detect()
+        if sub == 'status':
+            if as_json:
+                print(json.dumps(info, ensure_ascii=False, indent=2, default=str)); return
+            section('防火墙检测')
+            print(_kv('发行版', info['family']))
+            print(_kv('推荐管理器', info['preferred']))
+            print(_kv('当前后端', (info['backend'] or '未检测到') if info['active']
+                       else color_state('未启用')))
+            for name, state in sorted((info.get('detail') or {}).items()):
+                print('  ' + _pad_line('  - ' + name, 20) + state)
+            if not info['active']:
+                print()
+                result_info(_firewall_hint_text(info))
+            print(RULE); return
+        if sub == 'plan':
+            plan = firewall_enable_plan()
+            if as_json:
+                print(json.dumps(plan, ensure_ascii=False, indent=2, default=str)); return
+            lines = ['目标管理器：%s（发行版 %s）' % (plan['target'], plan['family'])]
+            if plan['install_cmds']:
+                lines.append('安装：' + ' '.join(plan['install_cmds'][0]))
+            lines.append('放行 SSH：' + ', '.join(str(p) for p in plan['ssh_ports']))
+            lines.append('放行 frps 端口：' + (', '.join('%d/%s' % (p, t) for p, t in plan['keep']) or '无'))
+            for note in plan['notes']: lines.append('说明：' + note)
+            _report('启用计划（未执行）', lines); return
+        if sub == 'enable':
+            result = firewall_enable(yes=bool(flags.get('yes')))
+            if result['ok']:
+                result_ok('防火墙已启用：' + result['plan']['target'])
+                ports_sync(apply_changes=True)
+            else:
+                result_error('防火墙未启用（%s）' % (result.get('reason') or '未知'),
+                             hint='可先执行 `frps ports firewall plan` 查看将要执行的命令。')
+            return
+        raise ValueError('支持 ports firewall status|plan|enable')
     if action == 'rules':
         opened = auto_port_state().get('opened') or []
         if as_json: print(json.dumps(opened, ensure_ascii=False, indent=2)); return

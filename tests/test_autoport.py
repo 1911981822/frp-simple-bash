@@ -181,7 +181,10 @@ class AutoPortTests(unittest.TestCase):
     def test_sync_refuses_when_firewall_inactive(self):
         cfg = self.cfg(enabled=True, allow_clients=['clientA'])
         m.save_auto_port_config(cfg)
-        with patch.object(m, 'firewall_backend', return_value=('ufw', False)):
+        detected = {'backend': 'ufw', 'active': False, 'available': ['ufw'],
+                    'family': 'debian', 'preferred': 'ufw', 'detail': {},
+                    'panels': [], 'conflict': False}
+        with patch.object(m, 'firewall_detect', return_value=detected):
             with self.assertRaises(ValueError):
                 m.ports_sync(apply_changes=True)
 
@@ -473,6 +476,97 @@ class AutoPortTests(unittest.TestCase):
         shown = out.getvalue()
         self.assertLess(shown.index('端口自动开通'), shown.index('功能状态'))
         self.assertLess(shown.index('功能状态'), shown.index('状态与预览'))
+
+
+    # ---- 面板接管（宝塔等）兼容 ----
+
+    def test_panel_detect_finds_baota(self):
+        with patch.object(m, 'TEST', False), \
+             patch.object(m.os, 'name', 'posix'), \
+             patch.object(m.shutil, 'which', return_value=None), \
+             patch.object(m.Path, 'exists', return_value=True):
+            panels = m.panel_detect()
+        self.assertTrue(any(p['key'] == 'baota' for p in panels))
+
+    def test_panel_detect_clean_machine(self):
+        with patch.object(m, 'TEST', False), \
+             patch.object(m.os, 'name', 'posix'), \
+             patch.object(m.shutil, 'which', return_value=None), \
+             patch.object(m.Path, 'exists', return_value=False):
+            self.assertEqual(m.panel_detect(), [])
+
+    def test_firewall_mode_defaults_to_readonly_with_panel(self):
+        info = {'panels': [{'key': 'baota', 'name': '宝塔面板 / aaPanel'}],
+                'detail': {'iptables': 'active'}, 'backend': 'iptables', 'active': True,
+                'managers': ['iptables'], 'conflict': True}
+        self.assertEqual(m.firewall_mode(info), 'readonly')
+
+    def test_firewall_mode_defaults_to_direct_without_panel(self):
+        info = {'panels': [], 'detail': {'ufw': 'active'}, 'backend': 'ufw',
+                'active': True, 'managers': ['ufw'], 'conflict': False}
+        self.assertEqual(m.firewall_mode(info), 'direct')
+
+    def test_firewall_mode_override(self):
+        cfg = self.cfg(panel_mode='direct')
+        m.save_auto_port_config(cfg)
+        info = {'panels': [{'key': 'baota', 'name': '宝塔'}], 'detail': {},
+                'backend': '', 'active': False}
+        self.assertEqual(m.firewall_mode(info), 'direct')
+        cfg['panel_mode'] = 'readonly'
+        m.save_auto_port_config(cfg)
+        self.assertEqual(m.firewall_mode(info), 'readonly')
+
+    def test_sync_readonly_mode_never_touches_firewall(self):
+        cfg = self.cfg(enabled=True, allow_clients=['clientA'], panel_mode='readonly')
+        m.save_auto_port_config(cfg)
+        detected = {'backend': 'iptables', 'active': True, 'available': ['iptables'],
+                    'family': 'debian', 'preferred': 'ufw', 'detail': {'iptables': 'active'},
+                    'panels': [{'key': 'baota', 'name': '宝塔面板 / aaPanel'}],
+                    'managers': ['iptables'], 'conflict': True}
+        with patch.object(m, 'firewall_detect', return_value=detected), \
+             patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]), \
+             patch.object(m, 'port_conflict', return_value=False), \
+             patch.object(m, '_service_pid', return_value=1), \
+             patch.object(m, 'firewall_open_ports', return_value=set()), \
+             patch.object(m, 'firewall_add_port') as add, \
+             patch.object(m, 'firewall_del_port') as delete:
+            report = m.ports_sync(apply_changes=True)
+        add.assert_not_called()
+        delete.assert_not_called()
+        self.assertEqual(report['mode'], 'readonly')
+        self.assertEqual([x['port'] for x in report['manual']], [6000])
+        self.assertTrue(report['conflict'])
+        self.assertEqual(m.auto_port_state()['opened'], [])   # 不改状态
+
+    def test_sync_detects_rules_cleared_by_panel(self):
+        cfg = self.cfg(enabled=True, allow_clients=['clientA'], panel_mode='direct')
+        m.save_auto_port_config(cfg)
+        m.save_auto_port_state({'schema_version': 1, 'backend': 'iptables', 'opened': [
+            {'port': 6000, 'proto': 'tcp', 'client_id': 'clientA', 'proxy': 'ssh'}]})
+        detected = {'backend': 'iptables', 'active': True, 'available': ['iptables'],
+                    'family': 'debian', 'preferred': 'ufw', 'detail': {'iptables': 'active'},
+                    'panels': [], 'managers': ['iptables'], 'conflict': False}
+        with patch.object(m, 'firewall_detect', return_value=detected), \
+             patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]), \
+             patch.object(m, 'port_conflict', return_value=False), \
+             patch.object(m, '_service_pid', return_value=1), \
+             patch.object(m, 'firewall_open_ports', return_value=set()), \
+             patch.object(m, 'firewall_add_port'):
+            report = m.ports_sync(apply_changes=True)
+        self.assertEqual([(x['port'], x['proto']) for x in report['lost']], [(6000, 'tcp')])
+        self.assertIn('rule-lost', m.auto_port_audit_path().read_text())
+
+    def test_report_mentions_readonly_and_conflict(self):
+        report = {'mode': 'readonly', 'backend': 'iptables', 'panels': ['宝塔面板'],
+                  'conflict': True, 'manual': [{'port': 6000, 'proto': 'tcp', 'proxy': 'ssh'}],
+                  'lost': [{'port': 6001, 'proto': 'tcp'}], 'added': [], 'removed': [],
+                  'kept': [], 'skipped': []}
+        text = '\n'.join(m.auto_port_report_lines(report))
+        self.assertIn('只读', text)
+        self.assertIn('宝塔面板', text)
+        self.assertIn('冲突', text)
+        self.assertIn('待手动放行：6000/tcp', text)
+        self.assertIn('规则已丢失：6001/tcp', text)
 
 
 if __name__ == '__main__':

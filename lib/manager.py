@@ -29,7 +29,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.10'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.11'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -3088,6 +3088,7 @@ def auto_port_config():
         'deny_ports': deny_list,
         'sync_interval_seconds': max(5, interval),
         'prune_after_seconds': max(10, prune),
+        'panel_mode': str(raw.get('panel_mode', 'auto') or 'auto').lower(),
     }
 
 def save_auto_port_config(cfg):
@@ -3102,6 +3103,7 @@ def save_auto_port_config(cfg):
         'deny_ports': list(cfg['deny_ports']),
         'sync_interval_seconds': int(cfg['sync_interval_seconds']),
         'prune_after_seconds': int(cfg['prune_after_seconds']),
+        'panel_mode': str(cfg.get('panel_mode', 'auto')),
     }
     atomic(auto_port_config_path(), toml(payload))
     try: os.chmod(str(auto_port_config_path()), 0o600)
@@ -3234,8 +3236,115 @@ def firewall_detect():
     elif fwd_active: info.update({'backend': 'firewalld', 'active': True})
     elif info['detail'].get('iptables') == 'active': info.update({'backend': 'iptables', 'active': True})
     elif info['detail'].get('nftables') == 'active': info.update({'backend': 'nftables', 'active': True})
+    info['panels'] = panel_detect()
+    info['managers'] = firewall_managers(info)
+    # 面板 + 系统防火墙同时管理 → 可能互相覆盖
+    info['conflict'] = bool(info['panels']) and bool(info['managers'])
     return info
 
+# ---------------------------------------------------------------- 面板接管检测
+# 宝塔/aaPanel/小皮/1Panel/cPanel/Plesk 都是"防火墙管理层"，它们直接操作
+# iptables 或 firewalld。面板接管时若我们直接写系统防火墙，规则可能在面板
+# 重载时被覆盖而静默失效，所以必须显性识别并默认切只读。
+
+PANEL_ROOTS = (
+    ('/www/server/panel', 'baota', '宝塔面板 / aaPanel'),
+    ('/www/server/phpstudy', 'xiaopi', '小皮面板'),
+    ('/xp/server', 'xiaopi', '小皮面板'),
+    ('/opt/1panel', '1panel', '1Panel'),
+    ('/usr/local/cpanel', 'cpanel', 'cPanel'),
+    ('/usr/local/psa', 'plesk', 'Plesk'),
+)
+
+def panel_detect():
+    """Detect panel software that manages the firewall. Read-only probes."""
+    if TEST: return []
+    panels = []
+    try:
+        roots = list(PANEL_ROOTS)
+        if os.name == 'nt':
+            roots = [((os.environ.get('ProgramFiles', 'C:/Program Files') + '/btpanel'),
+                      'baota', '宝塔面板（Windows）')]
+        seen = set()
+        for path, key, name in roots:
+            try:
+                exists = Path(path).exists()
+            except OSError:
+                exists = False
+            if exists and key not in seen:
+                seen.add(key)
+                panels.append({'key': key, 'name': name, 'path': path})
+        if os.name != 'nt' and shutil.which('bt') and 'baota' not in seen:
+            panels.append({'key': 'baota', 'name': '宝塔面板 / aaPanel', 'path': 'bt'})
+    except (OSError, ValueError):
+        pass
+    return panels
+
+def panel_baota_api_port():
+    """Baota panel port from its own config (best effort, read-only)."""
+    for candidate in ('/www/server/panel/data/port.pl',):
+        try:
+            text = Path(candidate).read_text(encoding='utf-8', errors='replace').strip()
+            if text.isdigit(): return int(text)
+        except OSError:
+            continue
+    return None
+
+def firewall_managers(info=None):
+    """Names of firewall layers that are actually active."""
+    info = info or firewall_detect()
+    detail = info.get('detail') or {}
+    return [name for name in ('ufw', 'firewalld', 'iptables', 'nftables', 'windows')
+            if detail.get(name) == 'active']
+
+def firewall_mode(info=None):
+    """Decide operating mode: 'readonly' | 'direct'.
+
+    auto（默认）：检测到面板接管 → readonly（只生成清单，不安全地写系统防火墙）
+                  无面板         → direct（直写系统防火墙）
+    可用 auto-port.toml 的 panel_mode 覆盖为 readonly / direct。
+    """
+    cfg = auto_port_config()
+    requested = str(cfg.get('panel_mode', 'auto')).lower()
+    info = info or firewall_detect()
+    if requested == 'direct': return 'direct'
+    if requested == 'readonly': return 'readonly'
+    return 'readonly' if (info.get('panels') or []) else 'direct'
+
+def firewall_open_ports():
+    """Set of (port, proto) currently allowed by the active backend (one query)."""
+    info = firewall_detect()
+    backend, active = info['backend'], info['active']
+    opened = set()
+    if not active: return opened
+    try:
+        if backend == 'ufw':
+            for line in _cmd_out(['ufw', 'status']).splitlines():
+                match = re.match(r'\s*(\d+)/(tcp|udp)\s+ALLOW', line, re.I)
+                if match: opened.add((int(match.group(1)), match.group(2).lower()))
+        elif backend == 'firewalld':
+            for token in _cmd_out(['firewall-cmd', '--list-ports']).split():
+                if '/' in token:
+                    port, proto = token.split('/', 1)
+                    if port.isdigit(): opened.add((int(port), proto.lower()))
+        elif backend == 'iptables':
+            for line in _cmd_out(['iptables', '-S', 'INPUT']).splitlines():
+                match = re.search(r'-p (tcp|udp).*--dport (\d+).*-j ACCEPT', line)
+                if match: opened.add((int(match.group(2)), match.group(1).lower()))
+        elif backend == 'nftables':
+            text = _cmd_out(['nft', 'list', 'chain', 'inet', 'filter', 'input'])
+            for match in re.finditer(r'(tcp|udp) dport (\d+)\s+accept', text, re.I):
+                opened.add((int(match.group(2)), match.group(1).lower()))
+        elif backend == 'windows':
+            for rec in auto_port_state().get('opened') or []:
+                try:
+                    if firewall_port_open(int(rec['port']), str(rec['proto'])):
+                        opened.add((int(rec['port']), str(rec['proto'])))
+                except (KeyError, TypeError, ValueError):
+                    continue
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return opened
 def firewall_backend():
     """Compatibility wrapper: (backend, active)."""
     info = firewall_detect()
@@ -3480,8 +3589,16 @@ def firewall_enable(yes=False):
     任一 SSH 放行失败即中止，绝不在没放行 SSH 的情况下启用。
     """
     plan = firewall_enable_plan()
+    info0 = firewall_detect()
+    panel_warning = ''
+    if info0.get('panels'):
+        panel_warning = ('\n⚠ 检测到面板正在管理防火墙：'
+                         + '、'.join(p.get('name', '') for p in info0['panels'])
+                         + '\n直接启用系统防火墙可能与面板冲突（规则被覆盖/顺序错乱）。\n'
+                         '建议改用「只读清单」或在面板里放行端口。\n')
     if not yes and not confirm(
             '将启用防火墙：' + plan['target'] + '\n'
+            + panel_warning +
             '会先放行 SSH 端口 ' + ', '.join(str(p) for p in plan['ssh_ports']) + '，'
             '再放行 frps 端口，最后启用。确认继续？', danger=True):
         return {'ok': False, 'reason': 'cancelled', 'plan': plan}
@@ -3622,27 +3739,49 @@ def ports_desired(cfg=None):
 def ports_sync(apply_changes=True):
     """Reconcile firewall rules with actually-online proxies.
 
-    Returns a report dict: {enabled, backend, added, removed, kept, skipped}.
+    mode=readonly（面板接管）时只生成"待手动放行清单"，绝不写系统防火墙；
+    同时始终检查"曾被我们放行但已不在防火墙中"的规则（面板重载会覆盖）。
     """
     cfg = auto_port_config()
-    report = {'enabled': cfg['enabled'], 'backend': '', 'added': [], 'removed': [],
-              'kept': [], 'skipped': []}
+    info = firewall_detect()
+    mode = firewall_mode(info)
+    report = {'enabled': cfg['enabled'], 'backend': info['backend'], 'mode': mode,
+              'panels': [p.get('name', '') for p in (info.get('panels') or [])],
+              'conflict': bool(info.get('conflict')),
+              'added': [], 'removed': [], 'kept': [], 'skipped': [],
+              'lost': [], 'manual': []}
     if not cfg['enabled']:
         return report
-    backend, active = firewall_backend()
-    report['backend'] = backend
+    active = info['active']
     if apply_changes and not active:
-        info = firewall_detect()
         raise ValueError('系统防火墙未启用，拒绝自动放行端口。\n  发行版：%s\n  %s'
                          % (info.get('family', 'other'), _firewall_hint_text(info)))
     desired, skipped = ports_desired(cfg)
     report['skipped'] = skipped
     st = auto_port_state()
-    st['backend'] = backend
+    st['backend'] = info['backend']
     current = {}
     for rec in st.get('opened') or []:
         try: current[(int(rec['port']), str(rec['proto']))] = rec
         except (KeyError, TypeError, ValueError): continue
+
+    # 规则丢失检测：曾放行过、现在防火墙里已不存在（典型原因：面板重载覆盖）
+    if active:
+        live = firewall_open_ports()
+        for key, rec in current.items():
+            if key in live: continue
+            report['lost'].append({'port': key[0], 'proto': key[1],
+                                   'client_id': rec.get('client_id', ''),
+                                   'proxy': rec.get('proxy', '')})
+            ports_audit('rule-lost', port=key[0], proto=key[1], result='missing',
+                        client_id=rec.get('client_id', ''), proxy=rec.get('proxy', ''))
+
+    # 只读模式：不写防火墙，只给出待手动放行清单
+    if mode == 'readonly':
+        report['manual'] = [{'port': key[0], 'proto': key[1], 'client_id': rec['client_id'],
+                             'proxy': rec['proxy']} for key, rec in sorted(desired.items())]
+        return report
+
     now = time.time()
     keep = []
     for key, rec in sorted(current.items()):
@@ -3650,8 +3789,7 @@ def ports_sync(apply_changes=True):
             rec.pop('missing_since', None)
             rec['proxy'] = desired[key]['proxy']
             rec['client_id'] = desired[key]['client_id']
-            if key not in [((r['port']), r['proto']) for r in report['kept']]:
-                report['kept'].append({'port': key[0], 'proto': key[1]})
+            report['kept'].append({'port': key[0], 'proto': key[1]})
             keep.append(rec)
             desired.pop(key, None)
             continue
@@ -3834,8 +3972,25 @@ def ports_timer_status():
 def auto_port_report_lines(report, plan_only=False):
     """Format a sync report as readable lines."""
     lines = []
+    mode = report.get('mode', 'direct')
+    if mode == 'readonly':
+        lines.append('模式：只读（检测到面板接管，不会修改系统防火墙）')
+        if report.get('panels'):
+            lines.append('面板：' + '、'.join(report['panels']))
+    else:
+        lines.append('模式：直写系统防火墙')
     backend = report.get('backend') or '未检测到'
     lines.append('防火墙后端：' + str(backend))
+    if report.get('conflict'):
+        lines.append('⚠ 冲突：面板与系统防火墙同时在管理，规则可能被互相覆盖')
+    for item in (report.get('manual') or [])[:30]:
+        lines.append('待手动放行：%d/%s%s' % (item['port'], item['proto'],
+                                       ('（' + item.get('proxy', '') + '）') if item.get('proxy') else ''))
+    if report.get('manual'):
+        lines.append('请到面板「安全 → 防火墙」中添加上述端口，或在 frps 中配置面板 API 模式。')
+    for item in report.get('lost') or []:
+        lines.append('⚠ 规则已丢失：%d/%s（可能被面板重载覆盖，建议改用面板 API 或手动重加）'
+                     % (item['port'], item['proto']))
     added = report.get('added') or []
     removed = report.get('removed') or []
     kept = report.get('kept') or []
@@ -3870,6 +4025,12 @@ def auto_port_menu():
             print('  ' + _kv('功能状态', color_state('已启用') if cfg['enabled'] else color_state('未启用')))
             print('  ' + _kv('防火墙', (info['backend'] + '（运行中）') if info['active']
                              else color_state('未启用')))
+            if info.get('panels'):
+                print('  ' + _kv('面板接管', color_state('是') + '：'
+                                 + '、'.join(p.get('name', '') for p in info['panels'])))
+                if info.get('conflict'):
+                    print('  ' + _kv('冲突提示', '\033[1;31m面板与系统防火墙同时管理，规则可能被覆盖\033[0m'
+                                     if UI_COLOR else '面板与系统防火墙同时管理，规则可能被覆盖'))
             print('  ' + _kv('发行版/推荐', str(info['family']) + ' / ' + str(info['preferred'])))
             print('  ' + _kv('白名单', ('%d 个客户端' % len(cfg['allow_clients']))
                              if cfg['allow_clients'] else color_state('空（不会放行任何端口）')))

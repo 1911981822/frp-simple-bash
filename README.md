@@ -111,6 +111,8 @@ sudo frps ports firewall enable  # 启用防火墙（先放行 SSH，避免自�
 | 审计 | `/etc/frp/logs/ports-audit.jsonl` 记录每次开关 |
 | 一键撤销 | 只删本工具添加的规则，不动你自己加的 |
 | 多发行版兼容 | 自动探测 ufw / firewalld / iptables / nftables / Windows 防火墙，按"谁真正生效"选择 |
+| **面板接管识别** | 检测宝塔/aaPanel、小皮、1Panel、cPanel、Plesk；检测到面板时**默认只读**（只生成待放行清单，不改系统防火墙），并显性提示冲突 |
+| 规则丢失告警 | 每次同步复核"曾放行但已不存在"的规则（面板重载会覆盖），立即告警并记审计 |
 | 启用引导 | 没开防火墙时给出命令；`frps ports firewall enable` 会**先放行 SSH** 再启用，避免自锁 |
 
 > ⚠️ 本功能**不做端口区间限制**，且云安全组需你手工配置。
@@ -189,6 +191,7 @@ sudo bash /opt/frp-simple-bash/uninstall.sh frpc --purge --yes   # 彻底卸载
 | [国内下载站部署与维护](docs/国内下载站部署与维护.md) | 镜像站运维说明 |
 | [全量代码审查 Bug 报告](docs/全量代码审查Bug报告.md) | 代码审查记录 |
 | [端口自动开通功能方案](docs/端口自动开通功能方案.md) | 自动放行端口的设计与安全模型 |
+| [面板防火墙兼容方案](docs/面板防火墙兼容方案.md) | 宝塔/小皮等面板接管防火墙时的机制与兼容策略 |
 
 ---
 

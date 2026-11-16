@@ -4,6 +4,7 @@
 回收策略、一键撤销、防火墙命令构造（必须参数化、不得拼接 shell）、审计。
 """
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -567,6 +568,103 @@ class AutoPortTests(unittest.TestCase):
         self.assertIn('冲突', text)
         self.assertIn('待手动放行：6000/tcp', text)
         self.assertIn('规则已丢失：6001/tcp', text)
+
+
+    # ---- 宝塔 API ----
+
+    def test_panel_config_defaults_and_roundtrip(self):
+        panel = m.panel_config()
+        self.assertEqual(panel['type'], 'baota')
+        self.assertFalse(panel['api_key'])
+        panel['url'] = 'http://127.0.0.1:8888'
+        panel['api_key'] = 'secret-key'
+        m.save_panel_config(panel)
+        back = m.panel_config()
+        self.assertEqual(back['url'], 'http://127.0.0.1:8888')
+        self.assertEqual(back['api_key'], 'secret-key')
+        # 不能破坏其它配置段
+        cfg = m.auto_port_config()
+        self.assertEqual(cfg['max_ports_per_client'], 20)
+        self.assertTrue(cfg['deny_ports'])
+        self.assertEqual((self.tmp / 'auto-port.toml').stat().st_mode & 0o777, 0o600)
+
+    def test_panel_api_ready(self):
+        panel = m.panel_config()
+        self.assertFalse(m.panel_api_ready(panel))
+        panel['api_key'] = 'k'
+        self.assertTrue(m.panel_api_ready(panel))
+
+    def test_panel_signature_format(self):
+        stamp, token = m._panel_sign('abc')
+        self.assertTrue(stamp.isdigit())
+        expected = hashlib.md5((stamp + hashlib.md5(b'abc').hexdigest()).encode()).hexdigest()
+        self.assertEqual(token, expected)
+
+    def test_panel_request_builds_signed_post(self):
+        captured = {}
+        class FakeResponse:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b'{"status": true, "data": []}'
+        class FakeOpener:
+            def open(self, request, timeout=None):
+                captured['url'] = request.full_url
+                captured['data'] = request.data.decode()
+                return FakeResponse()
+        panel = {'type': 'baota', 'url': 'http://127.0.0.1:8888', 'api_key': 'k',
+                 'verify_tls': False, 'timeout': 5, 'node': '', 'mode': 'auto',
+                 'list_action': 'GetRules', 'add_action': 'AddRule', 'del_action': 'DelRule'}
+        with patch.object(m.urllib.request, 'build_opener', return_value=FakeOpener()):
+            payload = m.panel_request('AddRule', {'port': 6000, 'types': 'tcp'}, panel)
+        self.assertIn('/firewall?action=AddRule', captured['url'])
+        for key in ('request_time=', 'request_token=', 'port=6000', 'types=tcp'):
+            self.assertIn(key, captured['data'])
+        self.assertEqual(payload['status'], True)
+
+    def test_panel_rule_helpers_use_marker_and_id(self):
+        panel = {'type': 'baota', 'url': 'http://127.0.0.1:8888', 'api_key': 'k',
+                 'verify_tls': False, 'timeout': 5, 'node': '', 'mode': 'auto',
+                 'list_action': 'GetRules', 'add_action': 'AddRule', 'del_action': 'DelRule'}
+        with patch.object(m, 'panel_request', side_effect=[
+                {'status': True},                                                  # AddRule
+                {'status': True, 'data': [{'id': '7', 'port': '6000', 'types': 'tcp'}]},  # GetRules
+                {'status': True}]) as request:                                     # DelRule
+            m.panel_add_rule(6000, 'tcp', panel)
+            self.assertEqual(request.call_args_list[0][0][0], 'AddRule')
+            self.assertEqual(request.call_args_list[0][0][1]['ps'], 'frp-simple-bash-auto')
+            self.assertTrue(m.panel_del_rule(6000, 'tcp', panel))
+            self.assertEqual(request.call_args_list[2][0][1], {'id': '7'})
+
+    def test_mode_is_panel_api_when_configured(self):
+        panel = m.panel_config()
+        panel['url'] = 'http://127.0.0.1:8888'
+        panel['api_key'] = 'k'
+        m.save_panel_config(panel)
+        info = {'panels': [{'key': 'baota', 'name': '宝塔'}], 'detail': {}, 'backend': ''}
+        self.assertEqual(m.firewall_mode(info), 'panel-api')
+
+    def test_sync_panel_api_does_not_require_system_firewall(self):
+        cfg = self.cfg(enabled=True, allow_clients=['clientA'], panel_mode='panel-api')
+        m.save_auto_port_config(cfg)
+        panel = m.panel_config(); panel['url'] = 'http://127.0.0.1:8888'; panel['api_key'] = 'k'
+        m.save_panel_config(panel)
+        detected = {'backend': '', 'active': False, 'available': [], 'family': 'debian',
+                    'preferred': 'ufw', 'detail': {},
+                    'panels': [{'key': 'baota', 'name': '宝塔'}], 'managers': [], 'conflict': False}
+        with patch.object(m, 'firewall_detect', return_value=detected), \
+             patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]), \
+             patch.object(m, 'port_conflict', return_value=False), \
+             patch.object(m, '_service_pid', return_value=1), \
+             patch.object(m, 'panel_rules', return_value=[]), \
+             patch.object(m, 'panel_add_rule') as add, \
+             patch.object(m, 'panel_del_rule') as delete, \
+             patch.object(m, 'firewall_add_port') as sysadd:
+            report = m.ports_sync(apply_changes=True)
+        add.assert_called_once_with(6000, 'tcp')
+        delete.assert_not_called()
+        sysadd.assert_not_called()          # 绝不能直写系统防火墙
+        self.assertEqual(report['mode'], 'panel-api')
+        self.assertEqual(report['added'], [{'port': 6000, 'proto': 'tcp'}])
 
 
 if __name__ == '__main__':

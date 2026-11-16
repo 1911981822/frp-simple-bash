@@ -23,13 +23,14 @@ except ImportError:
         _toml_lib = None
 import urllib.request
 import urllib.error
+import urllib.parse
 import base64
 import socket
 
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.11'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.12'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -3298,18 +3299,50 @@ def firewall_managers(info=None):
             if detail.get(name) == 'active']
 
 def firewall_mode(info=None):
-    """Decide operating mode: 'readonly' | 'direct'.
+    """Decide operating mode: 'readonly' | 'panel-api' | 'direct'.
 
-    auto（默认）：检测到面板接管 → readonly（只生成清单，不安全地写系统防火墙）
-                  无面板         → direct（直写系统防火墙）
-    可用 auto-port.toml 的 panel_mode 覆盖为 readonly / direct。
+    auto（默认）：
+      面板 API 已配置            → panel-api（写进面板数据库，重载不丢）
+      检测到面板但未配置 API      → readonly（只生成清单）
+      无面板                     → direct（直写系统防火墙）
+    可用 auto-port.toml 的 panel_mode 覆盖为 readonly / panel-api / direct。
     """
     cfg = auto_port_config()
     requested = str(cfg.get('panel_mode', 'auto')).lower()
+    if requested in ('direct', 'readonly', 'panel-api'): return requested
     info = info or firewall_detect()
-    if requested == 'direct': return 'direct'
-    if requested == 'readonly': return 'readonly'
+    if panel_api_ready():
+        return 'panel-api'
     return 'readonly' if (info.get('panels') or []) else 'direct'
+
+def _port_open_action(port, proto, mode):
+    """Open one port through the selected mechanism."""
+    if mode == 'panel-api': return panel_add_rule(port, proto)
+    return firewall_add_port(port, proto)
+
+def _port_close_action(port, proto, mode):
+    """Close one port through the selected mechanism."""
+    if mode == 'panel-api': return panel_del_rule(port, proto)
+    return firewall_del_port(port, proto)
+
+def _live_ports(mode):
+    """Currently-allowed (port, proto) set from the active mechanism."""
+    live = set()
+    if mode == 'panel-api':
+        try:
+            for row in panel_rules():
+                try:
+                    text = str(row.get('port', ''))
+                    port = int(text.split(',')[0].split('-')[0])
+                except (TypeError, ValueError):
+                    continue
+                types = str(row.get('types', 'tcp')).lower()
+                for proto in ('tcp', 'udp'):
+                    if not types or proto in types: live.add((port, proto))
+        except (OSError, ValueError):
+            pass
+        return live
+    return firewall_open_ports()
 
 def firewall_open_ports():
     """Set of (port, proto) currently allowed by the active backend (one query)."""
@@ -3345,6 +3378,170 @@ def firewall_open_ports():
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
     return opened
+# ---------------------------------------------------------------- 宝塔面板 API
+# 宝塔/aaPanel 的防火墙是 iptables 的管理界面。直接写 iptables 会在面板重载时
+# 被覆盖；通过面板 API 写入规则则进入面板数据库，重载后依然存在。
+#
+# 鉴权：request_token = md5(request_time + md5(api_key))
+# 接口：POST {url}/firewall?action=AddRule  (参数 port/ps/types)
+# 注意：不同宝塔版本参数名可能略有差异，因此这里全部做成可配置项，
+#      并提供 `probe` 命令把原始返回打出来，便于现场校准。
+
+PANEL_TYPES = ('baota', 'aapanel')
+
+def panel_config():
+    """Read the [panel] section from auto-port.toml."""
+    raw = read_toml(auto_port_config_path()) if auto_port_config_path().exists() else {}
+    section = {}
+    if isinstance(raw, dict):
+        section = raw.get('panel') or {}
+        if not isinstance(section, dict): section = {}
+    cfg = auto_port_config()
+    return {
+        'type': str(section.get('type', 'baota') or 'baota').lower(),
+        'url': str(section.get('url', 'http://127.0.0.1:8888') or '').rstrip('/'),
+        'api_key': str(section.get('api_key', '') or os.environ.get('FRP_PANEL_API_KEY', '')),
+        'verify_tls': bool(section.get('verify_tls', False)),
+        'timeout': int(section.get('timeout', 10) or 10),
+        'node': str(section.get('node', '') or ''),          # aaPanel 多节点时可填
+        'list_action': str(section.get('list_action', 'GetRules')),
+        'add_action': str(section.get('add_action', 'AddRule')),
+        'del_action': str(section.get('del_action', 'DelRule')),
+        'mode': str(cfg.get('panel_mode', 'auto')).lower(),
+    }
+
+def save_panel_config(panel):
+    """Persist the [panel] section without touching other keys."""
+    raw = read_toml(auto_port_config_path()) if auto_port_config_path().exists() else {}
+    if not isinstance(raw, dict): raw = {}
+    raw['panel'] = {
+        'type': str(panel.get('type', 'baota')),
+        'url': str(panel.get('url', '')),
+        'api_key': str(panel.get('api_key', '')),
+        'verify_tls': bool(panel.get('verify_tls', False)),
+        'timeout': int(panel.get('timeout', 10)),
+        'list_action': str(panel.get('list_action', 'GetRules')),
+        'add_action': str(panel.get('add_action', 'AddRule')),
+        'del_action': str(panel.get('del_action', 'DelRule')),
+    }
+    if panel.get('node'): raw['panel']['node'] = str(panel['node'])
+    raw.setdefault('schema_version', 1)
+    raw.setdefault('panel_mode', 'auto')
+    raw.setdefault('allow_clients', [])
+    raw.setdefault('max_ports_per_client', 20)
+    raw.setdefault('deny_ports_enabled', True)
+    raw.setdefault('deny_ports', list(AUTO_PORT_DENY_DEFAULT))
+    raw.setdefault('sync_interval_seconds', 15)
+    raw.setdefault('prune_after_seconds', 120)
+    atomic(auto_port_config_path(), toml(raw))
+    try: os.chmod(str(auto_port_config_path()), 0o600)
+    except OSError: pass
+    audit('panel-config-saved')
+
+def panel_api_ready(panel=None):
+    """True when the panel API is configured enough to be used."""
+    panel = panel or panel_config()
+    return bool(panel['type'] in PANEL_TYPES and panel['url'] and panel['api_key'])
+
+def _panel_sign(api_key):
+    """Baota signature: md5(request_time + md5(api_key))."""
+    stamp = str(int(time.time()))
+    inner = hashlib.md5(api_key.encode()).hexdigest()
+    token = hashlib.md5((stamp + inner).encode()).hexdigest()
+    return stamp, token
+
+def panel_request(action, params=None, panel=None, timeout=None):
+    """Signed POST to the panel firewall endpoint. Returns parsed JSON dict."""
+    panel = panel or panel_config()
+    if not panel['url']: raise ValueError('面板 API 地址未配置（panel.url）')
+    if not panel['api_key']: raise ValueError('面板 API 密钥未配置（panel.api_key 或 FRP_PANEL_API_KEY）')
+    if not panel['url'].lower().startswith(('http://', 'https://')):
+        raise ValueError('面板 API 地址必须以 http:// 或 https:// 开头')
+    stamp, token = _panel_sign(panel['api_key'])
+    body = {'request_time': stamp, 'request_token': token}
+    if panel.get('node'): body['node'] = panel['node']
+    for key, value in (params or {}).items():
+        if value is not None: body[key] = str(value)
+    data = urllib.parse.urlencode(body).encode()
+    url = '%s/firewall?action=%s' % (panel['url'], urllib.parse.quote(action))
+    request = urllib.request.Request(url, data=data, method='POST')
+    context = None
+    if url.lower().startswith('https://') and not panel['verify_tls']:
+        import ssl
+        context = ssl._create_unverified_context()
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    if context is not None:
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context),
+                                             urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=timeout or panel['timeout']) as response:
+            raw = response.read().decode('utf-8', errors='replace')
+    except (OSError, urllib.error.URLError) as exc:
+        raise ValueError('面板 API 请求失败：' + str(exc))
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        raise ValueError('面板 API 返回非 JSON：' + raw[:200])
+    if not isinstance(payload, dict):
+        raise ValueError('面板 API 返回格式异常：' + raw[:200])
+    return payload
+
+def panel_rules(panel=None):
+    """List firewall rules through the panel API."""
+    panel = panel or panel_config()
+    payload = panel_request(panel['list_action'], {}, panel)
+    # 宝塔常见返回：{"data": [...]} 或 {"data": {"data": [...]}}
+    rows = payload.get('data')
+    if isinstance(rows, dict): rows = rows.get('data') or rows.get('list')
+    if not isinstance(rows, list): return []
+    result = []
+    for row in rows:
+        if not isinstance(row, dict): continue
+        result.append(row)
+    return result
+
+def _panel_find_rule(port, proto, panel=None):
+    """Find the panel rule id for a port/proto pair."""
+    for row in panel_rules(panel):
+        try:
+            row_port = int(str(row.get('port', '')).split(',')[0].split('-')[0])
+        except (TypeError, ValueError):
+            continue
+        row_types = str(row.get('types', 'tcp')).lower()
+        if row_port == int(port) and (proto in row_types or row_types in ('', ',')):
+            return row.get('id')
+    return None
+
+def panel_add_rule(port, proto, panel=None):
+    """Add an inbound allow rule through the panel (survives panel reload)."""
+    panel = panel or panel_config()
+    payload = panel_request(panel['add_action'],
+                            {'port': int(port), 'types': proto,
+                             'ps': 'frp-simple-bash-auto', 'address': ''}, panel)
+    if str(payload.get('status', '')).lower() not in ('true', '1', 'ok', ''):
+        raise ValueError('面板添加规则失败：' + str(payload.get('msg') or payload)[:200])
+    ports_audit('panel-port-open', port=port, proto=proto, result='ok')
+    return payload
+
+def panel_del_rule(port, proto, panel=None):
+    """Remove the panel rule for a port/proto pair (only ours, by marker/port)."""
+    panel = panel or panel_config()
+    rule_id = _panel_find_rule(port, proto, panel)
+    if rule_id is None: return False
+    payload = panel_request(panel['del_action'], {'id': rule_id}, panel)
+    if str(payload.get('status', '')).lower() not in ('true', '1', 'ok', ''):
+        raise ValueError('面板删除规则失败：' + str(payload.get('msg') or payload)[:200])
+    ports_audit('panel-port-close', port=port, proto=proto, result='ok')
+    return True
+
+def panel_probe(panel=None):
+    """Connectivity + credential check; returns {'ok', 'rules', 'raw'} or raises."""
+    panel = panel or panel_config()
+    payload = panel_request(panel['list_action'], {}, panel)
+    rows = payload.get('data')
+    if isinstance(rows, dict): rows = rows.get('data') or rows.get('list')
+    count = len(rows) if isinstance(rows, list) else 0
+    return {'ok': True, 'rules': count, 'raw': payload}
 def firewall_backend():
     """Compatibility wrapper: (backend, active)."""
     info = firewall_detect()
@@ -3753,9 +3950,11 @@ def ports_sync(apply_changes=True):
     if not cfg['enabled']:
         return report
     active = info['active']
-    if apply_changes and not active:
+    if apply_changes and mode != 'panel-api' and not active:
         raise ValueError('系统防火墙未启用，拒绝自动放行端口。\n  发行版：%s\n  %s'
                          % (info.get('family', 'other'), _firewall_hint_text(info)))
+    if apply_changes and mode == 'panel-api' and not panel_api_ready():
+        raise ValueError('面板 API 模式已启用但面板地址/密钥未配置完整，请先完成 panel 配置。')
     desired, skipped = ports_desired(cfg)
     report['skipped'] = skipped
     st = auto_port_state()
@@ -3766,8 +3965,8 @@ def ports_sync(apply_changes=True):
         except (KeyError, TypeError, ValueError): continue
 
     # 规则丢失检测：曾放行过、现在防火墙里已不存在（典型原因：面板重载覆盖）
-    if active:
-        live = firewall_open_ports()
+    if active or mode == 'panel-api':
+        live = _live_ports(mode)
         for key, rec in current.items():
             if key in live: continue
             report['lost'].append({'port': key[0], 'proto': key[1],
@@ -3807,7 +4006,7 @@ def ports_sync(apply_changes=True):
             continue
         if apply_changes:
             try:
-                firewall_del_port(key[0], key[1])
+                _port_close_action(key[0], key[1], mode)
                 report['removed'].append({'port': key[0], 'proto': key[1]})
                 ports_audit('port-close', port=key[0], proto=key[1], result='ok',
                             client_id=rec.get('client_id', ''), proxy=rec.get('proxy', ''))
@@ -3818,7 +4017,7 @@ def ports_sync(apply_changes=True):
                  'proxy': rec['proxy'], 'opened_at': dt.datetime.now().isoformat(timespec='seconds')}
         if apply_changes:
             try:
-                firewall_add_port(key[0], key[1])
+                _port_open_action(key[0], key[1], mode)
                 report['added'].append({'port': key[0], 'proto': key[1]})
                 ports_audit('port-open', port=key[0], proto=key[1], result='ok',
                             client_id=rec['client_id'], proxy=rec['proxy'])
@@ -3847,6 +4046,7 @@ def ports_revert():
         cfg['enabled'] = False
         save_auto_port_config(cfg)
     ports_timer_remove()
+    mode = firewall_mode()
     st = auto_port_state()
     removed = []
     for rec in st.get('opened') or []:
@@ -3854,7 +4054,7 @@ def ports_revert():
             port, proto = int(rec['port']), str(rec['proto'])
         except (KeyError, TypeError, ValueError):
             continue
-        firewall_del_port(port, proto)
+        _port_close_action(port, proto, mode)
         removed.append({'port': port, 'proto': proto})
         ports_audit('port-close', port=port, proto=proto, result='reverted')
     st['opened'] = []
@@ -4038,6 +4238,9 @@ def auto_port_menu():
                                                   if cfg['max_ports_per_client'] else '不限')))
             print('  ' + _kv('已放行', '%d 个端口' % len(opened)))
             print('  ' + _kv('定时同步', color_state(ports_timer_status())))
+            print('  ' + _kv('工作模式', {'readonly': color_state('只读（不改防火墙）'),
+                                          'panel-api': color_state('面板 API（推荐）'),
+                                          'direct': '直写系统防火墙'}.get(firewall_mode(), firewall_mode())))
 
         items = [
             '查看完整状态',
@@ -4052,11 +4255,12 @@ def auto_port_menu():
             '检测防火墙状态',
             '预览防火墙启用计划',
             '一键启用防火墙（先放行 SSH）',
+            '面板 API 配置（宝塔 / aaPanel）',
             '撤销全部自动放行并关闭',
         ]
         groups = {0: '── 状态与预览 ──', 4: '── 功能开关 ──',
                   6: '── 客户端白名单 ──', 9: '── 防火墙 ──',
-                  12: '── 危险操作 ──'}
+                  12: '── 面板接管（推荐） ──', 13: '── 危险操作 ──'}
         n = choose(items, '端口自动开通', '返回上一级', groups=groups, prelude=_prelude)
         if not n: return
         try:
@@ -4168,6 +4372,8 @@ def auto_port_menu():
                     result_info('已取消，未做任何修改。')
                 pause()
             elif n == 13:
+                panel_config_menu(); needs_pause = False
+            elif n == 14:
                 if not confirm('将删除本工具添加的全部防火墙规则（不会动你自己加的规则），'
                                '并关闭自动放行。确认？', danger=True):
                     result_info('已取消。'); pause(); continue
@@ -4176,6 +4382,67 @@ def auto_port_menu():
         except MENU_ERRORS as exc:
             result_error(str(exc)); pause()
 
+def panel_config_menu():
+    """宝塔/aaPanel API 配置与连通性测试。"""
+    clear_screen()
+    while True:
+        panel = panel_config()
+        ready = panel_api_ready(panel)
+        print('  ' + _kv('面板类型', panel['type']))
+        print('  ' + _kv('API 地址', panel['url'] or color_state('未配置')))
+        print('  ' + _kv('API 密钥', color_state('已配置') if panel['api_key']
+                         else color_state('未配置')))
+        print('  ' + _kv('TLS 校验', '开启' if panel['verify_tls'] else '关闭（自签证书可容忍）'))
+        print('  ' + _kv('当前模式', firewall_mode()))
+        print(RULE)
+        result_info('宝塔面板：设置 → API 接口 → 开启并复制「接口密钥」；'
+                    '建议同时把调用来源限制为 127.0.0.1。')
+        items = ['测试 API 连接（probe）', '设置 API 地址', '设置 API 密钥',
+                 '切换面板类型（宝塔/aaPanel）', '切换 TLS 校验',
+                 '清空面板配置']
+        n = choose(items, '面板 API 配置', '返回上一级')
+        if not n: return
+        try:
+            if n == 1:
+                if not ready:
+                    result_error('面板配置不完整：需要同时配置 API 地址与密钥。'); pause(); continue
+                info = panel_probe(panel)
+                result_ok('API 连接正常：当前有 %d 条防火墙规则。' % info['rules'])
+                pause()
+            elif n == 2:
+                value = ask('面板 API 地址（例 http://127.0.0.1:8888）', panel['url'], allow_empty=True)
+                if value is None: continue
+                if not value.lower().startswith(('http://', 'https://')):
+                    result_error('地址必须以 http:// 或 https:// 开头'); pause(); continue
+                panel['url'] = value.rstrip('/'); save_panel_config(panel)
+                result_ok('已保存 API 地址。'); pause()
+            elif n == 3:
+                import getpass
+                try:
+                    value = getpass.getpass('\n  面板 API 密钥（输入不回显，直接回车取消）：')
+                except EOFError:
+                    continue
+                if not value: result_info('已取消。'); pause(); continue
+                panel['api_key'] = value.strip(); save_panel_config(panel)
+                result_ok('已保存 API 密钥（写入 auto-port.toml，权限 0600）。')
+                result_info('可用第 1 项测试连接。'); pause()
+            elif n == 4:
+                index = choose(['baota（宝塔 Linux）', 'aapanel（宝塔国际版）'], '选择面板类型')
+                if not index: continue
+                panel['type'] = 'baota' if index == 1 else 'aapanel'
+                save_panel_config(panel); result_ok('已切换为 ' + panel['type']); pause()
+            elif n == 5:
+                panel['verify_tls'] = not panel['verify_tls']
+                save_panel_config(panel)
+                result_ok('TLS 校验已' + ('开启' if panel['verify_tls'] else '关闭')); pause()
+            elif n == 6:
+                if not confirm('将清空面板 API 配置（不影响面板本身）。确认？', danger=True):
+                    result_info('已取消。'); pause(); continue
+                panel['url'] = ''; panel['api_key'] = ''
+                save_panel_config(panel)
+                result_ok('已清空面板配置；模式将回落到只读或直写。'); pause()
+        except MENU_ERRORS as exc:
+            result_error(str(exc), hint='可在面板「设置 → API 接口」确认密钥与 IP 白名单。'); pause()
 def auto_port_add_client(cfg):
     """Add a clientID to the whitelist: pick from discovered clients or type it."""
     discovered = []
@@ -4305,6 +4572,37 @@ def ports_command(argv, flags=None):
                              hint='可先执行 `frps ports firewall plan` 查看将要执行的命令。')
             return
         raise ValueError('支持 ports firewall status|plan|enable')
+    if action == 'panel':
+        sub = argv[1] if len(argv) > 1 else 'status'
+        panel = panel_config()
+        if sub == 'status':
+            payload = {'type': panel['type'], 'url': panel['url'],
+                       'key_configured': bool(panel['api_key']),
+                       'verify_tls': panel['verify_tls'], 'mode': firewall_mode()}
+            if as_json: print(json.dumps(payload, ensure_ascii=False, indent=2)); return
+            section('面板 API 状态')
+            print(_kv('面板类型', panel['type']))
+            print(_kv('API 地址', panel['url'] or color_state('未配置')))
+            print(_kv('API 密钥', color_state('已配置') if panel['api_key']
+                       else color_state('未配置')))
+            print(_kv('工作模式', payload['mode']))
+            print(RULE); return
+        if sub == 'set':
+            if len(argv) < 3: raise ValueError('用法：ports panel set <url> [api_key]')
+            panel['url'] = argv[2].rstrip('/')
+            if len(argv) > 3: panel['api_key'] = argv[3]
+            save_panel_config(panel)
+            result_ok('面板配置已保存。'); return
+        if sub == 'probe':
+            info = panel_probe(panel)
+            if as_json: print(json.dumps({'ok': info['ok'], 'rules': info['rules']},
+                                         ensure_ascii=False, indent=2)); return
+            result_ok('API 连接正常：当前有 %d 条防火墙规则。' % info['rules']); return
+        if sub == 'clear':
+            panel['url'] = ''; panel['api_key'] = ''
+            save_panel_config(panel)
+            result_ok('已清空面板 API 配置。'); return
+        raise ValueError('支持 ports panel status|set <url> [key]|probe|clear')
     if action == 'rules':
         opened = auto_port_state().get('opened') or []
         if as_json: print(json.dumps(opened, ensure_ascii=False, indent=2)); return

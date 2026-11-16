@@ -97,6 +97,9 @@ sudo frps ports revert --yes     # 撤销全部自动放行并关闭功能
 sudo frps ports firewall status  # 检测本机防火墙（发行版/推荐/是否启用）
 sudo frps ports firewall plan    # 打印启用计划（不执行）
 sudo frps ports firewall enable  # 启用防火墙（先放行 SSH，避免自锁）
+sudo frps ports panel status     # 查看宝塔 API 配置与工作模式
+sudo frps ports panel set <url> <api_key>   # 配置宝塔 API
+sudo frps ports panel probe      # 测试 API 连接
 ```
 
 **安全边界（必读）**：
@@ -113,6 +116,7 @@ sudo frps ports firewall enable  # 启用防火墙（先放行 SSH，避免自�
 | 多发行版兼容 | 自动探测 ufw / firewalld / iptables / nftables / Windows 防火墙，按"谁真正生效"选择 |
 | **面板接管识别** | 检测宝塔/aaPanel、小皮、1Panel、cPanel、Plesk；检测到面板时**默认只读**（只生成待放行清单，不改系统防火墙），并显性提示冲突 |
 | 规则丢失告警 | 每次同步复核"曾放行但已不存在"的规则（面板重载会覆盖），立即告警并记审计 |
+| **宝塔 API 模式** | 配置面板地址+密钥后，规则写进**宝塔数据库**，面板重载/重启都不会丢（菜单 `13) 面板 API 配置`） |
 | 启用引导 | 没开防火墙时给出命令；`frps ports firewall enable` 会**先放行 SSH** 再启用，避免自锁 |
 
 > ⚠️ 本功能**不做端口区间限制**，且云安全组需你手工配置。

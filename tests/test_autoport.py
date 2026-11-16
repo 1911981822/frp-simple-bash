@@ -568,6 +568,7 @@ class AutoPortTests(unittest.TestCase):
         cfg = self.cfg(enabled=True, allow_clients=['clientA'])
         m.save_auto_port_config(cfg)
         with patch.object(m, 'panel_api_ready', return_value=False), \
+             patch.object(m, 'panel_detect', return_value=[{'key': 'baota', 'name': '宝塔'}]), \
              patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]), \
              patch.object(m, 'port_conflict', return_value=False), \
              patch.object(m, '_service_pid', return_value=1), \

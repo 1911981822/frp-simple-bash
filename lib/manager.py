@@ -30,7 +30,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.14'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.15'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -419,6 +419,25 @@ def mappings(pid):
             if key in ports: raise ValueError('同类型远程端口冲突')
             ports.add(key)
     return items
+
+def validate_mappings(items):
+    """Validate a whole mapping set: per-item rules + cross-item conflicts.
+
+    frps 会拒绝重复的 remote_port，但那是"注册失败"层面的错误，
+    用户看到的是连接异常而不是配置错误。这里提前拦截并给出明确提示。
+    """
+    for item in items: validate_mapping(item)
+    names, remote_ports = {}, {}
+    for item in items:
+        name = item['name']
+        if name in names: raise ValueError('映射名称重复：' + name)
+        names[name] = True
+        if item['type'] in ('tcp', 'udp'):
+            key = (int(item['remote_port']), item['type'])
+            if key in remote_ports:
+                raise ValueError('远程端口重复：%d/%s（映射 %s 与 %s 冲突）'
+                                 % (key[0], key[1], remote_ports[key], name))
+            remote_ports[key] = name
 
 def validate_mapping(m):
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', m['name']): raise ValueError('映射名称允许 1-64 个 ASCII 字母、数字、-、_')
@@ -1646,7 +1665,7 @@ def save_mappings(pid, items, explicit=False):
     before_count = len(mappings(pid))
     with lock(), transaction():
         if not explicit and pid != active(): raise ValueError('当前服务端已在另一终端切换，请重新打开映射菜单')
-        for m in items: validate_mapping(m)
+        validate_mappings(items)
         path = pdir(pid) / 'mappings.toml'; old = path.read_text(encoding='utf-8')
         backup([path]); atomic(path, toml({'schema_version': 1, 'mappings': items}))
         # 只有当前服务端才允许覆写全局运行配置 frpc.toml；否则会把正在运行的
@@ -2498,7 +2517,11 @@ def status(role):
     return result
 
 def status_bar(role, data):
-    """One-line compact status shown above every menu."""
+    """One-line compact status line.
+
+    当前主菜单改用 _status_body（状态块）后，本函数只保留给测试与未来复用；
+    不删除是因为它承载了「坏 mappings 文件不崩菜单」的回归断言。
+    """
     state_text = SERVICE_STATES.get(str(data.get('service_state', '')).lower(), data.get('service_state', '未知'))
     parts = [role, color_state(state_text), str(data.get('version', ''))]
     if role == 'frps':
@@ -3281,15 +3304,6 @@ def panel_detect():
         pass
     return panels
 
-def panel_baota_api_port():
-    """Baota panel port from its own config (best effort, read-only)."""
-    for candidate in ('/www/server/panel/data/port.pl',):
-        try:
-            text = Path(candidate).read_text(encoding='utf-8', errors='replace').strip()
-            if text.isdigit(): return int(text)
-        except OSError:
-            continue
-    return None
 
 def firewall_managers(info=None):
     """Names of firewall layers that are actually active."""
@@ -3315,34 +3329,8 @@ def firewall_mode(info=None):
         return 'panel-api'
     return 'readonly' if (info.get('panels') or []) else 'direct'
 
-def _port_open_action(port, proto, mode):
-    """Open one port through the selected mechanism."""
-    if mode == 'panel-api': return panel_add_rule(port, proto)
-    return firewall_add_port(port, proto)
 
-def _port_close_action(port, proto, mode):
-    """Close one port through the selected mechanism."""
-    if mode == 'panel-api': return panel_del_rule(port, proto)
-    return firewall_del_port(port, proto)
 
-def _live_ports(mode):
-    """Currently-allowed (port, proto) set from the active mechanism."""
-    live = set()
-    if mode == 'panel-api':
-        try:
-            for row in panel_rules():
-                try:
-                    text = str(row.get('port', ''))
-                    port = int(text.split(',')[0].split('-')[0])
-                except (TypeError, ValueError):
-                    continue
-                types = str(row.get('types', 'tcp')).lower()
-                for proto in ('tcp', 'udp'):
-                    if not types or proto in types: live.add((port, proto))
-        except (OSError, ValueError):
-            pass
-        return live
-    return firewall_open_ports()
 
 def firewall_open_ports():
     """Set of (port, proto) currently allowed by the active backend (one query)."""
@@ -4046,7 +4034,13 @@ def ports_sync(apply_changes=True):
     cfg = auto_port_config()
     panel = panel_config()
     api_ready = panel_api_ready(panel)
-    mode = 'panel-api' if api_ready else 'manual'
+    has_panel = bool(panel_detect())
+    if api_ready:
+        mode = 'panel-api'
+    elif has_panel:
+        mode = 'manual'          # 有面板没配 API → 只列清单，绝不碰系统防火墙
+    else:
+        mode = 'direct'          # 裸机无面板 → 直写系统防火墙
     report = {'enabled': cfg['enabled'], 'mode': mode,
               'added': [], 'removed': [], 'pending': [], 'skipped': []}
     if not cfg['enabled']:
@@ -4056,7 +4050,7 @@ def ports_sync(apply_changes=True):
     st = auto_port_state()
     known = {(int(r['port']), str(r['proto'])): r for r in (st.get('opened') or [])}
 
-    if not api_ready:
+    if mode == 'manual':
         report['pending'] = [{'port': k[0], 'proto': k[1], 'proxy': v.get('proxy', '')}
                              for k, v in sorted(desired.items()) if k not in known]
         if apply_changes:
@@ -4072,19 +4066,23 @@ def ports_sync(apply_changes=True):
                            if k not in known]
         return report
 
+    opener = (lambda p, pr: panel_add_rule(p, pr, panel)) if mode == 'panel-api' \
+        else (lambda p, pr: firewall_add_port(p, pr))
+    closer = (lambda p, pr: panel_del_rule(p, pr, panel)) if mode == 'panel-api' \
+        else (lambda p, pr: firewall_del_port(p, pr))
     for key, rec in sorted(desired.items()):
         if key in known: continue
         try:
-            panel_add_rule(key[0], key[1], panel)
+            opener(key[0], key[1])
             report['added'].append({'port': key[0], 'proto': key[1]})
         except (ValueError, OSError) as exc:
-            ports_audit('panel-port-open', port=key[0], proto=key[1], result='failed',
+            ports_audit('port-open', port=key[0], proto=key[1], result='failed',
                         detail=str(exc))
             report['skipped'].append(dict(rec, reason='apply_failed', detail=str(exc)))
     for key in list(known):
         if key in desired: continue
         try:
-            if panel_del_rule(key[0], key[1], panel):
+            if closer(key[0], key[1]) is not False:
                 report['removed'].append({'port': key[0], 'proto': key[1]})
         except (ValueError, OSError):
             pass
@@ -4099,6 +4097,7 @@ def ports_revert():
     """删除本工具放行的全部端口（有 API 走 API，否则清记录）。"""
     panel = panel_config()
     api_ready = panel_api_ready(panel)
+    has_panel = bool(panel_detect())
     st = auto_port_state()
     removed, failed = [], []
     for rec in st.get('opened') or []:
@@ -4111,8 +4110,13 @@ def ports_revert():
                 if panel_del_rule(port, proto, panel): removed.append('%d/%s' % (port, proto))
             except (ValueError, OSError):
                 failed.append('%d/%s' % (port, proto))
+        elif not has_panel:
+            try:
+                firewall_del_port(port, proto); removed.append('%d/%s' % (port, proto))
+            except (ValueError, OSError):
+                failed.append('%d/%s' % (port, proto))
         else:
-            removed.append('%d/%s' % (port, proto))
+            removed.append('%d/%s' % (port, proto))   # 面板机器：只清记录
     cfg = auto_port_config()
     if cfg.get('enabled'):
         cfg['enabled'] = False; save_auto_port_config(cfg)
@@ -4124,10 +4128,17 @@ def ports_revert():
     return removed
 
 def ports_enable(cfg, yes=False):
-    """Validate prerequisites and enable auto-port."""
+    """Validate prerequisites and enable auto-port.
+
+    前置条件只有两个（与菜单逻辑保持一致）：
+      1. frps Dashboard 可读（否则拿不到实际映射）
+      2. 白名单非空（否则不会放行任何端口）
+    防火墙是否启用**不是**必需条件：
+      - 配了宝塔 API → 规则进面板数据库，不需要系统防火墙
+      - 有面板没配 API → 只列清单，也不需要系统防火墙
+      - 裸机         → 需要系统防火墙，由 ports_sync 在 direct 模式下报错
+    """
     problems = []
-    backend, active = firewall_backend()
-    if not backend: problems.append('未检测到 ufw / firewalld / iptables 任一防火墙')
     try:
         frps_dashboard_config()
     except (ValueError, OSError) as exc:
@@ -4136,17 +4147,25 @@ def ports_enable(cfg, yes=False):
         problems.append('客户端白名单为空：启用后不会有任何端口被放行，请先登记 clientID')
     if problems:
         raise ValueError('无法启用端口自动开通：\n  - ' + '\n  - '.join(problems))
-    if not active:
-        if not yes and not confirm('检测到系统防火墙未启用（%s 未运行）。\n'
-                                   '此时服务器实际处于全端口暴露状态，任何放行都不会生效。\n'
-                                   '仍要启用？' % backend, danger=True):
-            return False
+    # 裸机直连模式才需要系统防火墙
+    api_ready = panel_api_ready()
+    has_panel = bool(panel_detect())
+    if not api_ready and not has_panel:
+        backend, active = firewall_backend()
+        if not backend:
+            raise ValueError('未检测到 ufw / firewalld / iptables，'
+                             '也没有配置宝塔 API，无法放行端口。')
+        if not active and not yes:
+            if not confirm('系统防火墙未启用（%s 未运行）。\n'
+                           '此时放行不会生效。仍要启用？' % backend, danger=True):
+                return False
     cfg['enabled'] = True
     save_auto_port_config(cfg)
     timer_ok = ports_timer_install(cfg)
     ports_audit('enable', result='ok',
-                detail='backend=%s active=%s timer=%s' % (backend, active, timer_ok))
+                detail='api=%s panel=%s timer=%s' % (api_ready, has_panel, timer_ok))
     return True
+
 # ---------------------------------------------------------------- 定时同步
 
 PORTS_TIMER_NAME = 'frp-simple-bash-ports'
@@ -4332,17 +4351,12 @@ def auto_port_menu():
                     ports_timer_remove(); ports_audit('disable', result='ok')
                     result_info('已关闭自动同步。已放行的端口保持不变。')
                 else:
-                    if not cfg['allow_clients']:
-                        result_error('白名单为空，先到 5) 管理白名单 里加入 clientID。')
-                        pause(); continue
                     if not confirm('启用后每 15 秒自动同步一次，把新映射的端口放行。确认？',
                                    danger=True):
                         result_info('已取消。'); pause(); continue
-                    cfg['enabled'] = True; save_auto_port_config(cfg)
-                    ports_timer_install(cfg)
-                    ports_audit('enable', result='ok')
-                    result_ok('已启用自动同步。')
-                    _apply_ports(cfg, panel)
+                    if ports_enable(cfg, yes=True):
+                        result_ok('已启用自动同步。')
+                        _apply_ports(cfg, panel)
                 pause()
             elif n == 7:
                 panel_config_menu(); needs_pause = False

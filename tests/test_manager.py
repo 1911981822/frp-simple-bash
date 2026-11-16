@@ -1351,4 +1351,30 @@ class ManagerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 m.run(['frpc', 'start', '--bogus'])
 
+
+    # ---- 整组映射校验（重复名称/重复远程端口）----
+    def test_duplicate_mapping_name_rejected(self):
+        pid = self.create(); m.set_current(pid)
+        dup = self.mapping('same'); dup2 = self.mapping('same', 6001)
+        with patch.object(m, 'apply'):
+            with self.assertRaises(ValueError) as ctx:
+                m.save_mappings(pid, [dup, dup2])
+        self.assertIn('名称重复', str(ctx.exception))
+
+    def test_duplicate_remote_port_rejected(self):
+        pid = self.create(); m.set_current(pid)
+        a = self.mapping('a'); b = self.mapping('b')
+        with patch.object(m, 'apply'):
+            with self.assertRaises(ValueError) as ctx:
+                m.save_mappings(pid, [a, b])     # 同 remote_port
+        self.assertIn('远程端口重复', str(ctx.exception))
+
+    def test_same_port_allowed_across_protocols(self):
+        pid = self.create(); m.set_current(pid)
+        a = self.mapping('a'); b = self.mapping('b')
+        b['type'] = 'udp'
+        with patch.object(m, 'apply'):
+            m.save_mappings(pid, [a, b])
+        self.assertEqual(len(m.mappings(pid)), 2)
+
 if __name__ == '__main__': unittest.main()

@@ -29,7 +29,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.9'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.10'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -3858,29 +3858,59 @@ def auto_port_report_lines(report, plan_only=False):
     return lines
 
 def auto_port_menu():
-    """端口自动开通子菜单（frps 专用）。"""
+    """端口自动开通：所有相关命令都在这一屏，输数字即可执行。"""
     clear_screen()
     while True:
         cfg = auto_port_config()
-        backend, active = firewall_backend()
-        state_text = color_state('已启用') if cfg['enabled'] else color_state('未启用')
-        print('  ' + _kv('功能状态', state_text))
-        print('  ' + _kv('防火墙', (backend or '未检测到') + ('' if active else color_state('（未运行）'))))
-        print('  ' + _kv('白名单', ('%d 个客户端' % len(cfg['allow_clients'])) if cfg['allow_clients'] else color_state('空（不会放行任何端口）')))
-        print('  ' + _kv('配额', '单客户端 ' + (str(cfg['max_ports_per_client']) if cfg['max_ports_per_client'] else '不限')))
-        print('  ' + _kv('已放行', '%d 个端口' % len(auto_port_state().get('opened') or [])))
-        print('  ' + _kv('定时同步', color_state(ports_timer_status())))
-        print(RULE)
-        items = ['查看状态明细', '预览变更计划（不执行）', '立即同步一次',
-                 '关闭功能' if cfg['enabled'] else '启用功能',
-                 '管理客户端白名单', '查看已放行规则', '撤销全部自动放行',
-                 '防火墙检测与启用']
-        n = choose(items, '端口自动开通', '返回上一级')
+        info = firewall_detect()
+        opened = auto_port_state().get('opened') or []
+
+        def _prelude():
+            # 状态块跟在菜单标题下方（与主菜单风格一致）
+            print('  ' + _kv('功能状态', color_state('已启用') if cfg['enabled'] else color_state('未启用')))
+            print('  ' + _kv('防火墙', (info['backend'] + '（运行中）') if info['active']
+                             else color_state('未启用')))
+            print('  ' + _kv('发行版/推荐', str(info['family']) + ' / ' + str(info['preferred'])))
+            print('  ' + _kv('白名单', ('%d 个客户端' % len(cfg['allow_clients']))
+                             if cfg['allow_clients'] else color_state('空（不会放行任何端口）')))
+            print('  ' + _kv('配额', '单客户端 ' + (str(cfg['max_ports_per_client'])
+                                                  if cfg['max_ports_per_client'] else '不限')))
+            print('  ' + _kv('已放行', '%d 个端口' % len(opened)))
+            print('  ' + _kv('定时同步', color_state(ports_timer_status())))
+
+        items = [
+            '查看完整状态',
+            '预览变更计划（不执行）',
+            '立即同步一次',
+            '查看已放行规则',
+            '启用自动放行',
+            '关闭自动放行',
+            '查看可发现的客户端（clientID）',
+            '添加客户端到白名单',
+            '从白名单移除客户端',
+            '检测防火墙状态',
+            '预览防火墙启用计划',
+            '一键启用防火墙（先放行 SSH）',
+            '撤销全部自动放行并关闭',
+        ]
+        groups = {0: '── 状态与预览 ──', 4: '── 功能开关 ──',
+                  6: '── 客户端白名单 ──', 9: '── 防火墙 ──',
+                  12: '── 危险操作 ──'}
+        n = choose(items, '端口自动开通', '返回上一级', groups=groups, prelude=_prelude)
         if not n: return
         try:
             if n == 1:
-                report = ports_sync(apply_changes=False)
-                _report('端口状态', auto_port_report_lines(report, plan_only=True)); pause()
+                lines = ['功能：%s' % ('已启用' if cfg['enabled'] else '未启用'),
+                         '防火墙：%s（%s）' % (info['backend'] or '未检测到',
+                                          '运行中' if info['active'] else '未启用'),
+                         '发行版：%s；推荐管理器：%s' % (info['family'], info['preferred']),
+                         '白名单：%s' % (', '.join(cfg['allow_clients']) or '空'),
+                         '配额：%s' % (cfg['max_ports_per_client'] or '不限'),
+                         '敏感端口黑名单：%s' % ('启用（%d 个）' % len(cfg['deny_ports'])
+                                            if cfg['deny_ports_enabled'] else '已关闭'),
+                         '定时同步：%s' % ports_timer_status(),
+                         '已放行端口：%d 个' % len(opened)]
+                _report('端口自动开通 · 完整状态', lines); pause()
             elif n == 2:
                 report = ports_sync(apply_changes=False)
                 _report('变更计划（未执行）', auto_port_report_lines(report, plan_only=True)); pause()
@@ -3889,116 +3919,37 @@ def auto_port_menu():
                 _report('同步结果', auto_port_report_lines(report))
                 result_ok('同步完成。'); pause()
             elif n == 4:
-                if cfg['enabled']:
-                    cfg['enabled'] = False; save_auto_port_config(cfg)
-                    ports_timer_remove()
-                    ports_audit('disable', result='ok')
-                    result_ok('已关闭端口自动开通；已放行规则保持不变，可用「撤销全部自动放行」清理。')
-                else:
-                    risk = ('启用后：任何在白名单内的客户端，其映射端口都会被自动放行到本机防火墙。\n'
-                            '当前配置为「不限制端口区间」，仅受敏感端口黑名单与配额约束。\n'
-                            '若云安全组已全开，系统防火墙是唯一防线。\n\n确认启用？')
-                    if not confirm(risk, danger=True): result_info('已取消。'); pause(); continue
-                    if ports_enable(cfg, yes=True):
-                        result_ok('已启用。'); ports_sync(apply_changes=True)
-                pause()
-            elif n == 5:
-                auto_port_clients_menu(); pause()
-            elif n == 6:
                 opened = auto_port_state().get('opened') or []
                 if not opened:
                     result_info('当前没有由本工具放行的规则。')
                 else:
-                    lines = ['%d/%s  client=%s  proxy=%s' % (r.get('port'), r.get('proto'),
-                                                             r.get('client_id', '-'), r.get('proxy', '-'))
-                             for r in opened]
-                    _report('已放行规则', lines)
+                    _report('已放行规则', ['%d/%s  client=%s  proxy=%s'
+                                          % (r.get('port'), r.get('proto'),
+                                             r.get('client_id', '-'), r.get('proxy', '-'))
+                                          for r in opened])
+                pause()
+            elif n == 5:
+                if cfg['enabled']:
+                    result_info('自动放行已经是启用状态。'); pause(); continue
+                risk = ('启用后：任何在白名单内的客户端，其映射端口都会被自动放行到本机防火墙。\n'
+                        '当前配置为「不限制端口区间」，仅受敏感端口黑名单与配额约束。\n'
+                        '若云安全组已全开，系统防火墙是唯一防线。\n\n确认启用？')
+                if not confirm(risk, danger=True):
+                    result_info('已取消。'); pause(); continue
+                if ports_enable(cfg, yes=True):
+                    report = ports_sync(apply_changes=True)
+                    _report('同步结果', auto_port_report_lines(report))
+                    result_ok('已启用端口自动放行。')
+                pause()
+            elif n == 6:
+                if not cfg['enabled']:
+                    result_info('自动放行当前已是关闭状态。'); pause(); continue
+                cfg['enabled'] = False; save_auto_port_config(cfg)
+                ports_timer_remove(); ports_audit('disable', result='ok')
+                result_info('已关闭自动放行；已放行的规则保持不变。',
+                            detail='如需清理规则，请用「撤销全部自动放行并关闭」。')
                 pause()
             elif n == 7:
-                if not confirm('将删除本工具添加的全部防火墙规则（不会动你自己加的规则）。确认？', danger=True):
-                    result_info('已取消。'); pause(); continue
-                removed = ports_revert()
-                result_ok('已撤销 %d 条自动放行规则。' % len(removed)); pause()
-            elif n == 8:
-                auto_port_firewall_menu(); pause()
-        except MENU_ERRORS as exc:
-            result_error(str(exc)); pause()
-
-def auto_port_firewall_menu():
-    """防火墙检测与启用子菜单。"""
-    clear_screen()
-    while True:
-        info = firewall_detect()
-        print('  ' + _kv('发行版', info['family']))
-        print('  ' + _kv('推荐管理器', info['preferred']))
-        print('  ' + _kv('当前后端', (info['backend'] if info['active'] else color_state('未启用'))))
-        for name, state in sorted((info.get('detail') or {}).items()):
-            if name == 'simulated': continue
-            print('  ' + _pad_line('  - ' + name, 20) + color_state(state))
-        print(RULE)
-        if not info['active']:
-            result_info(_firewall_hint_text(info))
-        items = ['查看检测详情', '预览启用计划（不执行）', '一键启用（先放行 SSH，避免自锁）']
-        n = choose(items, '防火墙检测与启用', '返回上一级')
-        if not n: return
-        try:
-            if n == 1:
-                lines = ['发行版：%s' % info['family'],
-                         '推荐管理器：%s' % info['preferred'],
-                         '当前后端：%s（%s）' % (info['backend'] or '无', '运行中' if info['active'] else '未启用'),
-                         '已安装：%s' % (', '.join(info['available']) or '无')]
-                _report('防火墙检测详情', lines); pause()
-            elif n == 2:
-                plan = firewall_enable_plan()
-                lines = ['目标管理器：%s（发行版 %s）' % (plan['target'], plan['family'])]
-                if plan['install_cmds']:
-                    lines.append('安装命令：' + ' '.join(plan['install_cmds'][0]))
-                lines.append('先放行 SSH：' + ', '.join(str(p) for p in plan['ssh_ports']))
-                lines.append('再放行 frps 端口：'
-                             + (', '.join('%d/%s' % (p, t) for p, t in plan['keep']) or '无'))
-                lines.append('最后启用：' + (' '.join(plan['enable_cmds'][0]) if plan['enable_cmds'] else '见说明'))
-                for note in plan['notes']: lines.append('说明：' + note)
-                _report('启用计划（未执行）', lines); pause()
-            elif n == 3:
-                result = firewall_enable(yes=False)
-                if result['ok']:
-                    result_ok('防火墙已启用：' + result['plan']['target'])
-                    if auto_port_config()['enabled']:
-                        report = ports_sync(apply_changes=True)
-                        _report('同步结果', auto_port_report_lines(report))
-                else:
-                    result_info('已取消，未做任何修改。')
-                pause()
-        except MENU_ERRORS as exc:
-            result_error(str(exc)); pause()
-def auto_port_clients_menu():
-    """Manage the clientID whitelist."""
-    clear_screen()
-    while True:
-        cfg = auto_port_config()
-        clients = cfg['allow_clients']
-        print('  当前白名单：' + (', '.join(clients) if clients else color_state('空')))
-        print(RULE)
-        n = choose(['添加客户端 ID', '移除客户端 ID', '查看可发现的客户端'], '客户端白名单', '返回上一级')
-        if not n: return
-        try:
-            if n == 1:
-                value = ask('clientID（frcp 配置里的 clientID，留空取消）', allow_empty=True)
-                if not value: continue
-                if value in clients:
-                    result_info('该 clientID 已在白名单中。'); pause(); continue
-                clients.append(value)
-                cfg['allow_clients'] = clients; save_auto_port_config(cfg)
-                result_ok('已加入白名单：' + value); pause()
-            elif n == 2:
-                if not clients:
-                    result_info('白名单为空。'); pause(); continue
-                index = choose(clients, '选择要移除的客户端')
-                if not index: continue
-                removed = clients.pop(index - 1)
-                cfg['allow_clients'] = clients; save_auto_port_config(cfg)
-                result_ok('已移除：' + removed); pause()
-            elif n == 3:
                 try:
                     rows = frps_online_proxies()
                 except (ValueError, OSError) as exc:
@@ -4008,14 +3959,90 @@ def auto_port_clients_menu():
                     cid = str(item.get('clientID') or item.get('clientId') or '')
                     if cid: seen[cid] = seen.get(cid, 0) + 1
                 if not seen:
-                    result_info('当前没有在线客户端。')
+                    result_info('当前没有在线客户端（或 Dashboard 无法读取）。')
                 else:
-                    _report('在线客户端', ['%s（%d 条映射）%s' % (cid, count,
-                                                  '  [已在白名单]' if cid in clients else '')
-                                           for cid, count in sorted(seen.items())])
+                    _report('在线客户端', ['%s（%d 条映射）%s' % (
+                        cid, count, '  [已在白名单]' if cid in cfg['allow_clients'] else '')
+                        for cid, count in sorted(seen.items())])
                 pause()
+            elif n == 8:
+                auto_port_add_client(cfg); pause()
+            elif n == 9:
+                if not cfg['allow_clients']:
+                    result_info('白名单为空，无需移除。'); pause(); continue
+                index = choose(cfg['allow_clients'], '选择要移除的客户端')
+                if not index: continue
+                removed = cfg['allow_clients'].pop(index - 1)
+                save_auto_port_config(cfg)
+                result_ok('已从白名单移除：' + removed); pause()
+            elif n == 10:
+                _report('防火墙检测', ['发行版：%s' % info['family'],
+                                       '推荐管理器：%s' % info['preferred'],
+                                       '当前后端：%s（%s）' % (info['backend'] or '未检测到',
+                                                        '运行中' if info['active'] else '未启用'),
+                                       '已安装：%s' % (', '.join(info['available']) or '无')])
+                if not info['active']:
+                    result_info(_firewall_hint_text(info))
+                pause()
+            elif n == 11:
+                plan = firewall_enable_plan()
+                lines = ['目标管理器：%s（发行版 %s）' % (plan['target'], plan['family'])]
+                if plan['install_cmds']:
+                    lines.append('安装命令：' + ' '.join(plan['install_cmds'][0]))
+                lines.append('先放行 SSH：' + ', '.join(str(p) for p in plan['ssh_ports']))
+                lines.append('再放行 frps 端口：'
+                             + (', '.join('%d/%s' % (p, t) for p, t in plan['keep']) or '无'))
+                lines.append('最后启用：' + (' '.join(plan['enable_cmds'][0])
+                                           if plan['enable_cmds'] else '见说明'))
+                for note in plan['notes']: lines.append('说明：' + note)
+                _report('防火墙启用计划（未执行）', lines); pause()
+            elif n == 12:
+                result = firewall_enable(yes=False)
+                if result['ok']:
+                    result_ok('防火墙已启用：' + result['plan']['target'])
+                    if auto_port_config()['enabled']:
+                        report = ports_sync(apply_changes=True)
+                        _report('同步结果', auto_port_report_lines(report))
+                else:
+                    result_info('已取消，未做任何修改。')
+                pause()
+            elif n == 13:
+                if not confirm('将删除本工具添加的全部防火墙规则（不会动你自己加的规则），'
+                               '并关闭自动放行。确认？', danger=True):
+                    result_info('已取消。'); pause(); continue
+                removed = ports_revert()
+                result_ok('已撤销 %d 条自动放行规则，并已关闭自动放行。' % len(removed)); pause()
         except MENU_ERRORS as exc:
             result_error(str(exc)); pause()
+
+def auto_port_add_client(cfg):
+    """Add a clientID to the whitelist: pick from discovered clients or type it."""
+    discovered = []
+    try:
+        seen = {}
+        for item in frps_online_proxies():
+            cid = str(item.get('clientID') or item.get('clientId') or '')
+            if cid: seen[cid] = seen.get(cid, 0) + 1
+        discovered = ['%s（%d 条映射）' % (cid, count) for cid, count in sorted(seen.items())
+                      if cid not in cfg['allow_clients']]
+    except (ValueError, OSError):
+        discovered = []
+    options = discovered + ['手动输入 clientID']
+    if len(options) == 1:
+        value = ask('clientID（留空取消）', allow_empty=True)
+    else:
+        index = choose(options, '选择要加入白名单的客户端')
+        if not index: return
+        if index <= len(discovered):
+            value = discovered[index - 1].split('（')[0]
+        else:
+            value = ask('clientID（留空取消）', allow_empty=True)
+    if not value: return
+    if value in cfg['allow_clients']:
+        result_info('该 clientID 已在白名单中。'); return
+    cfg['allow_clients'].append(value)
+    save_auto_port_config(cfg)
+    result_ok('已加入白名单：' + value)
 
 def ports_command(argv, flags=None):
     """CLI: ports status|plan|apply|enable|disable|clients|rules|revert."""

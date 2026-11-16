@@ -445,5 +445,35 @@ class AutoPortTests(unittest.TestCase):
         self.assertIn('alpine', text2)
 
 
+    # ---- 菜单（所有命令都要能用数字执行） ----
+
+    def test_menu_exposes_every_command(self):
+        out = io.StringIO()
+        with patch('builtins.input', side_effect=['0']), \
+             contextlib.redirect_stdout(out):
+            m.auto_port_menu()
+        shown = out.getvalue()
+        expected = ['查看完整状态', '预览变更计划（不执行）', '立即同步一次',
+                    '查看已放行规则', '启用自动放行', '关闭自动放行',
+                    '查看可发现的客户端（clientID）', '添加客户端到白名单',
+                    '从白名单移除客户端', '检测防火墙状态',
+                    '预览防火墙启用计划', '一键启用防火墙（先放行 SSH）',
+                    '撤销全部自动放行并关闭']
+        for label in expected:
+            self.assertIn(label, shown, label)
+        # 编号必须连续 1..13
+        for index in range(1, 14):
+            self.assertIn('%d)' % index, shown.replace(' 1)', ' 1)'))
+
+    def test_menu_status_block_under_title(self):
+        out = io.StringIO()
+        with patch('builtins.input', side_effect=['0']), \
+             contextlib.redirect_stdout(out):
+            m.auto_port_menu()
+        shown = out.getvalue()
+        self.assertLess(shown.index('端口自动开通'), shown.index('功能状态'))
+        self.assertLess(shown.index('功能状态'), shown.index('状态与预览'))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -667,5 +667,97 @@ class AutoPortTests(unittest.TestCase):
         self.assertEqual(report['added'], [{'port': 6000, 'proto': 'tcp'}])
 
 
+    # ---- 防火墙启用：面板硬阻止 / 快照 / 回滚 ----
+
+    def test_enable_refuses_when_panel_present_without_force(self):
+        detected = {'backend': 'iptables', 'active': True, 'available': ['iptables'],
+                    'family': 'debian', 'preferred': 'ufw', 'detail': {'iptables': 'active'},
+                    'panels': [{'key': 'baota', 'name': '宝塔面板 / aaPanel'}],
+                    'managers': ['iptables'], 'conflict': True}
+        with patch.object(m, 'firewall_detect', return_value=detected), \
+             patch.object(m, 'firewall_enable_plan', return_value={
+                 'target': 'ufw', 'family': 'debian', 'installed': True, 'ssh_ports': [22],
+                 'keep': [], 'install_cmds': [], 'allow_cmds': [], 'enable_cmds': [],
+                 'notes': []}), \
+             patch.object(m, 'run_cmd') as run:
+            with self.assertRaises(ValueError) as ctx:
+                m.firewall_enable(yes=True)
+        self.assertIn('拒绝', str(ctx.exception))
+        run.assert_not_called()          # 一条命令都不能执行
+
+    def test_enable_saves_snapshot_before_enabling(self):
+        # 启用后复查会再次调用 firewall_detect，此时应为 active
+        detected = {'backend': 'ufw', 'active': True, 'available': ['ufw'],
+                    'family': 'debian', 'preferred': 'ufw', 'detail': {'ufw': 'active'},
+                    'panels': [], 'managers': ['ufw'], 'conflict': False}
+        plan = {'target': 'ufw', 'family': 'debian', 'installed': True, 'ssh_ports': [22],
+                'keep': [(7000, 'tcp')], 'install_cmds': [],
+                'allow_cmds': [['ufw', 'allow', '22/tcp'], ['ufw', 'allow', '7000/tcp']],
+                'enable_cmds': [['ufw', '--force', 'enable']], 'notes': []}
+        order = []
+        def fake_run(args_list, **kwargs):
+            order.append(args_list)
+            return type('R', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+        with patch.object(m, 'firewall_detect', return_value=detected), \
+             patch.object(m, 'firewall_enable_plan', return_value=plan), \
+             patch.object(m, 'firewall_snapshot', return_value={'time': 't', 'iptables': 'x'}), \
+             patch.object(m, 'firewall_snapshot_save', side_effect=lambda s: order.append('SNAP')), \
+             patch.object(m, 'firewall_open_ports', return_value={(22, 'tcp'), (7000, 'tcp')}), \
+             patch.object(m, 'run_cmd', side_effect=fake_run):
+            result = m.firewall_enable(yes=True)
+        self.assertTrue(result['ok'])
+        self.assertEqual(order[0], 'SNAP')      # 快照必须先于任何防火墙命令
+        self.assertEqual(result['missing'], [])
+
+    def test_enable_reports_missing_ports_after_activation(self):
+        detected = {'backend': 'ufw', 'active': True, 'available': ['ufw'],
+                    'family': 'debian', 'preferred': 'ufw', 'detail': {'ufw': 'active'},
+                    'panels': [], 'managers': ['ufw'], 'conflict': False}
+        plan = {'target': 'ufw', 'family': 'debian', 'installed': True, 'ssh_ports': [22],
+                'keep': [(7000, 'tcp')], 'install_cmds': [],
+                'allow_cmds': [['ufw', 'allow', '22/tcp']],
+                'enable_cmds': [], 'notes': []}
+        with patch.object(m, 'firewall_detect', return_value=detected), \
+             patch.object(m, 'firewall_enable_plan', return_value=plan), \
+             patch.object(m, 'firewall_snapshot', return_value={'time': 't'}), \
+             patch.object(m, 'firewall_snapshot_save', return_value=self.tmp / 'snap.json'), \
+             patch.object(m, 'firewall_open_ports', return_value={(22, 'tcp')}), \
+             patch.object(m, 'run_cmd', return_value=type('R', (), {
+                 'returncode': 0, 'stdout': '', 'stderr': ''})()):
+            result = m.firewall_enable(yes=True)
+        self.assertEqual(result['missing'], ['7000/tcp'])
+
+    def test_revert_disables_ufw_when_snapshot_had_it_off(self):
+        calls = []
+        def fake_run(args_list, **kwargs):
+            calls.append(list(args_list))
+            return type('R', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+        snap = {'time': 't', 'ufw_active': False, 'iptables': '*filter\nCOMMIT\n'}
+        with patch.object(m, 'run_cmd', side_effect=fake_run):
+            result = m.firewall_revert(snap, yes=True)
+        self.assertTrue(result['ok'])
+        self.assertIn(['ufw', 'disable'], calls)
+        self.assertIn('ufw disable', result['actions'])
+
+    def test_revert_without_snapshot_raises(self):
+        with patch.object(m, 'firewall_snapshot_load', return_value={}):
+            with self.assertRaises(ValueError):
+                m.firewall_revert(yes=True)
+
+    def test_snapshot_captures_ufw_and_iptables(self):
+        def fake_run(args_list, **kwargs):
+            key = ' '.join(args_list)
+            if key.startswith('iptables-save'):
+                return type('R', (), {'returncode': 0, 'stdout': '*filter\n', 'stderr': ''})()
+            if key.startswith('ufw status'):
+                return type('R', (), {'returncode': 0, 'stdout': 'Status: inactive\n', 'stderr': ''})()
+            return type('R', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+        with patch.object(m, 'run_cmd', side_effect=fake_run), \
+             patch.object(m.shutil, 'which', return_value='/usr/sbin/x'):
+            snap = m.firewall_snapshot()
+        self.assertIn('iptables', snap)
+        self.assertFalse(snap['ufw_active'])
+
+
 if __name__ == '__main__':
     unittest.main()

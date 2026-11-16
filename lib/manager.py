@@ -30,7 +30,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.12'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.13'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -3779,26 +3779,117 @@ def firewall_enable_plan():
             'install_cmds': install_cmds, 'allow_cmds': allow_cmds,
             'enable_cmds': enable_cmds, 'notes': notes}
 
-def firewall_enable(yes=False):
-    """Install (if needed) and enable a firewall, SSH-safe.
+def firewall_snapshot():
+    """Save current firewall state so enabling can be rolled back."""
+    snap = {'time': dt.datetime.now().isoformat(timespec='seconds')}
+    try:
+        # iptables 快照（ufw/firewalld 底层都是 iptables 或 nft）
+        out = run_cmd(['iptables-save'], capture_output=True, text=True, timeout=30)
+        if out.returncode == 0: snap['iptables'] = out.stdout
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    try:
+        if shutil.which('nft'):
+            out = run_cmd(['nft', 'list', 'ruleset'], capture_output=True, text=True, timeout=30)
+            if out.returncode == 0: snap['nft'] = out.stdout
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    try:
+        if shutil.which('ufw'):
+            out = run_cmd(['ufw', 'status'], capture_output=True, text=True, timeout=20)
+            snap['ufw_status'] = (out.stdout or '').strip()
+            snap['ufw_active'] = 'status: active' in (out.stdout or '').lower()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    try:
+        data = read_toml(ROOT / 'frps.toml') if (ROOT / 'frps.toml').exists() else {}
+        snap['bind_port'] = data.get('bindPort')
+    except (ValueError, OSError):
+        pass
+    return snap
 
-    Order is strictly: 放行 SSH → 放行 frps 端口 → 启用防火墙。
-    任一 SSH 放行失败即中止，绝不在没放行 SSH 的情况下启用。
+def firewall_snapshot_save(snap):
+    """Persist a snapshot next to auto-port state (0600)."""
+    path = ROOT / 'firewall-snapshot.json'
+    save_json(path, snap)
+    try: os.chmod(str(path), 0o600)
+    except OSError: pass
+    return path
+
+def firewall_snapshot_load():
+    path = ROOT / 'firewall-snapshot.json'
+    if not path.exists(): return {}
+    try:
+        return read_json(path, {})
+    except (ValueError, OSError):
+        return {}
+
+def firewall_revert(snap=None, yes=False):
+    """Roll the firewall back to the saved snapshot.
+
+    用于「启用防火墙后把自己或服务锁在外面」的急救场景。
+    """
+    snap = snap or firewall_snapshot_load()
+    if not snap:
+        raise ValueError('没有可用的防火墙快照；请手动检查 ufw / iptables 状态。')
+    if not yes and not confirm(
+            '将把防火墙回滚到 ' + str(snap.get('time', '未知时间')) + ' 的快照状态。\n'
+            '这会覆盖当前的防火墙规则。确认继续？', danger=True):
+        return {'ok': False, 'reason': 'cancelled'}
+    actions = []
+    # 1) 如果快照里 ufw 原本是关闭的，就关掉它（最常见的"锁死"根因）
+    if snap.get('ufw_active') is False:
+        try:
+            run_cmd(['ufw', 'disable'], capture_output=True, text=True, timeout=60)
+            actions.append('ufw disable')
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # 2) 恢复 iptables 规则
+    if snap.get('iptables'):
+        try:
+            proc = subprocess.run(['iptables-restore'], input=snap['iptables'],
+                                  capture_output=True, text=True, timeout=60)
+            actions.append('iptables-restore' + ('' if proc.returncode == 0
+                                                 else '（失败：%s）' % (proc.stderr or '').strip()))
+        except (OSError, subprocess.SubprocessError) as exc:
+            actions.append('iptables-restore 失败：' + str(exc))
+    ports_audit('firewall-revert', result='ok', detail='; '.join(actions))
+    return {'ok': True, 'actions': actions}
+
+def firewall_enable(yes=False, force=False):
+    """Install (if needed) and enable a firewall, SSH-safe and reversible.
+
+    Order is strictly: 快照 → 放行 SSH → 放行 frps 端口 → 启用 → 复查。
+    面板接管时默认**拒绝执行**（只给出说明），因为启用系统防火墙会覆盖面板
+    已经下发的 iptables 规则，导致既有服务失联。确需执行时必须 force。
     """
     plan = firewall_enable_plan()
     info0 = firewall_detect()
-    panel_warning = ''
-    if info0.get('panels'):
-        panel_warning = ('\n⚠ 检测到面板正在管理防火墙：'
-                         + '、'.join(p.get('name', '') for p in info0['panels'])
-                         + '\n直接启用系统防火墙可能与面板冲突（规则被覆盖/顺序错乱）。\n'
-                         '建议改用「只读清单」或在面板里放行端口。\n')
+    # 面板接管：硬阻止（不再是"警告后仍可继续"）
+    if info0.get('panels') and not force:
+        names = '、'.join(p.get('name', '') for p in info0['panels'])
+        raise ValueError(
+            '检测到面板正在管理防火墙（%s），已拒绝启用系统防火墙。\n'
+            '原因：启用 ufw/firewalld 会重建规则链，覆盖面板已放行的端口，'
+            '可能导致现有服务（含 frps 7000、SSH）立即失联。\n'
+            '建议做法：在面板「安全 → 防火墙」中手工放行所需端口，'
+            '或改用「13) 面板 API 配置」让本工具通过面板 API 放行。\n'
+            '若你确实要接管系统防火墙（风险自负），请用：'
+            'frps ports firewall enable --force' % names)
+
+    keep_desc = ', '.join('%d/%s' % (p, t) for p, t in plan['keep']) or '无'
     if not yes and not confirm(
             '将启用防火墙：' + plan['target'] + '\n'
-            + panel_warning +
-            '会先放行 SSH 端口 ' + ', '.join(str(p) for p in plan['ssh_ports']) + '，'
-            '再放行 frps 端口，最后启用。确认继续？', danger=True):
+            '会先保存当前防火墙快照，再放行 SSH 端口 '
+            + ', '.join(str(p) for p in plan['ssh_ports'])
+            + '，然后放行 frps 端口（' + keep_desc + '），最后启用。\n'
+            '若启用后失联，可用 `frps ports firewall revert` 回滚。确认继续？', danger=True):
         return {'ok': False, 'reason': 'cancelled', 'plan': plan}
+
+    # 0) 快照（回滚依据）
+    snap = firewall_snapshot()
+    snap_path = firewall_snapshot_save(snap)
+
     for cmd in plan['install_cmds']:
         out = run_cmd(cmd, capture_output=True, text=True, timeout=300)
         if out.returncode != 0:
@@ -3819,10 +3910,22 @@ def firewall_enable(yes=False):
         if out.returncode != 0:
             raise ValueError('启用失败：' + ' '.join(cmd) + ' — ' + (out.stderr or '').strip())
     info = firewall_detect()
+    # 启用后自检：frps 业务端口如果不在放行集合里，外部客户端会立刻失联，
+    # 这是"启用防火墙把自己服务锁在外面"最常见的情形，必须当场告警。
+    missing = []
+    try:
+        live = firewall_open_ports()
+        for port, proto in plan['keep']:
+            if live and (port, proto) not in live: missing.append('%d/%s' % (port, proto))
+    except (OSError, ValueError):
+        pass
     ports_audit('firewall-enable', result='ok' if info['active'] else 'inactive',
-                detail='%s family=%s ssh=%s' % (plan['target'], plan['family'],
-                                                ','.join(str(p) for p in plan['ssh_ports'])))
-    return {'ok': info['active'], 'reason': '' if info['active'] else 'not-active', 'plan': plan}
+                detail='%s family=%s ssh=%s snapshot=%s missing=%s'
+                       % (plan['target'], plan['family'],
+                          ','.join(str(p) for p in plan['ssh_ports']),
+                          Path(str(snap_path)).name, ','.join(missing) or 'none'))
+    return {'ok': info['active'], 'reason': '' if info['active'] else 'not-active',
+            'plan': plan, 'snapshot': str(snap_path), 'missing': missing}
 
 def _firewall_hint_text(info):
     """One-line guidance describing what to do about the missing firewall."""
@@ -4255,12 +4358,15 @@ def auto_port_menu():
             '检测防火墙状态',
             '预览防火墙启用计划',
             '一键启用防火墙（先放行 SSH）',
+            '保存防火墙快照',
+            '回滚防火墙到快照（急救）',
             '面板 API 配置（宝塔 / aaPanel）',
             '撤销全部自动放行并关闭',
         ]
         groups = {0: '── 状态与预览 ──', 4: '── 功能开关 ──',
                   6: '── 客户端白名单 ──', 9: '── 防火墙 ──',
-                  12: '── 面板接管（推荐） ──', 13: '── 危险操作 ──'}
+                  12: '── 急救与回滚 ──', 14: '── 面板接管（推荐） ──',
+                  15: '── 危险操作 ──'}
         n = choose(items, '端口自动开通', '返回上一级', groups=groups, prelude=_prelude)
         if not n: return
         try:
@@ -4362,9 +4468,20 @@ def auto_port_menu():
                 for note in plan['notes']: lines.append('说明：' + note)
                 _report('防火墙启用计划（未执行）', lines); pause()
             elif n == 12:
+                if info.get('panels'):
+                    result_error('已拒绝：检测到面板正在管理防火墙（'
+                                 + '、'.join(p.get('name', '') for p in info['panels']) + '）。',
+                                 hint='启用系统防火墙会覆盖面板规则，可能导致 frps/SSH 立即失联。\n'
+                                      '建议：在面板里放行端口，或用 15) 面板 API 配置。')
+                    pause(); continue
                 result = firewall_enable(yes=False)
                 if result['ok']:
-                    result_ok('防火墙已启用：' + result['plan']['target'])
+                    result_ok('防火墙已启用：' + result['plan']['target'],
+                              detail='已保存快照：' + result.get('snapshot', ''))
+                    if result.get('missing'):
+                        result_error('⚠ 以下端口未被放行，外部可能立即失联：'
+                                     + '、'.join(result['missing']),
+                                     hint='请立刻检查；可用 14) 回滚防火墙到快照。')
                     if auto_port_config()['enabled']:
                         report = ports_sync(apply_changes=True)
                         _report('同步结果', auto_port_report_lines(report))
@@ -4372,8 +4489,28 @@ def auto_port_menu():
                     result_info('已取消，未做任何修改。')
                 pause()
             elif n == 13:
-                panel_config_menu(); needs_pause = False
+                snap = firewall_snapshot()
+                path = firewall_snapshot_save(snap)
+                lines = ['快照文件：' + str(path),
+                         '时间：' + str(snap.get('time', '')),
+                         'ufw 状态：' + ('启用' if snap.get('ufw_active') else '未启用/未知'),
+                         'iptables 规则：' + ('已保存' if snap.get('iptables') else '未获取'),
+                         'nft 规则：' + ('已保存' if snap.get('nft') else '未获取')]
+                _report('防火墙快照', lines); result_ok('快照已保存，可用 14) 回滚。'); pause()
             elif n == 14:
+                snap = firewall_snapshot_load()
+                if not snap:
+                    result_error('没有可用的防火墙快照。', hint='可先用 13) 保存快照。')
+                    pause(); continue
+                result = firewall_revert(snap, yes=False)
+                if result.get('ok'):
+                    result_ok('已回滚防火墙。', detail='；'.join(result.get('actions') or []))
+                else:
+                    result_info('已取消回滚。')
+                pause()
+            elif n == 15:
+                panel_config_menu(); needs_pause = False
+            elif n == 16:
                 if not confirm('将删除本工具添加的全部防火墙规则（不会动你自己加的规则），'
                                '并关闭自动放行。确认？', danger=True):
                     result_info('已取消。'); pause(); continue
@@ -4563,15 +4700,33 @@ def ports_command(argv, flags=None):
             for note in plan['notes']: lines.append('说明：' + note)
             _report('启用计划（未执行）', lines); return
         if sub == 'enable':
-            result = firewall_enable(yes=bool(flags.get('yes')))
+            result = firewall_enable(yes=bool(flags.get('yes')), force=bool(flags.get('force')))
             if result['ok']:
-                result_ok('防火墙已启用：' + result['plan']['target'])
-                ports_sync(apply_changes=True)
+                result_ok('防火墙已启用：' + result['plan']['target'],
+                          detail='已保存快照：' + result.get('snapshot', ''))
+                if result.get('missing'):
+                    result_error('⚠ 以下端口未被放行，外部客户端可能立即失联：'
+                                 + '、'.join(result['missing']),
+                                 hint='请立刻检查，或执行 `frps ports firewall revert` 回滚。')
+                if auto_port_config()['enabled']:
+                    ports_sync(apply_changes=True)
             else:
                 result_error('防火墙未启用（%s）' % (result.get('reason') or '未知'),
                              hint='可先执行 `frps ports firewall plan` 查看将要执行的命令。')
             return
-        raise ValueError('支持 ports firewall status|plan|enable')
+        if sub == 'snapshot':
+            snap = firewall_snapshot()
+            path = firewall_snapshot_save(snap)
+            result_ok('已保存防火墙快照：', detail=str(path))
+            return
+        if sub == 'revert':
+            result = firewall_revert(yes=bool(flags.get('yes')))
+            if result.get('ok'):
+                result_ok('已回滚防火墙。', detail='；'.join(result.get('actions') or []))
+            else:
+                result_info('已取消回滚。')
+            return
+        raise ValueError('支持 ports firewall status|plan|enable [--force]|snapshot|revert')
     if action == 'panel':
         sub = argv[1] if len(argv) > 1 else 'status'
         panel = panel_config()

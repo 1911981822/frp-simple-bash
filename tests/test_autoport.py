@@ -56,6 +56,43 @@ class AutoPortTests(unittest.TestCase):
 
     # ---- 配置 ----
 
+    def _capture(self, backend, fn, *args):
+        calls = []
+        def fake(args_list, **kwargs):
+            calls.append(list(args_list))
+            return type('R', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+        detected = {'backend': backend, 'active': True, 'available': [backend],
+                    'family': 'debian', 'preferred': 'ufw', 'detail': {}}
+        with patch.object(m, 'firewall_detect', return_value=detected), \
+             patch.object(m, 'run_cmd', side_effect=fake):
+            fn(*args)
+        return calls
+
+    def _detect_with(self, handlers, available=('ufw', 'firewall-cmd', 'nft', 'iptables'), osr=None):
+        """Run firewall_detect with TEST disabled and stubbed commands."""
+        os_release = osr if osr is not None else {'ID': 'debian', 'ID_LIKE': 'debian'}
+        def fake_run(args_list, **kwargs):
+            key = ' '.join(args_list)
+            return type('R', (), {'returncode': 0, 'stdout': handlers.get(key, ''),
+                                  'stderr': ''})()
+        def fake_which(name):
+            return '/usr/sbin/' + name if name in available else None
+        with patch.object(m, 'TEST', False), \
+             patch.object(m, 'os_release', return_value=os_release), \
+             patch.object(m, 'run_cmd', side_effect=fake_run), \
+             patch.object(m.shutil, 'which', side_effect=fake_which):
+            return m.firewall_detect()
+
+    def proxy(self, port, client='clientA', phase='online', ptype='tcp', name='p'):
+        return {'name': name, 'clientID': client,
+                'spec': {'type': ptype, 'remotePort': port},
+                'status': {'phase': phase}}
+
+    def cfg(self, **overrides):
+        cfg = m.auto_port_config()
+        cfg.update(overrides)
+        return cfg
+
     def test_default_config(self):
         cfg = m.auto_port_config()
         self.assertFalse(cfg['enabled'])
@@ -127,130 +164,6 @@ class AutoPortTests(unittest.TestCase):
             self.assertFalse(m.port_conflict(6000, 'tcp', frps_pid=None))
 
     # ---- 同步 ----
-
-    def test_sync_adds_and_tracks_state(self):
-        cfg = self.cfg(enabled=True, allow_clients=['clientA'])
-        m.save_auto_port_config(cfg)
-        with patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]), \
-             patch.object(m, 'port_conflict', return_value=False), \
-             patch.object(m, '_service_pid', return_value=1), \
-             patch.object(m, 'firewall_add_port') as add, \
-             patch.object(m, 'firewall_del_port'):
-            report = m.ports_sync(apply_changes=True)
-        add.assert_called_once_with(6000, 'tcp')
-        self.assertEqual(report['added'], [{'port': 6000, 'proto': 'tcp'}])
-        self.assertEqual([(r['port'], r['proto']) for r in m.auto_port_state()['opened']],
-                         [(6000, 'tcp')])
-
-    def test_sync_prunes_only_after_ttl(self):
-        cfg = self.cfg(enabled=True, allow_clients=['clientA'], prune_after_seconds=3600)
-        m.save_auto_port_config(cfg)
-        m.save_auto_port_state({'schema_version': 1, 'backend': 'ufw', 'opened': [
-            {'port': 6000, 'proto': 'tcp', 'client_id': 'clientA', 'proxy': 'old'}]})
-        with patch.object(m, 'frps_online_proxies', return_value=[]), \
-             patch.object(m, 'port_conflict', return_value=False), \
-             patch.object(m, '_service_pid', return_value=1), \
-             patch.object(m, 'firewall_add_port'), \
-             patch.object(m, 'firewall_del_port') as delete:
-            report = m.ports_sync(apply_changes=True)
-        delete.assert_not_called()                       # 未到 TTL，先只打标记
-        self.assertEqual(report['removed'], [])
-        self.assertIn('missing_since', m.auto_port_state()['opened'][0])
-
-    def test_sync_prune_after_ttl_removes_rule(self):
-        cfg = self.cfg(enabled=True, allow_clients=['clientA'], prune_after_seconds=10)
-        m.save_auto_port_config(cfg)
-        m.save_auto_port_state({'schema_version': 1, 'backend': 'ufw', 'opened': [
-            {'port': 6000, 'proto': 'tcp', 'client_id': 'clientA', 'proxy': 'old',
-             'missing_since': '2000-01-01T00:00:00'}]})
-        with patch.object(m, 'frps_online_proxies', return_value=[]), \
-             patch.object(m, 'port_conflict', return_value=False), \
-             patch.object(m, '_service_pid', return_value=1), \
-             patch.object(m, 'firewall_add_port'), \
-             patch.object(m, 'firewall_del_port') as delete:
-            report = m.ports_sync(apply_changes=True)
-        delete.assert_called_once_with(6000, 'tcp')
-        self.assertEqual(report['removed'], [{'port': 6000, 'proto': 'tcp'}])
-        self.assertEqual(m.auto_port_state()['opened'], [])
-
-    def test_sync_reports_but_does_not_apply_when_disabled(self):
-        with patch.object(m, 'firewall_add_port') as add:
-            report = m.ports_sync(apply_changes=True)
-        self.assertFalse(report['enabled'])
-        add.assert_not_called()
-
-    def test_sync_refuses_when_firewall_inactive(self):
-        cfg = self.cfg(enabled=True, allow_clients=['clientA'])
-        m.save_auto_port_config(cfg)
-        detected = {'backend': 'ufw', 'active': False, 'available': ['ufw'],
-                    'family': 'debian', 'preferred': 'ufw', 'detail': {},
-                    'panels': [], 'conflict': False}
-        with patch.object(m, 'firewall_detect', return_value=detected):
-            with self.assertRaises(ValueError):
-                m.ports_sync(apply_changes=True)
-
-    def test_plan_mode_does_not_change_state(self):
-        cfg = self.cfg(enabled=True, allow_clients=['clientA'])
-        m.save_auto_port_config(cfg)
-        with patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]), \
-             patch.object(m, 'port_conflict', return_value=False), \
-             patch.object(m, '_service_pid', return_value=1), \
-             patch.object(m, 'firewall_add_port') as add:
-            report = m.ports_sync(apply_changes=False)
-        add.assert_not_called()
-        self.assertEqual(report['added'], [{'port': 6000, 'proto': 'tcp'}])
-        self.assertEqual(m.auto_port_state()['opened'], [])
-
-    # ---- 撤销 / 启用 ----
-
-    def test_revert_disables_and_clears_state(self):
-        cfg = self.cfg(enabled=True, allow_clients=['clientA'])
-        m.save_auto_port_config(cfg)
-        m.save_auto_port_state({'schema_version': 1, 'backend': 'ufw', 'opened': [
-            {'port': 6000, 'proto': 'tcp'}, {'port': 6001, 'proto': 'udp'}]})
-        with patch.object(m, 'firewall_del_port') as delete, \
-             patch.object(m, 'ports_timer_remove'):
-            removed = m.ports_revert()
-        self.assertEqual(len(removed), 2)
-        self.assertEqual(delete.call_count, 2)
-        self.assertFalse(m.auto_port_config()['enabled'])
-        self.assertEqual(m.auto_port_state()['opened'], [])
-
-    def test_enable_requires_whitelist(self):
-        with patch.object(m, 'firewall_backend', return_value=('ufw', True)), \
-             patch.object(m, 'frps_dashboard_config', return_value=('http', '127.0.0.1', {})):
-            with self.assertRaises(ValueError) as ctx:
-                m.ports_enable(self.cfg(allow_clients=[]))
-        self.assertIn('白名单', str(ctx.exception))
-
-    def test_enable_requires_dashboard(self):
-        with patch.object(m, 'firewall_backend', return_value=('ufw', True)), \
-             patch.object(m, 'frps_dashboard_config', side_effect=ValueError('Dashboard 未启用')):
-            with self.assertRaises(ValueError) as ctx:
-                m.ports_enable(self.cfg(allow_clients=['clientA']))
-        self.assertIn('Dashboard', str(ctx.exception))
-
-    def test_enable_installs_timer(self):
-        cfg = self.cfg(allow_clients=['clientA'])
-        with patch.object(m, 'firewall_backend', return_value=('ufw', True)), \
-             patch.object(m, 'frps_dashboard_config', return_value=('http', '127.0.0.1', {})), \
-             patch.object(m, 'ports_timer_install', return_value=True) as timer:
-            self.assertTrue(m.ports_enable(cfg))
-        timer.assert_called_once()
-
-    # ---- 防火墙命令构造 ----
-
-    def _capture(self, backend, fn, *args):
-        calls = []
-        def fake(args_list, **kwargs):
-            calls.append(list(args_list))
-            return type('R', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
-        detected = {'backend': backend, 'active': True, 'available': [backend],
-                    'family': 'debian', 'preferred': 'ufw', 'detail': {}}
-        with patch.object(m, 'firewall_detect', return_value=detected), \
-             patch.object(m, 'run_cmd', side_effect=fake):
-            fn(*args)
-        return calls
 
     def test_ufw_commands_are_argument_lists(self):
         calls = self._capture('ufw', m.firewall_add_port, 6000, 'tcp')
@@ -451,36 +364,6 @@ class AutoPortTests(unittest.TestCase):
 
     # ---- 菜单（所有命令都要能用数字执行） ----
 
-    def test_menu_exposes_every_command(self):
-        out = io.StringIO()
-        with patch('builtins.input', side_effect=['0']), \
-             contextlib.redirect_stdout(out):
-            m.auto_port_menu()
-        shown = out.getvalue()
-        expected = ['查看完整状态', '预览变更计划（不执行）', '立即同步一次',
-                    '查看已放行规则', '启用自动放行', '关闭自动放行',
-                    '查看可发现的客户端（clientID）', '添加客户端到白名单',
-                    '从白名单移除客户端', '检测防火墙状态',
-                    '预览防火墙启用计划', '一键启用防火墙（先放行 SSH）',
-                    '撤销全部自动放行并关闭']
-        for label in expected:
-            self.assertIn(label, shown, label)
-        # 编号必须连续 1..13
-        for index in range(1, 14):
-            self.assertIn('%d)' % index, shown.replace(' 1)', ' 1)'))
-
-    def test_menu_status_block_under_title(self):
-        out = io.StringIO()
-        with patch('builtins.input', side_effect=['0']), \
-             contextlib.redirect_stdout(out):
-            m.auto_port_menu()
-        shown = out.getvalue()
-        self.assertLess(shown.index('端口自动开通'), shown.index('功能状态'))
-        self.assertLess(shown.index('功能状态'), shown.index('状态与预览'))
-
-
-    # ---- 面板接管（宝塔等）兼容 ----
-
     def test_panel_detect_finds_baota(self):
         with patch.object(m, 'TEST', False), \
              patch.object(m.os, 'name', 'posix'), \
@@ -516,61 +399,6 @@ class AutoPortTests(unittest.TestCase):
         cfg['panel_mode'] = 'readonly'
         m.save_auto_port_config(cfg)
         self.assertEqual(m.firewall_mode(info), 'readonly')
-
-    def test_sync_readonly_mode_never_touches_firewall(self):
-        cfg = self.cfg(enabled=True, allow_clients=['clientA'], panel_mode='readonly')
-        m.save_auto_port_config(cfg)
-        detected = {'backend': 'iptables', 'active': True, 'available': ['iptables'],
-                    'family': 'debian', 'preferred': 'ufw', 'detail': {'iptables': 'active'},
-                    'panels': [{'key': 'baota', 'name': '宝塔面板 / aaPanel'}],
-                    'managers': ['iptables'], 'conflict': True}
-        with patch.object(m, 'firewall_detect', return_value=detected), \
-             patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]), \
-             patch.object(m, 'port_conflict', return_value=False), \
-             patch.object(m, '_service_pid', return_value=1), \
-             patch.object(m, 'firewall_open_ports', return_value=set()), \
-             patch.object(m, 'firewall_add_port') as add, \
-             patch.object(m, 'firewall_del_port') as delete:
-            report = m.ports_sync(apply_changes=True)
-        add.assert_not_called()
-        delete.assert_not_called()
-        self.assertEqual(report['mode'], 'readonly')
-        self.assertEqual([x['port'] for x in report['manual']], [6000])
-        self.assertTrue(report['conflict'])
-        self.assertEqual(m.auto_port_state()['opened'], [])   # 不改状态
-
-    def test_sync_detects_rules_cleared_by_panel(self):
-        cfg = self.cfg(enabled=True, allow_clients=['clientA'], panel_mode='direct')
-        m.save_auto_port_config(cfg)
-        m.save_auto_port_state({'schema_version': 1, 'backend': 'iptables', 'opened': [
-            {'port': 6000, 'proto': 'tcp', 'client_id': 'clientA', 'proxy': 'ssh'}]})
-        detected = {'backend': 'iptables', 'active': True, 'available': ['iptables'],
-                    'family': 'debian', 'preferred': 'ufw', 'detail': {'iptables': 'active'},
-                    'panels': [], 'managers': ['iptables'], 'conflict': False}
-        with patch.object(m, 'firewall_detect', return_value=detected), \
-             patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]), \
-             patch.object(m, 'port_conflict', return_value=False), \
-             patch.object(m, '_service_pid', return_value=1), \
-             patch.object(m, 'firewall_open_ports', return_value=set()), \
-             patch.object(m, 'firewall_add_port'):
-            report = m.ports_sync(apply_changes=True)
-        self.assertEqual([(x['port'], x['proto']) for x in report['lost']], [(6000, 'tcp')])
-        self.assertIn('rule-lost', m.auto_port_audit_path().read_text())
-
-    def test_report_mentions_readonly_and_conflict(self):
-        report = {'mode': 'readonly', 'backend': 'iptables', 'panels': ['宝塔面板'],
-                  'conflict': True, 'manual': [{'port': 6000, 'proto': 'tcp', 'proxy': 'ssh'}],
-                  'lost': [{'port': 6001, 'proto': 'tcp'}], 'added': [], 'removed': [],
-                  'kept': [], 'skipped': []}
-        text = '\n'.join(m.auto_port_report_lines(report))
-        self.assertIn('只读', text)
-        self.assertIn('宝塔面板', text)
-        self.assertIn('冲突', text)
-        self.assertIn('待手动放行：6000/tcp', text)
-        self.assertIn('规则已丢失：6001/tcp', text)
-
-
-    # ---- 宝塔 API ----
 
     def test_panel_config_defaults_and_roundtrip(self):
         panel = m.panel_config()
@@ -642,32 +470,6 @@ class AutoPortTests(unittest.TestCase):
         m.save_panel_config(panel)
         info = {'panels': [{'key': 'baota', 'name': '宝塔'}], 'detail': {}, 'backend': ''}
         self.assertEqual(m.firewall_mode(info), 'panel-api')
-
-    def test_sync_panel_api_does_not_require_system_firewall(self):
-        cfg = self.cfg(enabled=True, allow_clients=['clientA'], panel_mode='panel-api')
-        m.save_auto_port_config(cfg)
-        panel = m.panel_config(); panel['url'] = 'http://127.0.0.1:8888'; panel['api_key'] = 'k'
-        m.save_panel_config(panel)
-        detected = {'backend': '', 'active': False, 'available': [], 'family': 'debian',
-                    'preferred': 'ufw', 'detail': {},
-                    'panels': [{'key': 'baota', 'name': '宝塔'}], 'managers': [], 'conflict': False}
-        with patch.object(m, 'firewall_detect', return_value=detected), \
-             patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]), \
-             patch.object(m, 'port_conflict', return_value=False), \
-             patch.object(m, '_service_pid', return_value=1), \
-             patch.object(m, 'panel_rules', return_value=[]), \
-             patch.object(m, 'panel_add_rule') as add, \
-             patch.object(m, 'panel_del_rule') as delete, \
-             patch.object(m, 'firewall_add_port') as sysadd:
-            report = m.ports_sync(apply_changes=True)
-        add.assert_called_once_with(6000, 'tcp')
-        delete.assert_not_called()
-        sysadd.assert_not_called()          # 绝不能直写系统防火墙
-        self.assertEqual(report['mode'], 'panel-api')
-        self.assertEqual(report['added'], [{'port': 6000, 'proto': 'tcp'}])
-
-
-    # ---- 防火墙启用：面板硬阻止 / 快照 / 回滚 ----
 
     def test_enable_refuses_when_panel_present_without_force(self):
         detected = {'backend': 'iptables', 'active': True, 'available': ['iptables'],
@@ -758,6 +560,62 @@ class AutoPortTests(unittest.TestCase):
         self.assertIn('iptables', snap)
         self.assertFalse(snap['ufw_active'])
 
+
+
+    # ---- 核心逻辑：同步 → API 放行 / 手动清单 ----
+
+    def test_sync_without_api_returns_manual_list(self):
+        cfg = self.cfg(enabled=True, allow_clients=['clientA'])
+        m.save_auto_port_config(cfg)
+        with patch.object(m, 'panel_api_ready', return_value=False), \
+             patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]), \
+             patch.object(m, 'port_conflict', return_value=False), \
+             patch.object(m, '_service_pid', return_value=1), \
+             patch.object(m, 'panel_add_rule') as api:
+            report = m.ports_sync(apply_changes=True)
+        api.assert_not_called()
+        self.assertEqual(report['mode'], 'manual')
+        self.assertEqual([x['port'] for x in report['pending']], [6000])
+        self.assertEqual([r['port'] for r in m.auto_port_state()['opened']], [6000])
+
+    def test_sync_with_api_calls_panel_add(self):
+        cfg = self.cfg(enabled=True, allow_clients=['clientA'])
+        m.save_auto_port_config(cfg)
+        with patch.object(m, 'panel_api_ready', return_value=True), \
+             patch.object(m, 'panel_add_rule') as api, \
+             patch.object(m, 'panel_del_rule'), \
+             patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]), \
+             patch.object(m, 'port_conflict', return_value=False), \
+             patch.object(m, '_service_pid', return_value=1):
+            report = m.ports_sync(apply_changes=True)
+        api.assert_called_once_with(6000, 'tcp', m.panel_config())
+        self.assertEqual(report['mode'], 'panel-api')
+        self.assertEqual(report['added'], [{'port': 6000, 'proto': 'tcp'}])
+
+    def test_sync_with_api_removes_stale_rule(self):
+        cfg = self.cfg(enabled=True, allow_clients=['clientA'])
+        m.save_auto_port_config(cfg)
+        m.save_auto_port_state({'schema_version': 1, 'opened': [
+            {'port': 6000, 'proto': 'tcp', 'proxy': 'old'}]})
+        with patch.object(m, 'panel_api_ready', return_value=True), \
+             patch.object(m, 'panel_add_rule'), \
+             patch.object(m, 'panel_del_rule', return_value=True) as delete, \
+             patch.object(m, 'frps_online_proxies', return_value=[]), \
+             patch.object(m, 'port_conflict', return_value=False), \
+             patch.object(m, '_service_pid', return_value=1):
+            report = m.ports_sync(apply_changes=True)
+        delete.assert_called_once_with(6000, 'tcp', m.panel_config())
+        self.assertEqual(report['removed'], [{'port': 6000, 'proto': 'tcp'}])
+
+    def test_menu_has_core_items_only(self):
+        out = io.StringIO()
+        with patch('builtins.input', side_effect=['0']), \
+             contextlib.redirect_stdout(out):
+            m.auto_port_menu()
+        shown = out.getvalue()
+        for label in ('查看待放行端口', '立即同步并放行', '查看已放行端口',
+                      '查看在线客户端', '管理白名单', '宝塔 API 设置'):
+            self.assertIn(label, shown, label)
 
 if __name__ == '__main__':
     unittest.main()

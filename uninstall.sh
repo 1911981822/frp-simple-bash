@@ -83,6 +83,16 @@ PY
     fi
   else
     rm -rf -- "$config_root/frps.toml" "$config_root/.canonical-frps.toml"
+    # 端口自动开通：先停并删除定时器，再清理配置/状态/审计
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl disable --now frp-simple-bash-ports.timer >/dev/null 2>&1 || true
+      systemctl stop frp-simple-bash-ports.service >/dev/null 2>&1 || true
+      rm -f -- /etc/systemd/system/frp-simple-bash-ports.timer \
+               /etc/systemd/system/frp-simple-bash-ports.service
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    rm -f -- "$config_root/auto-port.toml" "$config_root/ports-state.json" \
+             "$config_root/logs/ports-audit.jsonl"
     if [[ -f "$config_root/state.json" ]]; then
       python3 - "$config_root/state.json" <<'PY'
 import json, sys

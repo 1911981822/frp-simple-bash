@@ -61,6 +61,37 @@ irm https://download.sueiyuan.top/frp-simple-bash/install-frpc.ps1 | iex   # 客
 | 运维 | 日志查看、连接诊断、备份恢复、开机自启动 |
 | 危险操作 | 卸载、升级 |
 
+### 端口自动开通（frps 侧，v1.0.0-rc.8 新增）
+
+frpc 加了映射后，frps 会自动监听端口——**但云服务器还有系统防火墙**。
+开启这个功能后，frps 侧管理器会读取 Dashboard 里"实际在线"的映射，
+自动在 `ufw / firewalld / iptables` 放行对应端口，删映射后自动回收。
+
+```bash
+sudo frps ports enable           # 启用（需先登记客户端白名单）
+sudo frps ports status           # 查看状态
+sudo frps ports plan             # 预览将增删哪些端口（不执行）
+sudo frps ports clients discover # 发现当前在线的 clientID
+sudo frps ports clients add <clientID>
+sudo frps ports revert --yes     # 撤销全部自动放行并关闭功能
+```
+
+**安全边界（必读）**：
+
+| 机制 | 说明 |
+|---|---|
+| 数据源 | 只放行 frps **已接受并在线**的映射，不信任客户端单方面声明 |
+| 白名单 | 只有登记过的 `clientID` 生效；默认空 = 不放行任何端口 |
+| 敏感端口黑名单 | 默认屏蔽 22/23/3306/6379/9200/27017 等 44 个高危端口 |
+| 单客户端配额 | 默认 20 个，`0` 表示不限 |
+| 端口冲突 | 被其它进程占用的端口一律不放行并给出原因 |
+| 审计 | `/etc/frp/logs/ports-audit.jsonl` 记录每次开关 |
+| 一键撤销 | 只删本工具添加的规则，不动你自己加的 |
+
+> ⚠️ 本功能**不做端口区间限制**，且云安全组需你手工配置。
+> 如果安全组全开而系统防火墙未启用，服务器等于全端口暴露——
+> 此时管理器会拒绝实际放行并报错。详见 [方案文档](docs/端口自动开通功能方案.md)。
+
 **交互规则（全程序统一）**：
 - `0` = 返回上一级（唯一的返回键）
 - 数字 = 执行对应操作
@@ -101,6 +132,7 @@ frpc start|stop|restart        # 服务控制
 frpc logs [--lines N]          # 查看日志
 frpc mapping list|add|delete   # 映射管理
 frpc upgrade                   # 升级管理器
+frps ports status              # 端口自动开通状态（见下）
 sudo bash /opt/frp-simple-bash/uninstall.sh frpc --purge --yes   # 彻底卸载
 ```
 
@@ -131,6 +163,7 @@ sudo bash /opt/frp-simple-bash/uninstall.sh frpc --purge --yes   # 彻底卸载
 | [macOS frpc 完整流程测试清单](docs/macOS-frpc-完整流程测试清单.md) | macOS 操作 checklist |
 | [国内下载站部署与维护](docs/国内下载站部署与维护.md) | 镜像站运维说明 |
 | [全量代码审查 Bug 报告](docs/全量代码审查Bug报告.md) | 代码审查记录 |
+| [端口自动开通功能方案](docs/端口自动开通功能方案.md) | 自动放行端口的设计与安全模型 |
 
 ---
 

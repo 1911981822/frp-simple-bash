@@ -29,7 +29,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.7'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.8'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -2697,12 +2697,12 @@ def main_menu(role):
         else:
             items = [
                 '启动', '停止', '重启',
-                '查看客户端连接信息', '修改服务端配置',
+                '查看客户端连接信息', '修改服务端配置', '端口自动开通',
                 '查看日志与连接诊断', '备份与恢复配置', '设置/取消开机自启动',
                 '卸载 frps', '升级 frps',
             ]
             groups = {0: '── 服务控制 ──', 3: '── 配置与连接 ──',
-                      5: '── 运维 ──', 8: '── 危险操作 ──'}
+                      6: '── 运维 ──', 9: '── 危险操作 ──'}
         def _prelude(_role=role, _data=data):
             # 状态块紧跟菜单标题显示（用户要求的布局）
             _status_body(_role, _data)
@@ -2749,12 +2749,13 @@ def main_menu(role):
                 elif n == 3: restart_safely(role)
                 elif n == 4: server_clients()
                 elif n == 5: frps_config_menu(); needs_pause = False
-                elif n == 6: logs_and_diagnostics_menu(role); needs_pause = False
-                elif n == 7: backup_menu(); needs_pause = False
-                elif n == 8:
+                elif n == 6: auto_port_menu(); needs_pause = False
+                elif n == 7: logs_and_diagnostics_menu(role); needs_pause = False
+                elif n == 8: backup_menu(); needs_pause = False
+                elif n == 9:
                     if not autostart(role): needs_pause = False
-                elif n == 9: terminal = uninstall_menu(role)
-                elif n == 10: terminal = upgrade(role)
+                elif n == 10: terminal = uninstall_menu(role)
+                elif n == 11: terminal = upgrade(role)
         except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as e:
             result_error(str(e))
         if terminal:
@@ -3018,6 +3019,722 @@ def mapping_command(argv, flags=None):
     if action == 'menu': mapping_menu(); return
     raise ValueError('支持 mapping list/add/edit/enable/disable/delete')
 
+# ============================================================================
+# 端口自动开通（auto-port）—— 路线 A：服务端被动同步
+# 数据源是 frps Dashboard 里"实际已注册并在线"的 proxy，而不是客户端声明，
+# 因此客户端不需要持有任何凭据，也无法凭一次请求打开任意端口。
+# ============================================================================
+
+AUTO_PORT_DENY_DEFAULT = (
+    21, 22, 23, 25, 53, 110, 111, 135, 137, 138, 139, 161, 162, 389, 445,
+    465, 512, 513, 514, 587, 636, 873, 993, 995, 1080, 1433, 1521, 2049,
+    2375, 2376, 2379, 3306, 3389, 5432, 5900, 6379, 6443, 7001, 7002,
+    9200, 9300, 10250, 11211, 27017,
+)
+
+def auto_port_config_path(): return ROOT / 'auto-port.toml'
+def auto_port_state_path(): return ROOT / 'ports-state.json'
+
+def auto_port_audit_path():
+    path = ROOT / 'logs' / 'ports-audit.jsonl'
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return path
+
+def ports_audit(action, **fields):
+    """Append one audit record. Fixed key set; never writes secrets."""
+    record = {'time': dt.datetime.now().isoformat(timespec='seconds'), 'action': str(action)}
+    for key in ('client_id', 'proxy', 'port', 'proto', 'result', 'detail'):
+        if key in fields: record[key] = fields[key]
+    try:
+        with auto_port_audit_path().open('a', encoding='utf-8') as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + '\n')
+    except OSError:
+        pass
+
+def auto_port_config():
+    """Load auto-port config, filling documented defaults."""
+    raw = read_toml(auto_port_config_path()) if auto_port_config_path().exists() else {}
+    if not isinstance(raw, dict): raw = {}
+    try:
+        max_ports = int(raw.get('max_ports_per_client', 20))
+    except (TypeError, ValueError):
+        max_ports = 20
+    try:
+        interval = int(raw.get('sync_interval_seconds', 15))
+    except (TypeError, ValueError):
+        interval = 15
+    try:
+        prune = int(raw.get('prune_after_seconds', 120))
+    except (TypeError, ValueError):
+        prune = 120
+    deny = raw.get('deny_ports')
+    if deny is None:
+        deny_list = list(AUTO_PORT_DENY_DEFAULT)
+    else:
+        deny_list = []
+        for item in deny:
+            try: deny_list.append(int(item))
+            except (TypeError, ValueError): continue
+    allow = []
+    for item in (raw.get('allow_clients') or []):
+        text = str(item).strip()
+        if text: allow.append(text)
+    return {
+        'enabled': bool(raw.get('enabled', False)),
+        'mode': str(raw.get('mode', 'firewall')),
+        'allow_clients': allow,
+        'max_ports_per_client': max(0, max_ports),
+        'deny_ports_enabled': bool(raw.get('deny_ports_enabled', True)),
+        'deny_ports': deny_list,
+        'sync_interval_seconds': max(5, interval),
+        'prune_after_seconds': max(10, prune),
+    }
+
+def save_auto_port_config(cfg):
+    """Persist auto-port config with 0600 permissions."""
+    payload = {
+        'schema_version': 1,
+        'enabled': bool(cfg['enabled']),
+        'mode': str(cfg['mode']),
+        'allow_clients': list(cfg['allow_clients']),
+        'max_ports_per_client': int(cfg['max_ports_per_client']),
+        'deny_ports_enabled': bool(cfg['deny_ports_enabled']),
+        'deny_ports': list(cfg['deny_ports']),
+        'sync_interval_seconds': int(cfg['sync_interval_seconds']),
+        'prune_after_seconds': int(cfg['prune_after_seconds']),
+    }
+    atomic(auto_port_config_path(), toml(payload))
+    try: os.chmod(str(auto_port_config_path()), 0o600)
+    except OSError: pass
+    audit('auto-port-config-saved')
+
+def auto_port_state():
+    data = read_json(auto_port_state_path(), {})
+    if not isinstance(data, dict): data = {}
+    opened = data.get('opened')
+    return {'schema_version': 1, 'backend': str(data.get('backend', '')),
+            'opened': opened if isinstance(opened, list) else []}
+
+def save_auto_port_state(st):
+    save_json(auto_port_state_path(), st)
+
+# ---------------------------------------------------------------- 防火墙后端
+
+def firewall_backend():
+    """Return (backend, active). Backend is 'ufw' | 'firewalld' | 'iptables' | ''."""
+    if TEST: return ('ufw', True)
+    try:
+        if shutil.which('ufw'):
+            out = run_cmd(['ufw', 'status'], capture_output=True, text=True, timeout=10)
+            return ('ufw', 'status: active' in (out.stdout or '').lower())
+        if shutil.which('firewall-cmd'):
+            out = run_cmd(['firewall-cmd', '--state'], capture_output=True, text=True, timeout=10)
+            return ('firewalld', (out.stdout or '').strip() == 'running')
+        if shutil.which('iptables'):
+            out = run_cmd(['iptables', '-S'], capture_output=True, text=True, timeout=10)
+            return ('iptables', bool((out.stdout or '').strip()))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return ('', False)
+
+def firewall_port_open(port, proto):
+    """True when the backend already allows that port."""
+    backend, active = firewall_backend()
+    if not active: return False
+    needle = '%d/%s' % (port, proto)
+    try:
+        if backend == 'ufw':
+            out = run_cmd(['ufw', 'status'], capture_output=True, text=True, timeout=10)
+            for line in (out.stdout or '').splitlines():
+                if line.strip().startswith(needle) and 'ALLOW' in line.upper():
+                    return True
+            return False
+        if backend == 'firewalld':
+            out = run_cmd(['firewall-cmd', '--query-port=' + needle],
+                          capture_output=True, text=True, timeout=10)
+            return out.returncode == 0
+        if backend == 'iptables':
+            out = run_cmd(['iptables', '-C', 'INPUT', '-p', proto, '--dport', str(port), '-j', 'ACCEPT'],
+                          capture_output=True, text=True, timeout=10)
+            return out.returncode == 0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return False
+
+def _persist_iptables():
+    """Best-effort persistence so rules survive a reboot."""
+    try:
+        out = run_cmd(['iptables-save'], capture_output=True, text=True, timeout=20)
+        if out.returncode != 0: return
+        target = Path('/etc/iptables/rules.v4')
+        if target.parent.exists(): atomic(target, out.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+
+def firewall_add_port(port, proto):
+    """Allow one port in the detected backend. Raises ValueError on failure."""
+    backend, active = firewall_backend()
+    if not backend:
+        raise ValueError('未检测到 ufw / firewalld / iptables，无法自动放行端口')
+    if not active:
+        raise ValueError('系统防火墙未启用（检测到 %s 但未运行），拒绝自动放行。'
+                         '安全组已全开时这会让服务器全端口暴露。' % backend)
+    needle = '%d/%s' % (port, proto)
+    try:
+        if backend == 'ufw':
+            out = run_cmd(['ufw', 'allow', needle], capture_output=True, text=True, timeout=20)
+        elif backend == 'firewalld':
+            out = run_cmd(['firewall-cmd', '--permanent', '--add-port=' + needle],
+                          capture_output=True, text=True, timeout=20)
+            if out.returncode == 0:
+                run_cmd(['firewall-cmd', '--reload'], capture_output=True, text=True, timeout=30)
+        else:
+            out = run_cmd(['iptables', '-I', 'INPUT', '-p', proto, '--dport', str(port),
+                           '-j', 'ACCEPT', '-m', 'comment', '--comment', 'frp-simple-bash:auto'],
+                          capture_output=True, text=True, timeout=20)
+            if out.returncode == 0: _persist_iptables()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError('防火墙放行失败：' + str(exc))
+    if out.returncode != 0:
+        raise ValueError('防火墙放行失败：' + (out.stderr or '').strip())
+
+def firewall_del_port(port, proto):
+    """Remove one port rule added by this tool."""
+    backend, active = firewall_backend()
+    if not backend or not active: return
+    needle = '%d/%s' % (port, proto)
+    try:
+        if backend == 'ufw':
+            run_cmd(['ufw', 'delete', 'allow', needle], capture_output=True, text=True, timeout=20)
+        elif backend == 'firewalld':
+            out = run_cmd(['firewall-cmd', '--permanent', '--remove-port=' + needle],
+                          capture_output=True, text=True, timeout=20)
+            if out.returncode == 0:
+                run_cmd(['firewall-cmd', '--reload'], capture_output=True, text=True, timeout=30)
+        else:
+            run_cmd(['iptables', '-D', 'INPUT', '-p', proto, '--dport', str(port),
+                     '-j', 'ACCEPT', '-m', 'comment', '--comment', 'frp-simple-bash:auto'],
+                    capture_output=True, text=True, timeout=20)
+            _persist_iptables()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+
+# ---------------------------------------------------------------- 端口占用检查
+
+def port_listener_pids(port, proto='tcp'):
+    """Best-effort PIDs listening on a TCP/UDP port."""
+    pids = []
+    try:
+        if shutil.which('ss'):
+            args = ['ss', '-lntpH' if proto == 'tcp' else '-lnupH', 'sport = :%d' % port]
+            out = run_cmd(args, capture_output=True, text=True, timeout=10)
+            for match in re.finditer(r'pid=(\d+)', out.stdout or ''):
+                pids.append(int(match.group(1)))
+        elif sys.platform == 'darwin' and shutil.which('lsof'):
+            out = run_cmd(['lsof', '-nP', '-i' + proto.upper(), '-s' + proto.upper() + ':LISTEN'],
+                          capture_output=True, text=True, timeout=15)
+            for line in (out.stdout or '').splitlines():
+                parts = line.split()
+                if len(parts) > 8 and (':' + str(port)) in parts[8]:
+                    if parts[1].isdigit(): pids.append(int(parts[1]))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return sorted(set(pids))
+
+def port_conflict(port, proto, frps_pid=None):
+    """True when a process OTHER than frps holds the port."""
+    pids = port_listener_pids(port, proto)
+    if not pids: return False
+    if frps_pid and all(pid == frps_pid for pid in pids): return False
+    return True
+
+# ---------------------------------------------------------------- 数据源
+
+def frps_dashboard_config():
+    """Return (scheme, host, web) for the local frps Dashboard/API."""
+    path = ROOT / 'frps.toml'
+    data = read_toml(path) if path.exists() else {}
+    web = data.get('webServer') or {}
+    if not web.get('port'):
+        raise ValueError('frps Dashboard/API 未启用，无法读取实际映射；'
+                         '请先在「修改服务端配置」中开启 Dashboard。')
+    host = web.get('addr', '127.0.0.1')
+    if host in ('0.0.0.0', '::'): host = '127.0.0.1' if host == '0.0.0.0' else '::1'
+    return api_scheme(web), api_host(host), web
+
+def frps_online_proxies():
+    """Read all proxies from the local frps v2 Dashboard API."""
+    scheme, host, web = frps_dashboard_config()
+    rows, page = [], 1
+    while True:
+        url = '%s://%s:%s/api/v2/proxies?page=%d&pageSize=200' % (scheme, host, web['port'], page)
+        data = api(url, web.get('user', ''), web.get('password', ''))
+        items = data.get('items') or []
+        rows.extend(items)
+        try: total = int(data.get('total', 0))
+        except (TypeError, ValueError): total = 0
+        if not items or page * 200 >= total or page >= 50: break
+        page += 1
+    return rows
+
+def ports_desired(cfg=None):
+    """Compute { (port, proto): record } from actually-online proxies.
+
+    Returns (desired, skipped) where skipped explains every excluded item.
+    """
+    cfg = cfg or auto_port_config()
+    frps_pid = _service_pid('frps')
+    allow = set(cfg['allow_clients'])
+    deny = set(cfg['deny_ports']) if cfg['deny_ports_enabled'] else set()
+    quota = cfg['max_ports_per_client']
+    desired, skipped, per_client = {}, [], {}
+    for item in frps_online_proxies():
+        status = item.get('status') or {}
+        if str(status.get('phase', '')).lower() not in ('online', 'running'): continue
+        spec = item.get('spec') or {}
+        proto = str(spec.get('type', '')).lower()
+        if proto not in ('tcp', 'udp'): continue
+        port = spec.get('remotePort') or spec.get('remote_port')
+        try: port = int(port)
+        except (TypeError, ValueError): continue
+        client_id = str(item.get('clientID') or item.get('clientId') or '')
+        name = str(item.get('name', ''))
+        base = {'port': port, 'proto': proto, 'client_id': client_id, 'proxy': name}
+        if not client_id or client_id not in allow:
+            skipped.append(dict(base, reason='client_not_allowed')); continue
+        if port in deny:
+            skipped.append(dict(base, reason='denied_port')); continue
+        if quota and per_client.get(client_id, 0) >= quota:
+            skipped.append(dict(base, reason='quota_exceeded')); continue
+        if port_conflict(port, proto, frps_pid):
+            skipped.append(dict(base, reason='port_in_use')); continue
+        key = (port, proto)
+        if key in desired: continue
+        per_client[client_id] = per_client.get(client_id, 0) + 1
+        desired[key] = base
+    return desired, skipped
+
+# ---------------------------------------------------------------- 同步
+
+def ports_sync(apply_changes=True):
+    """Reconcile firewall rules with actually-online proxies.
+
+    Returns a report dict: {enabled, backend, added, removed, kept, skipped}.
+    """
+    cfg = auto_port_config()
+    report = {'enabled': cfg['enabled'], 'backend': '', 'added': [], 'removed': [],
+              'kept': [], 'skipped': []}
+    if not cfg['enabled']:
+        return report
+    backend, active = firewall_backend()
+    report['backend'] = backend
+    if apply_changes and not active:
+        raise ValueError('系统防火墙未启用（%s 未运行），拒绝自动放行端口。' % (backend or '无后端'))
+    desired, skipped = ports_desired(cfg)
+    report['skipped'] = skipped
+    st = auto_port_state()
+    st['backend'] = backend
+    current = {}
+    for rec in st.get('opened') or []:
+        try: current[(int(rec['port']), str(rec['proto']))] = rec
+        except (KeyError, TypeError, ValueError): continue
+    now = time.time()
+    keep = []
+    for key, rec in sorted(current.items()):
+        if key in desired:
+            rec.pop('missing_since', None)
+            rec['proxy'] = desired[key]['proxy']
+            rec['client_id'] = desired[key]['client_id']
+            if key not in [((r['port']), r['proto']) for r in report['kept']]:
+                report['kept'].append({'port': key[0], 'proto': key[1]})
+            keep.append(rec)
+            desired.pop(key, None)
+            continue
+        missing_since = rec.get('missing_since')
+        if missing_since is None:
+            rec['missing_since'] = dt.datetime.now().isoformat(timespec='seconds')
+            keep.append(rec)
+            continue
+        try:
+            started = dt.datetime.fromisoformat(rec['missing_since']).timestamp()
+        except (ValueError, TypeError, AttributeError):
+            started = now
+        if now - started < cfg['prune_after_seconds']:
+            keep.append(rec)
+            continue
+        if apply_changes:
+            try:
+                firewall_del_port(key[0], key[1])
+                report['removed'].append({'port': key[0], 'proto': key[1]})
+                ports_audit('port-close', port=key[0], proto=key[1], result='ok',
+                            client_id=rec.get('client_id', ''), proxy=rec.get('proxy', ''))
+            except (OSError, ValueError):
+                keep.append(rec)
+    for key, rec in sorted(desired.items()):
+        entry = {'port': key[0], 'proto': key[1], 'client_id': rec['client_id'],
+                 'proxy': rec['proxy'], 'opened_at': dt.datetime.now().isoformat(timespec='seconds')}
+        if apply_changes:
+            try:
+                firewall_add_port(key[0], key[1])
+                report['added'].append({'port': key[0], 'proto': key[1]})
+                ports_audit('port-open', port=key[0], proto=key[1], result='ok',
+                            client_id=rec['client_id'], proxy=rec['proxy'])
+            except (OSError, ValueError) as exc:
+                ports_audit('port-open', port=key[0], proto=key[1], result='failed',
+                            client_id=rec['client_id'], proxy=rec['proxy'], detail=str(exc))
+                report['skipped'].append(dict(rec, reason='apply_failed', detail=str(exc)))
+                continue
+        else:
+            report['added'].append({'port': key[0], 'proto': key[1]})
+        keep.append(entry)
+    # plan 模式必须完全只读：不写状态文件，也不改动 missing_since 标记
+    if apply_changes:
+        st['opened'] = sorted(keep, key=lambda r: (int(r.get('port', 0)), str(r.get('proto', ''))))
+        save_auto_port_state(st)
+    return report
+
+def ports_revert():
+    """Remove every rule this tool opened and stop the automation.
+
+    只撤销规则而不关闭功能的话，下一次定时同步会在 15 秒后把它们重新放行，
+    所以这里同时关闭功能并移除定时器。Never touches user-created rules.
+    """
+    cfg = auto_port_config()
+    if cfg.get('enabled'):
+        cfg['enabled'] = False
+        save_auto_port_config(cfg)
+    ports_timer_remove()
+    st = auto_port_state()
+    removed = []
+    for rec in st.get('opened') or []:
+        try:
+            port, proto = int(rec['port']), str(rec['proto'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        firewall_del_port(port, proto)
+        removed.append({'port': port, 'proto': proto})
+        ports_audit('port-close', port=port, proto=proto, result='reverted')
+    st['opened'] = []
+    save_auto_port_state(st)
+    return removed
+
+def ports_enable(cfg, yes=False):
+    """Validate prerequisites and enable auto-port."""
+    problems = []
+    backend, active = firewall_backend()
+    if not backend: problems.append('未检测到 ufw / firewalld / iptables 任一防火墙')
+    try:
+        frps_dashboard_config()
+    except (ValueError, OSError) as exc:
+        problems.append(str(exc))
+    if not cfg['allow_clients']:
+        problems.append('客户端白名单为空：启用后不会有任何端口被放行，请先登记 clientID')
+    if problems:
+        raise ValueError('无法启用端口自动开通：\n  - ' + '\n  - '.join(problems))
+    if not active:
+        if not yes and not confirm('检测到系统防火墙未启用（%s 未运行）。\n'
+                                   '此时服务器实际处于全端口暴露状态，任何放行都不会生效。\n'
+                                   '仍要启用？' % backend, danger=True):
+            return False
+    cfg['enabled'] = True
+    save_auto_port_config(cfg)
+    timer_ok = ports_timer_install(cfg)
+    ports_audit('enable', result='ok',
+                detail='backend=%s active=%s timer=%s' % (backend, active, timer_ok))
+    return True
+# ---------------------------------------------------------------- 定时同步
+
+PORTS_TIMER_NAME = 'frp-simple-bash-ports'
+PORTS_TIMER_DIR = Path('/etc/systemd/system')
+
+def _systemd_available():
+    if TEST: return False
+    return bool(shutil.which('systemctl') and Path('/run/systemd/system').exists())
+
+def ports_timer_installed():
+    return (PORTS_TIMER_DIR / (PORTS_TIMER_NAME + '.timer')).exists()
+
+def ports_timer_install(cfg=None):
+    """Install + enable the systemd timer that keeps firewall rules in sync.
+
+    Returns True when the timer is active. Non-systemd platforms return False
+    (sync then happens on menu entry / manual `frps ports apply`).
+    """
+    if not _systemd_available(): return False
+    cfg = cfg or auto_port_config()
+    interval = max(5, int(cfg.get('sync_interval_seconds', 15)))
+    script = INSTALL_ROOT / 'lib' / 'manager.py'
+    service = (
+        '[Unit]\n'
+        'Description=frp-simple-bash auto port sync\n'
+        'After=network-online.target\n\n'
+        '[Service]\n'
+        'Type=oneshot\n'
+        'ExecStart=/usr/bin/env python3 %s frps ports apply\n'
+        % script
+    )
+    timer = (
+        '[Unit]\n'
+        'Description=frp-simple-bash auto port sync timer\n\n'
+        '[Timer]\n'
+        'OnBootSec=30\n'
+        'OnUnitActiveSec=%d\n'
+        'AccuracySec=5\n\n'
+        '[Install]\n'
+        'WantedBy=timers.target\n'
+        % interval
+    )
+    try:
+        atomic(PORTS_TIMER_DIR / (PORTS_TIMER_NAME + '.service'), service)
+        atomic(PORTS_TIMER_DIR / (PORTS_TIMER_NAME + '.timer'), timer)
+        for path in (PORTS_TIMER_DIR / (PORTS_TIMER_NAME + '.service'),
+                     PORTS_TIMER_DIR / (PORTS_TIMER_NAME + '.timer')):
+            try: os.chmod(str(path), 0o644)
+            except OSError: pass
+        run_cmd(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=30)
+        run_cmd(['systemctl', 'enable', '--now', PORTS_TIMER_NAME + '.timer'],
+                capture_output=True, text=True, timeout=30)
+        audit('ports-timer-installed')
+        return True
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+def ports_timer_remove():
+    """Disable + delete the timer; safe when it was never installed."""
+    if not _systemd_available(): return False
+    try:
+        run_cmd(['systemctl', 'disable', '--now', PORTS_TIMER_NAME + '.timer'],
+                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    for name in (PORTS_TIMER_NAME + '.timer', PORTS_TIMER_NAME + '.service'):
+        unlink_quiet(PORTS_TIMER_DIR / name)
+    try:
+        run_cmd(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    audit('ports-timer-removed')
+    return True
+
+def ports_timer_status():
+    """Human-readable timer state for the menu/CLI."""
+    if not _systemd_available(): return '不适用（非 systemd 平台）'
+    if not ports_timer_installed(): return '未安装'
+    try:
+        out = run_cmd(['systemctl', 'is-active', PORTS_TIMER_NAME + '.timer'],
+                      capture_output=True, text=True, timeout=10)
+        return '运行中' if (out.stdout or '').strip() == 'active' else '已停止'
+    except (OSError, subprocess.SubprocessError):
+        return '未知'
+def auto_port_report_lines(report, plan_only=False):
+    """Format a sync report as readable lines."""
+    lines = []
+    backend = report.get('backend') or '未检测到'
+    lines.append('防火墙后端：' + str(backend))
+    added = report.get('added') or []
+    removed = report.get('removed') or []
+    kept = report.get('kept') or []
+    lines.append('已放行：%d 个（本次新增 %d，回收 %d）' % (len(kept) + len(added), len(added), len(removed)))
+    if added:
+        lines.append(('将放行：' if plan_only else '本次放行：')
+                     + '、'.join('%d/%s' % (x['port'], x['proto']) for x in added))
+    if removed:
+        lines.append(('将回收：' if plan_only else '本次回收：')
+                     + '、'.join('%d/%s' % (x['port'], x['proto']) for x in removed))
+    for item in (report.get('skipped') or [])[:20]:
+        reason = {'client_not_allowed': '客户端不在白名单',
+                  'denied_port': '命中敏感端口黑名单',
+                  'quota_exceeded': '超出单客户端配额',
+                  'port_in_use': '端口已被其它进程占用',
+                  'apply_failed': '防火墙执行失败'}.get(item.get('reason'), item.get('reason'))
+        lines.append('跳过 %s/%s（%s）' % (item.get('port'), item.get('proto'), reason))
+    extra = len(report.get('skipped') or []) - 20
+    if extra > 0: lines.append('… 另有 %d 条跳过项，详见审计日志' % extra)
+    return lines
+
+def auto_port_menu():
+    """端口自动开通子菜单（frps 专用）。"""
+    clear_screen()
+    while True:
+        cfg = auto_port_config()
+        backend, active = firewall_backend()
+        state_text = color_state('已启用') if cfg['enabled'] else color_state('未启用')
+        print('  ' + _kv('功能状态', state_text))
+        print('  ' + _kv('防火墙', (backend or '未检测到') + ('' if active else color_state('（未运行）'))))
+        print('  ' + _kv('白名单', ('%d 个客户端' % len(cfg['allow_clients'])) if cfg['allow_clients'] else color_state('空（不会放行任何端口）')))
+        print('  ' + _kv('配额', '单客户端 ' + (str(cfg['max_ports_per_client']) if cfg['max_ports_per_client'] else '不限')))
+        print('  ' + _kv('已放行', '%d 个端口' % len(auto_port_state().get('opened') or [])))
+        print('  ' + _kv('定时同步', color_state(ports_timer_status())))
+        print(RULE)
+        items = ['查看状态明细', '预览变更计划（不执行）', '立即同步一次',
+                 '关闭功能' if cfg['enabled'] else '启用功能',
+                 '管理客户端白名单', '查看已放行规则', '撤销全部自动放行']
+        n = choose(items, '端口自动开通', '返回上一级')
+        if not n: return
+        try:
+            if n == 1:
+                report = ports_sync(apply_changes=False)
+                _report('端口状态', auto_port_report_lines(report, plan_only=True)); pause()
+            elif n == 2:
+                report = ports_sync(apply_changes=False)
+                _report('变更计划（未执行）', auto_port_report_lines(report, plan_only=True)); pause()
+            elif n == 3:
+                report = ports_sync(apply_changes=True)
+                _report('同步结果', auto_port_report_lines(report))
+                result_ok('同步完成。'); pause()
+            elif n == 4:
+                if cfg['enabled']:
+                    cfg['enabled'] = False; save_auto_port_config(cfg)
+                    ports_timer_remove()
+                    ports_audit('disable', result='ok')
+                    result_ok('已关闭端口自动开通；已放行规则保持不变，可用「撤销全部自动放行」清理。')
+                else:
+                    risk = ('启用后：任何在白名单内的客户端，其映射端口都会被自动放行到本机防火墙。\n'
+                            '当前配置为「不限制端口区间」，仅受敏感端口黑名单与配额约束。\n'
+                            '若云安全组已全开，系统防火墙是唯一防线。\n\n确认启用？')
+                    if not confirm(risk, danger=True): result_info('已取消。'); pause(); continue
+                    if ports_enable(cfg, yes=True):
+                        result_ok('已启用。'); ports_sync(apply_changes=True)
+                pause()
+            elif n == 5:
+                auto_port_clients_menu(); pause()
+            elif n == 6:
+                opened = auto_port_state().get('opened') or []
+                if not opened:
+                    result_info('当前没有由本工具放行的规则。')
+                else:
+                    lines = ['%d/%s  client=%s  proxy=%s' % (r.get('port'), r.get('proto'),
+                                                             r.get('client_id', '-'), r.get('proxy', '-'))
+                             for r in opened]
+                    _report('已放行规则', lines)
+                pause()
+            elif n == 7:
+                if not confirm('将删除本工具添加的全部防火墙规则（不会动你自己加的规则）。确认？', danger=True):
+                    result_info('已取消。'); pause(); continue
+                removed = ports_revert()
+                result_ok('已撤销 %d 条自动放行规则。' % len(removed)); pause()
+        except MENU_ERRORS as exc:
+            result_error(str(exc)); pause()
+
+def auto_port_clients_menu():
+    """Manage the clientID whitelist."""
+    clear_screen()
+    while True:
+        cfg = auto_port_config()
+        clients = cfg['allow_clients']
+        print('  当前白名单：' + (', '.join(clients) if clients else color_state('空')))
+        print(RULE)
+        n = choose(['添加客户端 ID', '移除客户端 ID', '查看可发现的客户端'], '客户端白名单', '返回上一级')
+        if not n: return
+        try:
+            if n == 1:
+                value = ask('clientID（frcp 配置里的 clientID，留空取消）', allow_empty=True)
+                if not value: continue
+                if value in clients:
+                    result_info('该 clientID 已在白名单中。'); pause(); continue
+                clients.append(value)
+                cfg['allow_clients'] = clients; save_auto_port_config(cfg)
+                result_ok('已加入白名单：' + value); pause()
+            elif n == 2:
+                if not clients:
+                    result_info('白名单为空。'); pause(); continue
+                index = choose(clients, '选择要移除的客户端')
+                if not index: continue
+                removed = clients.pop(index - 1)
+                cfg['allow_clients'] = clients; save_auto_port_config(cfg)
+                result_ok('已移除：' + removed); pause()
+            elif n == 3:
+                try:
+                    rows = frps_online_proxies()
+                except (ValueError, OSError) as exc:
+                    result_error(str(exc)); pause(); continue
+                seen = {}
+                for item in rows:
+                    cid = str(item.get('clientID') or item.get('clientId') or '')
+                    if cid: seen[cid] = seen.get(cid, 0) + 1
+                if not seen:
+                    result_info('当前没有在线客户端。')
+                else:
+                    _report('在线客户端', ['%s（%d 条映射）%s' % (cid, count,
+                                                  '  [已在白名单]' if cid in clients else '')
+                                           for cid, count in sorted(seen.items())])
+                pause()
+        except MENU_ERRORS as exc:
+            result_error(str(exc)); pause()
+
+def ports_command(argv, flags=None):
+    """CLI: ports status|plan|apply|enable|disable|clients|rules|revert."""
+    flags = flags or {}
+    as_json = bool(flags.get('json'))
+    action = argv[0] if argv else 'status'
+    if action == 'status':
+        cfg = auto_port_config(); backend, active = firewall_backend()
+        opened = auto_port_state().get('opened') or []
+        payload = {'enabled': cfg['enabled'], 'backend': backend, 'firewall_active': active,
+                   'allow_clients': cfg['allow_clients'],
+                   'max_ports_per_client': cfg['max_ports_per_client'],
+                   'deny_ports_enabled': cfg['deny_ports_enabled'],
+                   'opened': [{'port': r.get('port'), 'proto': r.get('proto'),
+                               'client_id': r.get('client_id'), 'proxy': r.get('proxy')} for r in opened]}
+        if as_json: print(json.dumps(payload, ensure_ascii=False, indent=2)); return
+        section('端口自动开通状态')
+        print(_kv('功能', color_state('已启用') if cfg['enabled'] else color_state('未启用')))
+        print(_kv('防火墙', (backend or '未检测到') + ('' if active else color_state('（未运行）'))))
+        print(_kv('白名单', ', '.join(cfg['allow_clients']) if cfg['allow_clients'] else '空'))
+        print(_kv('已放行', '%d 个端口' % len(opened)))
+        print(RULE)
+        return
+    if action == 'plan':
+        report = ports_sync(apply_changes=False)
+        if as_json: print(json.dumps(report, ensure_ascii=False, indent=2)); return
+        _report('变更计划（未执行）', auto_port_report_lines(report, plan_only=True)); return
+    if action == 'apply':
+        report = ports_sync(apply_changes=True)
+        if as_json: print(json.dumps(report, ensure_ascii=False, indent=2)); return
+        _report('同步结果', auto_port_report_lines(report)); result_ok('同步完成。'); return
+    if action == 'enable':
+        cfg = auto_port_config()
+        if ports_enable(cfg, yes=bool(flags.get('yes'))):
+            result_ok('已启用端口自动开通。'); ports_sync(apply_changes=True)
+        return
+    if action == 'disable':
+        cfg = auto_port_config(); cfg['enabled'] = False; save_auto_port_config(cfg)
+        ports_timer_remove()
+        ports_audit('disable', result='ok')
+        result_ok('已关闭端口自动开通。')
+        return
+    if action == 'clients':
+        cfg = auto_port_config(); sub = argv[1] if len(argv) > 1 else 'list'
+        if sub == 'list' or sub == 'ls':
+            print(json.dumps(cfg['allow_clients'], ensure_ascii=False, indent=2)); return
+        if sub == 'discover':
+            rows = frps_online_proxies(); seen = {}
+            for item in rows:
+                cid = str(item.get('clientID') or item.get('clientId') or '')
+                if cid: seen[cid] = seen.get(cid, 0) + 1
+            print(json.dumps(seen, ensure_ascii=False, indent=2)); return
+        if sub == 'add' or sub == 'remove':
+            if len(argv) < 3: raise ValueError('用法：ports clients add|remove <clientID>')
+            target = argv[2]
+            if sub == 'add':
+                if target not in cfg['allow_clients']: cfg['allow_clients'].append(target)
+            else:
+                if target in cfg['allow_clients']: cfg['allow_clients'].remove(target)
+            save_auto_port_config(cfg)
+            result_ok(('已加入白名单：' if sub == 'add' else '已移除：') + target)
+            return
+        raise ValueError('支持 ports clients list|discover|add|remove')
+    if action == 'rules':
+        opened = auto_port_state().get('opened') or []
+        if as_json: print(json.dumps(opened, ensure_ascii=False, indent=2)); return
+        if not opened: result_info('当前没有由本工具放行的规则。'); return
+        _report('已放行规则', ['%s/%s  client=%s  proxy=%s' % (r.get('port'), r.get('proto'),
+                                                    r.get('client_id', '-'), r.get('proxy', '-'))
+                               for r in opened]); return
+    if action == 'revert':
+        removed = ports_revert()
+        result_ok('已撤销 %d 条自动放行规则。' % len(removed)); return
+    raise ValueError('支持 ports status|plan|apply|enable|disable|clients|rules|revert')
 def install(role, yes=False, no_start=False, non_interactive=False):
     script = Path(__file__).resolve().parent.parent / ('install-' + role + ('.ps1' if os.name == 'nt' else '.sh'))
     if not script.exists(): raise ValueError('安装脚本未安装')
@@ -3560,6 +4277,17 @@ def run(argv=None):
         done = refresh_units(('frps', 'frpc'), yes=bool(flags.get('yes')))
         print(json.dumps({'ok': True, 'code': 0, 'refreshed': done, 'error': None},
                          ensure_ascii=False, indent=2))
+        return
+    if cmd == 'ports':
+        if role != 'frps': err('E001', '端口自动开通仅适用于服务端 frps；客户端如需固定公网端口请使用映射。')
+        sub, flags = None, {}
+        if argv:
+            sub = [argv[0]]
+            rest, flags = _parse_flags(argv[1:])
+            sub = [argv[0]] + rest
+        else:
+            flags = {}
+        ports_command(sub or ['status'], flags)
         return
     if cmd == 'configure': (configure_server if role == 'frps' else profile_wizard)(); return
     if cmd == 'import': import_external(role); return

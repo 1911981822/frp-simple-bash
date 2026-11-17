@@ -743,5 +743,65 @@ class AutoPortTests(unittest.TestCase):
         b = dict(a, name='b', enabled=False)
         m.validate_mappings([a, b])      # 停用项不参与查重，不应抛错
 
+    # ---- 剩余 15 项清理（rc.18）----
+
+    def test_windows_port_listener_parses_netstat(self):
+        out = ('  TCP    0.0.0.0:6000    0.0.0.0:0    LISTENING    1234\n'
+               '  TCP    0.0.0.0:7000    0.0.0.0:0    LISTENING    5678\n')
+        with patch.object(m.os, 'name', 'nt'), \
+             patch.object(m.shutil, 'which', return_value=None), \
+             patch.object(m, 'run_cmd', return_value=type('R', (), {
+                 'returncode': 0, 'stdout': out, 'stderr': ''})()):
+            self.assertEqual(m.port_listener_pids(6000, 'tcp'), [1234])
+
+    def test_persist_iptables_tries_multiple_paths(self):
+        calls = []
+        def fake_run(args_list, **kwargs):
+            calls.append(list(args_list))
+            return type('R', (), {'returncode': 0, 'stdout': '*filter\nCOMMIT\n', 'stderr': ''})()
+        with patch.object(m, 'run_cmd', side_effect=fake_run), \
+             patch.object(m.shutil, 'which', return_value=None), \
+             patch.object(m.Path, 'exists', return_value=False):
+            self.assertFalse(m._persist_iptables())    # 全部路径都不可用 → False
+        self.assertTrue(any(c[0] == 'iptables-save' for c in calls))
+
+    def test_nftables_port_open_requires_same_rule(self):
+        # 同一输出里 dport 与 accept 分离在不同规则时不能算"已开放"
+        out = 'tcp dport 6000 drop\n tcp dport 9999 accept\n'
+        detected = {'backend': 'nftables', 'active': True, 'available': ['nftables'],
+                    'family': 'alpine', 'preferred': 'nftables', 'detail': {'nftables': 'active'},
+                    'panels': [], 'managers': ['nftables'], 'conflict': False}
+        with patch.object(m, 'firewall_detect', return_value=detected), \
+             patch.object(m, '_cmd_out', return_value=out):
+            self.assertFalse(m.firewall_port_open(6000, 'tcp'))
+
+    def test_cli_destructive_commands_require_yes(self):
+        for argv in (['revert'], ['panel', 'clear']):
+            with self.assertRaises(ValueError) as ctx:
+                m.ports_command(argv, {})
+            self.assertIn('--yes', str(ctx.exception))
+        with patch.object(m, 'managed_paths', return_value=[]):
+            with self.assertRaises(ValueError) as ctx:
+                m.run(['frpc', 'logs-clean'])
+        self.assertIn('--yes', str(ctx.exception))
+
+    def test_panel_api_key_from_env_not_persisted(self):
+        panel = {'type': 'baota', 'url': 'http://127.0.0.1:8888',
+                 'api_key': 'from-env', 'api_key_from_env': True,
+                 'verify_tls': True, 'timeout': 10,
+                 'list_action': 'GetRules', 'add_action': 'AddRule', 'del_action': 'DelRule'}
+        m.save_panel_config(panel)
+        saved = m.read_toml(m.auto_port_config_path()).get('panel') or {}
+        self.assertEqual(saved.get('api_key', ''), '')   # 环境变量密钥不落盘
+
+    def test_verify_tls_defaults_to_true(self):
+        m.atomic(m.auto_port_config_path(), 'schema_version = 1\n')
+        self.assertTrue(m.panel_config()['verify_tls'])
+
+    def test_wrap_text_handles_non_sgr_escape(self):
+        out = m._wrap_text('\033[2J\033[H真实文本', 20)
+        self.assertTrue(out and '真实文本' in ''.join(out))
+
+
 if __name__ == '__main__':
     unittest.main()

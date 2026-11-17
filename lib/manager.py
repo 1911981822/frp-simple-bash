@@ -30,7 +30,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.17'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.18'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -360,12 +360,12 @@ def audit(event, pid=''):
 def state(): return read_json(ROOT / 'state.json')
 def active(): return state().get('active_profile_id', '')
 def pdir(pid):
-    if not re.fullmatch(r'[a-f0-9]{24}', pid): err('E011', '非法 profile ID')
+    if not re.fullmatch(r'[a-f0-9]{24}', pid): err('E011', '非法的服务端配置 ID')
     return ROOT / 'profiles' / pid
 
 def load_profile(pid):
     p = read_toml(pdir(pid) / 'profile.toml')
-    if p.get('id') != pid: raise ValueError('profile ID 与目录不一致')
+    if p.get('id') != pid: raise ValueError('服务端配置 ID 与目录不一致')
     validate_profile(p, pid)
     return p
 
@@ -714,7 +714,7 @@ ERROR_CODES = {
     'E008': '地址不可达',
     'E009': 'token / TLS 认证失败',
     'E010': 'Dashboard/API 不可用',
-    'E011': 'profile 不存在',
+    'E011': '服务端配置不存在',
     'E012': '映射不存在',
     'E013': '连接超时',
     'E014': '配置写入失败（检查权限和磁盘）',
@@ -892,21 +892,21 @@ def wait_connection(pid, timeout=30):
                             detail='下一步：主菜单 9「管理端口映射」→ 新增端口映射。')
             return True
         if state in ('auth-failed', 'tls-failed'):
-            result_error('连接失败：' + result.get('detail', state) + '；保留当前 profile。',
+            result_error('连接失败：' + result.get('detail', state) + '；已保留当前服务端配置。',
                          hint='排查：服务端的 token / TLS 配置；菜单「日志与连接诊断」→ 运行连接诊断。')
             return False
         # A stopped/failed service can never reach "connected": fail fast with
         # the real reason instead of waiting out the whole timeout.
         if state == 'stopped' and not running('frpc'):
-            result_error('frpc 未在运行，连接检测无法继续；已保留当前 profile。',
+            result_error('frpc 未在运行，连接检测无法继续；已保留当前服务端配置。',
                          hint='先在主菜单按 1「启动」；若启动失败请看「查看日志与连接诊断」（主菜单 11）。')
             return False
         if state == 'proxy-error':
-            result_error('frpc 已登录，但有映射未就绪（proxy-error）；已保留当前 profile。',
+            result_error('frpc 已登录，但有映射未就绪；已保留当前服务端配置。',
                          hint='检查映射的本地服务是否在运行、远程端口是否被占用；用主菜单 9「管理端口映射」查看。')
             return False
         if state == 'config-error':
-            result_error('配置错误，无法建立连接；已保留当前 profile。',
+            result_error('配置错误，无法建立连接；已保留当前服务端配置。',
                          hint='检查主菜单 7「修改服务端配置」中的地址/端口/token/TLS；或从「备份与恢复配置」恢复。')
             return False
         remaining = max(0, int(deadline - time.monotonic()))
@@ -1066,6 +1066,7 @@ def color_state(text):
             if w in s: return '\033[1;' + code + 'm' + s + '\033[0m'
     return s
 
+_ANSI_SGR = re.compile(r'\033\[[0-9;]*[A-Za-z]')
 _STATUS_RE = [None]
 
 def color_status_words(text):
@@ -1121,10 +1122,15 @@ def _wrap_text(text, width):
             ch = raw[i]
             # ANSI 转义序列不占显示宽度，整体原样带进 buf（着色后换行才不会错位）
             if ch == '\033' and i + 1 < len(raw) and raw[i + 1] == '[':
-                end = raw.find('m', i + 2)
-                if end < 0: end = len(raw) - 1
-                buf += raw[i:end + 1]
-                i = end + 1
+                match = _ANSI_SGR.match(raw, i)
+                if match:
+                    buf += match.group(0)
+                    i = match.end()
+                    continue
+                # 非 SGR 转义（如 \033[2J 清屏）不做宽度处理，按普通字符继续
+                buf += ch
+                i += 1
+                used += 1
                 continue
             w = 2 if ord(ch) > 0x2E7F else 1
             if used + w > width and buf:
@@ -1687,7 +1693,7 @@ def api_host(host): return '[' + host + ']' if ':' in host else host
 def save_mappings(pid, items, explicit=False):
     """Persist mappings. explicit=True is used by `mapping ... --profile <id>`
     so a non-active profile can be edited from the CLI (FUNC-6)."""
-    if not explicit and pid != require_active(): raise ValueError('只能管理当前 profile 的映射')
+    if not explicit and pid != require_active(): raise ValueError('只能管理当前服务端的映射')
     load_profile(pid)
     before_count = len(mappings(pid))
     with lock(), transaction():
@@ -2534,7 +2540,7 @@ def import_external(role):
         except Exception:
             for dest, value in zip(paths, old): atomic(dest, value)
             raise
-    result_ok('外部修改已导入当前 profile。')
+    result_ok('外部修改已导入当前服务端配置。')
 
 def status(role):
     result = {'component': role, 'version': VERSION, 'service_state': service(role, 'status'), 'config_path': str(ROOT / (role + '.toml'))}
@@ -3432,11 +3438,15 @@ def panel_config():
         section = raw.get('panel') or {}
         if not isinstance(section, dict): section = {}
     cfg = auto_port_config()
+    from_env = os.environ.get('FRP_PANEL_API_KEY', '')
+    file_key = str(section.get('api_key', '') or '')
     return {
         'type': str(section.get('type', 'baota') or 'baota').lower(),
         'url': str(section.get('url', 'http://127.0.0.1:8888') or '').rstrip('/'),
-        'api_key': str(section.get('api_key', '') or os.environ.get('FRP_PANEL_API_KEY', '')),
-        'verify_tls': bool(section.get('verify_tls', False)),
+        'api_key': file_key or from_env,
+        # 密钥来自环境变量时标记来源，保存配置时不要把它物化到磁盘
+        'api_key_from_env': bool(from_env and not file_key),
+        'verify_tls': bool(section.get('verify_tls', True)),
         'timeout': _safe_int(section.get('timeout', 10), 10),
         'node': str(section.get('node', '') or ''),          # aaPanel 多节点时可填
         'list_action': str(section.get('list_action', 'GetRules')),
@@ -3449,11 +3459,12 @@ def save_panel_config(panel):
     """Persist the [panel] section without touching other keys."""
     raw = read_toml(auto_port_config_path()) if auto_port_config_path().exists() else {}
     if not isinstance(raw, dict): raw = {}
+    api_key = '' if panel.get('api_key_from_env') else str(panel.get('api_key', ''))
     raw['panel'] = {
         'type': str(panel.get('type', 'baota')),
         'url': str(panel.get('url', '')),
-        'api_key': str(panel.get('api_key', '')),
-        'verify_tls': bool(panel.get('verify_tls', False)),
+        'api_key': api_key,
+        'verify_tls': bool(panel.get('verify_tls', True)),
         'timeout': int(panel.get('timeout', 10)),
         'list_action': str(panel.get('list_action', 'GetRules')),
         'add_action': str(panel.get('add_action', 'AddRule')),
@@ -3502,6 +3513,8 @@ def panel_request(action, params=None, panel=None, timeout=None):
     request = urllib.request.Request(url, data=data, method='POST')
     context = None
     if url.lower().startswith('https://') and not panel['verify_tls']:
+        # 关闭校验意味着可被中间人伪造响应；每次调用都记审计便于事后追溯
+        ports_audit('panel-tls-insecure', result='warn', detail='面板 HTTPS 校验已关闭')
         import ssl
         context = ssl._create_unverified_context()
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -3629,7 +3642,9 @@ def firewall_port_open(port, proto):
             return _cmd_ok(['iptables', '-C', 'INPUT', '-p', proto, '--dport', str(port), '-j', 'ACCEPT'])
         if backend == 'nftables':
             out = _cmd_out(['nft', 'list', 'chain', 'inet', 'filter', 'input'])
-            return ('%s dport %d' % (proto, port)) in out and 'accept' in out.lower()
+            # 逐条规则匹配：必须同一条规则里既有该 dport 又 verdict 为 accept
+            pattern = re.compile(r'%s\s+dport\s+%d\s+accept' % (proto, port), re.I)
+            return bool(pattern.search(out))
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
     return False
@@ -3638,14 +3653,41 @@ def _win_rule_name(port, proto):
     return 'frp-simple-bash-auto-%s-%d' % (proto, port)
 
 def _persist_iptables():
-    """Best-effort persistence so rules survive a reboot."""
+    """Persist iptables rules so they survive a reboot.
+
+    规则本身是临时的：不落盘的话重启即失效，而 state 里仍记着"已放行"，
+    用户会看到"界面说放行了但端口不通"。这里按发行版尝试多个落盘方式，
+    全都失败时返回 False，由调用方告警。
+    """
     try:
         out = run_cmd(['iptables-save'], capture_output=True, text=True, timeout=20)
-        if out.returncode != 0: return
+        if out.returncode != 0: return False
+        payload = out.stdout
+        # 1) Debian/Ubuntu: iptables-persistent
         target = Path('/etc/iptables/rules.v4')
-        if target.parent.exists(): atomic(target, out.stdout)
+        if target.parent.exists():
+            try:
+                atomic(target, payload); return True
+            except (OSError, ValueError): pass
+        # 2) RHEL/CentOS: iptables-services
+        target = Path('/etc/sysconfig/iptables')
+        if target.parent.exists():
+            try:
+                atomic(target, payload); return True
+            except (OSError, ValueError): pass
+        # 3) 通用：netfilter-persistent
+        if shutil.which('netfilter-persistent'):
+            proc = run_cmd(['netfilter-persistent', 'save'],
+                           capture_output=True, text=True, timeout=30)
+            if proc.returncode == 0: return True
+        # 4) 通用：service iptables save
+        if shutil.which('service'):
+            proc = run_cmd(['service', 'iptables', 'save'],
+                           capture_output=True, text=True, timeout=30)
+            if proc.returncode == 0: return True
+        return False
     except (OSError, ValueError, subprocess.SubprocessError):
-        pass
+        return False
 
 def firewall_add_port(port, proto):
     """Allow one port in the detected backend. Raises ValueError on failure."""
@@ -3675,7 +3717,9 @@ def firewall_add_port(port, proto):
             out = run_cmd(['iptables', '-I', 'INPUT', '-p', proto, '--dport', str(port),
                            '-j', 'ACCEPT', '-m', 'comment', '--comment', 'frp-simple-bash:auto'],
                           capture_output=True, text=True, timeout=20)
-            if out.returncode == 0: _persist_iptables()
+            if out.returncode == 0 and not _persist_iptables():
+                ports_audit('persist-failed', port=port, proto=proto, result='warn',
+                            detail='iptables 规则未能持久化，重启后失效')
         else:  # nftables
             if not _cmd_ok(['nft', 'list', 'table', 'inet', 'filter']):
                 raise ValueError('当前系统使用 nftables，但未找到标准 inet filter 表；'
@@ -3742,13 +3786,43 @@ def ssh_listen_ports(strict=True):
                 except ValueError: pass
             detected = True
     if not detected:
+        # 1) sshd -T 是最权威的（已合并 Include 与默认值）
         try:
-            for line in Path('/etc/ssh/sshd_config').read_text(encoding='utf-8', errors='replace').splitlines():
+            out = _cmd_out(['sshd', '-T'])
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].lower() == 'port' and parts[1].isdigit():
+                    ports.add(int(parts[1])); detected = True
+        except (OSError, ValueError):
+            pass
+    if not detected:
+        # 2) 退回解析 sshd_config 及其 sshd_config.d/*.conf
+        candidates = [Path('/etc/ssh/sshd_config')]
+        drop_in = Path('/etc/ssh/sshd_config.d')
+        if drop_in.is_dir():
+            candidates.extend(sorted(drop_in.glob('*.conf')))
+        for candidate in candidates:
+            try:
+                text = candidate.read_text(encoding='utf-8', errors='replace')
+            except OSError:
+                continue
+            for line in text.splitlines():
                 stripped = line.strip()
+                if stripped.startswith('#'): continue
                 if stripped.lower().startswith('port '):
                     value = stripped.split()[1]
                     if value.isdigit():
                         ports.add(int(value)); detected = True
+    if not detected:
+        # 3) Windows: 从 OpenSSH 配置读
+        try:
+            base = os.environ.get('ProgramData', r'C:\ProgramData')
+            cfg = Path(base) / 'ssh' / 'sshd_config'
+            if cfg.exists():
+                for line in cfg.read_text(encoding='utf-8', errors='replace').splitlines():
+                    if line.strip().lower().startswith('port '):
+                        value = line.split()[1]
+                        if value.isdigit(): ports.add(int(value)); detected = True
         except OSError:
             pass
     if not ports:
@@ -3798,7 +3872,7 @@ def _install_command(manager):
     if family == 'arch': return ['pacman', '-S', '--noconfirm', package]
     return []
 
-def firewall_enable_plan():
+def firewall_enable_plan(ssh_port=None):
     """Build a SAFE enable plan: SSH first, then frps ports, then activate."""
     info = firewall_detect()
     family = info['family']
@@ -3814,7 +3888,10 @@ def firewall_enable_plan():
             '请任选其一：\n'
             '  1) 安装并启用 ufw 或 firewalld（推荐，之后本工具可自动管理）；\n'
             '  2) 手动在 /etc/nftables.conf 中放行所需端口。')
-    ssh_ports = ssh_listen_ports(strict=True)
+    if ssh_port:
+        ssh_ports = [int(ssh_port)]
+    else:
+        ssh_ports = ssh_listen_ports(strict=True)
     keep = frps_keep_ports()
     install_cmds, allow_cmds, notes = [], [], []
     if not installed:
@@ -3931,14 +4008,14 @@ def firewall_revert(snap=None, yes=False):
     ports_audit('firewall-revert', result='ok', detail='; '.join(actions))
     return {'ok': True, 'actions': actions}
 
-def firewall_enable(yes=False, force=False):
+def firewall_enable(yes=False, force=False, ssh_port=None):
     """Install (if needed) and enable a firewall, SSH-safe and reversible.
 
     Order is strictly: 快照 → 放行 SSH → 放行 frps 端口 → 启用 → 复查。
     面板接管时默认**拒绝执行**（只给出说明），因为启用系统防火墙会覆盖面板
     已经下发的 iptables 规则，导致既有服务失联。确需执行时必须 force。
     """
-    plan = firewall_enable_plan()
+    plan = firewall_enable_plan(ssh_port=ssh_port)
     info0 = firewall_detect()
     # 面板接管：硬阻止（不再是"警告后仍可继续"）
     if info0.get('panels') and not force:
@@ -4032,6 +4109,18 @@ def port_listener_pids(port, proto='tcp'):
                 parts = line.split()
                 if len(parts) > 8 and (':' + str(port)) in parts[8]:
                     if parts[1].isdigit(): pids.append(int(parts[1]))
+        elif os.name == 'nt':
+            # Windows: netstat -ano 输出 "  TCP  0.0.0.0:6000  0.0.0.0:0  LISTENING  1234"
+            out = run_cmd(['netstat', '-ano'], capture_output=True, text=True, timeout=20)
+            needle = ':%d' % port
+            for line in (out.stdout or '').splitlines():
+                parts = line.split()
+                if len(parts) < 5: continue
+                if 'LISTEN' not in parts[3].upper(): continue
+                if not parts[1].endswith(needle): continue
+                if proto == 'udp' and parts[0].upper() != 'UDP': continue
+                if proto == 'tcp' and parts[0].upper() != 'TCP': continue
+                if parts[4].isdigit(): pids.append(int(parts[4]))
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
     return sorted(set(pids))
@@ -4797,7 +4886,7 @@ def ports_command(argv, flags=None):
                 result_info(_firewall_hint_text(info))
             print(RULE); return
         if sub == 'plan':
-            plan = firewall_enable_plan()
+            plan = firewall_enable_plan(ssh_port=flags.get('ssh_port'))
             if as_json:
                 print(json.dumps(plan, ensure_ascii=False, indent=2, default=str)); return
             lines = ['目标管理器：%s（发行版 %s）' % (plan['target'], plan['family'])]
@@ -4808,7 +4897,8 @@ def ports_command(argv, flags=None):
             for note in plan['notes']: lines.append('说明：' + note)
             _report('启用计划（未执行）', lines); return
         if sub == 'enable':
-            result = firewall_enable(yes=bool(flags.get('yes')), force=bool(flags.get('force')))
+            result = firewall_enable(yes=bool(flags.get('yes')), force=bool(flags.get('force')),
+                                     ssh_port=flags.get('ssh_port'))
             if result['ok']:
                 result_ok('防火墙已启用：' + result['plan']['target'],
                           detail='已保存快照：' + result.get('snapshot', ''))
@@ -4834,7 +4924,8 @@ def ports_command(argv, flags=None):
             else:
                 result_info('已取消回滚。')
             return
-        raise ValueError('支持 ports firewall status|plan|enable [--force]|snapshot|revert')
+        raise ValueError('支持 ports firewall status|plan|enable [--force] [--ssh-port N]'
+                         '|snapshot|revert')
     if action == 'panel':
         sub = argv[1] if len(argv) > 1 else 'status'
         panel = panel_config()
@@ -4877,6 +4968,8 @@ def ports_command(argv, flags=None):
                                          ensure_ascii=False, indent=2)); return
             result_ok('API 连接正常：当前有 %d 条防火墙规则。' % info['rules']); return
         if sub == 'clear':
+            if not flags.get('yes'):
+                raise ValueError('清空面板 API 配置后自动放行会失效：请追加 --yes 明确授权。')
             panel['url'] = ''; panel['api_key'] = ''
             save_panel_config(panel)
             result_ok('已清空面板 API 配置。'); return
@@ -4889,6 +4982,9 @@ def ports_command(argv, flags=None):
                                                     r.get('client_id', '-'), r.get('proxy', '-'))
                                for r in opened]); return
     if action == 'revert':
+        if not flags.get('yes'):
+            raise ValueError('ports revert 会删除本工具放行的全部端口，属破坏性操作：'
+                             '请追加 --yes 明确授权。')
         outcome = ports_revert()
         _report_revert(outcome); return
     raise ValueError('支持 ports status|plan|apply|enable|disable|clients|rules|revert')
@@ -5312,6 +5408,8 @@ def _parse_flags(argv):
             flags['version'] = argv[i + 1]; i += 2; continue
         if item == '--profile' and i + 1 < len(argv):
             flags['profile'] = argv[i + 1]; i += 2; continue
+        if item == '--ssh-port' and i + 1 < len(argv):
+            flags['ssh_port'] = argv[i + 1]; i += 2; continue
         if item in CLI_FLAGS:
             # Normalize flag key: strip leading dashes, and map '-'-joined
             # names to '_' so readers can use a single stable key.
@@ -5382,6 +5480,9 @@ def run(argv=None):
         if flags.get('follow'): follow_log(role, lines); return
         show_logs(role, lines); return
     if cmd == 'logs-clean':
+        _args, flags = _parse_flags(argv)
+        if not flags.get('yes'):
+            raise ValueError('logs-clean 会删除全部轮转归档：请追加 --yes 明确授权。')
         removed = 0
         for item in log_files(role):
             if item.name == role + '.log': continue
@@ -5400,6 +5501,12 @@ def run(argv=None):
         # root and restore into ROOT. Detect which kind and dispatch.
         manifest = directory / 'manifest.json'
         reason = read_json(manifest, {}).get('reason', '') if manifest.exists() else ''
+        if not flags.get('yes'):
+            raise ValueError('restore 会覆盖当前配置：请追加 --yes 明确授权。')
+        if reason != 'upgrade':
+            # 与菜单保持一致：恢复前先留一份当前状态的快照，便于反悔
+            try: backup(managed_paths(), 'pre-restore')
+            except (ValueError, OSError): pass
         if reason == 'upgrade':
             restored = restore_upgrade_snapshot(directory)
         else:

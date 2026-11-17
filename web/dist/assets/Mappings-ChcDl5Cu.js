@@ -1,1 +1,0 @@
-import{_ as t}from"./_plugin-vue_export-helper-DlAUqK2U.js";import{c as o,b as s,k as r}from"./index-Cny8auPq.js";const a={},c={class:"page"};function n(p,e){return r(),o("div",c,[...e[0]||(e[0]=[s("h2",null,"端口映射",-1),s("p",{class:"muted"},"下一阶段实现（P3）。",-1)])])}const d=t(a,[["render",n]]);export{d as default};

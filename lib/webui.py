@@ -730,6 +730,585 @@ def api_logs(ctx):
             'total': len(content)}
 
 
+# ---------------------------------------------------------------- 映射 CRUD
+
+MAPPING_FIELDS = ('name', 'type', 'local_ip', 'local_port', 'remote_port',
+                  'domain', 'enabled')
+
+def _mapping_from_body(body, existing=None):
+    """把请求体规整成合法 mapping dict（缺省值取现有值或默认值）。"""
+    base = dict(existing or {})
+    item = {
+        'name': str(body.get('name', base.get('name', ''))).strip(),
+        'type': str(body.get('type', base.get('type', 'tcp'))).lower(),
+        'local_ip': str(body.get('local_ip', base.get('local_ip', '127.0.0.1'))).strip(),
+        'local_port': body.get('local_port', base.get('local_port')),
+        'enabled': bool(body.get('enabled', base.get('enabled', True))),
+    }
+    if item['type'] in ('tcp', 'udp'):
+        item['remote_port'] = body.get('remote_port', base.get('remote_port'))
+    else:
+        item['domain'] = str(body.get('domain', base.get('domain', ''))).strip()
+    return item
+
+
+def _active_pid():
+    pid = manager.active()
+    if not pid:
+        raise HttpError(400, '还没有选择服务端', 'E_NO_PROFILE',
+                        hint='请先到「服务端」页新建或选择一个 FRPS 服务端')
+    manager.load_profile(pid)
+    return pid
+
+
+def api_mappings(ctx):
+    """列出映射（默认当前服务端；all=1 时列出全部服务端）。"""
+    ctx.app.require_auth(ctx)
+    want_all = str(ctx.param('all', '0')) in ('1', 'true', 'yes')
+    active_id = manager.active()
+    rows = []
+    errors = []
+    targets = manager.profiles() if want_all else None
+    if targets is None:
+        pid = _active_pid()
+        targets = [manager.load_profile(pid)]
+    online = manager.mapping_online_status(active_id) if active_id else None
+    for profile in targets:
+        try:
+            items = manager.mappings(profile['id'])
+        except (ValueError, OSError) as exc:
+            errors.append({'profile': profile.get('name'), 'error': str(exc)})
+            continue
+        for item in items:
+            row = dict(item)
+            row['profile_id'] = profile['id']
+            row['profile_name'] = profile.get('name')
+            row['is_active_profile'] = profile['id'] == active_id
+            if profile['id'] == active_id and online is not None:
+                row['online'] = bool(online.get(str(item.get('name'))))
+            else:
+                row['online'] = None
+            rows.append(row)
+    return {'items': rows, 'errors': errors,
+            'active_profile': _profile_brief(manager.load_profile(active_id)) if active_id else None}
+
+
+def api_mapping_create(ctx):
+    ctx.app.require_auth(ctx)
+    body = ctx.json_body()
+    pid = _active_pid()
+    items = manager.mappings(pid)
+    item = _mapping_from_body(body)
+    if any(str(m.get('name')) == item['name'] for m in items):
+        raise HttpError(400, '映射名称已存在：' + item['name'], 'E_DUPLICATE_NAME')
+    items.append(item)
+    manager.validate_mappings(items)
+    with ctx.app.write_lock:
+        manager.save_mappings(pid, items)
+    web_audit('mapping-create', ctx.client_ip, ctx.session['user'], 'ok', item['name'])
+    return {'item': item}
+
+
+def _find_mapping(pid, name):
+    for index, item in enumerate(manager.mappings(pid)):
+        if str(item.get('name')) == name:
+            return index, item
+    raise HttpError(404, '映射不存在：' + name, 'E_NOT_FOUND')
+
+
+def api_mapping_update(ctx, name):
+    ctx.app.require_auth(ctx)
+    body = ctx.json_body()
+    pid = _active_pid()
+    index, current = _find_mapping(pid, name)
+    item = _mapping_from_body(body, current)
+    if item['name'] != name and any(
+            str(m.get('name')) == item['name'] for i, m in enumerate(manager.mappings(pid)) if i != index):
+        raise HttpError(400, '映射名称已存在：' + item['name'], 'E_DUPLICATE_NAME')
+    items = manager.mappings(pid)
+    items[index] = item
+    manager.validate_mappings(items)
+    with ctx.app.write_lock:
+        manager.save_mappings(pid, items)
+    web_audit('mapping-update', ctx.client_ip, ctx.session['user'], 'ok', name)
+    return {'item': item}
+
+
+def api_mapping_toggle(ctx, name):
+    ctx.app.require_auth(ctx)
+    pid = _active_pid()
+    index, current = _find_mapping(pid, name)
+    items = manager.mappings(pid)
+    items[index] = dict(current, enabled=not current.get('enabled', True))
+    manager.validate_mappings(items)
+    with ctx.app.write_lock:
+        manager.save_mappings(pid, items)
+    web_audit('mapping-toggle', ctx.client_ip, ctx.session['user'], 'ok', name)
+    return {'item': items[index]}
+
+
+def api_mapping_delete(ctx, name):
+    ctx.app.require_auth(ctx)
+    body = ctx.json_body() if ctx.body else {}
+    if str(body.get('confirm', '')) != name:
+        raise HttpError(400, '请确认删除：需要提交与映射名相同的 confirm 字段',
+                        'E_CONFIRM_REQUIRED')
+    pid = _active_pid()
+    index, _current = _find_mapping(pid, name)
+    items = manager.mappings(pid)
+    items.pop(index)
+    with ctx.app.write_lock:
+        manager.save_mappings(pid, items)
+    web_audit('mapping-delete', ctx.client_ip, ctx.session['user'], 'ok', name)
+    return {'deleted': name}
+
+
+# ---------------------------------------------------------------- 服务端 CRUD
+
+def api_profiles(ctx):
+    ctx.app.require_auth(ctx)
+    active_id = manager.active()
+    rows = []
+    for profile in manager.profiles():
+        row = dict(profile)
+        row.pop('token', None)                    # 凭据绝不外发
+        try:
+            count = len(manager.mappings(profile['id']))
+        except (ValueError, OSError):
+            count = None
+        row['mapping_count'] = count
+        row['is_active'] = profile['id'] == active_id
+        rows.append(row)
+    return {'items': rows, 'active_id': active_id}
+
+
+PROFILE_FIELDS = ('name', 'server_addr', 'server_port', 'tls_enable',
+                  'transport_protocol', 'log_level')
+
+def _profile_from_body(body, existing=None):
+    base = dict(existing or {})
+    item = {}
+    for key in PROFILE_FIELDS:
+        if key in body:
+            item[key] = body[key]
+        elif key in base:
+            item[key] = base[key]
+    return item
+
+
+def api_profile_create(ctx):
+    ctx.app.require_auth(ctx)
+    body = ctx.json_body()
+    profile = _profile_from_body(body)
+    token = str(body.get('token', '') or '').strip()
+    if not token:
+        raise HttpError(400, 'token 不能为空', 'E_INVALID',
+                        details=[{'field': 'token', 'message': '必填'}])
+    # render()/本地 admin API 依赖 admin_password，必须与 CLI 向导一致地生成，
+    # 否则新建的服务端在「设为当前」或启动 frpc 时会 KeyError。
+    secret = {'token': token,
+              'admin_password': secrets.token_urlsafe(32)}
+    profile['name'] = str(profile.get('name', '')).strip()
+    if not profile['name']:
+        raise HttpError(400, '名称不能为空', 'E_INVALID')
+    profile.setdefault('server_addr', '')
+    profile.setdefault('server_port', 7000)
+    profile.setdefault('tls_enable', True)
+    profile.setdefault('admin_port', 7400)
+    with ctx.app.write_lock:
+        with manager.non_interactive():
+            pid = manager.create_profile(profile, secret)
+            activated = False
+            # 第一个服务端直接设为当前，省掉"新建完还要再点一次切换"
+            if not manager.active():
+                manager.switch(pid)
+                activated = True
+    web_audit('profile-create', ctx.client_ip, ctx.session['user'], 'ok', profile['name'])
+    return {'id': pid, 'activated': activated}
+
+
+def api_profile_update(ctx, pid):
+    ctx.app.require_auth(ctx)
+    body = ctx.json_body()
+    current = manager.load_profile(pid)
+    profile = dict(current)
+    profile.update(_profile_from_body(body, current))
+    secret = manager.secrets_for(pid)
+    if 'token' in body and str(body['token']).strip():
+        secret['token'] = str(body['token']).strip()
+    if not secret.get('admin_password'):
+        secret['admin_password'] = secrets.token_urlsafe(32)
+    current.setdefault('admin_port', 7400)
+    with ctx.app.write_lock:
+        with manager.non_interactive():
+            manager.update_profile(pid, profile, secret)
+    web_audit('profile-update', ctx.client_ip, ctx.session['user'], 'ok', profile.get('name', ''))
+    return {'id': pid}
+
+
+def api_profile_switch(ctx, pid):
+    ctx.app.require_auth(ctx)
+    manager.load_profile(pid)
+    with ctx.app.write_lock:
+        with manager.non_interactive():
+            manager.switch(pid)
+    web_audit('profile-switch', ctx.client_ip, ctx.session['user'], 'ok', pid)
+    return {'active_id': manager.active()}
+
+
+def api_profile_delete(ctx, pid):
+    ctx.app.require_auth(ctx)
+    body = ctx.json_body() if ctx.body else {}
+    profile = manager.load_profile(pid)
+    if str(body.get('confirm', '')) != str(profile.get('name', '')):
+        raise HttpError(400, '请确认删除：需要提交与服务端名相同的 confirm 字段',
+                        'E_CONFIRM_REQUIRED')
+    with ctx.app.write_lock:
+        with manager.non_interactive():
+            manager.delete_profile_id(pid)
+    web_audit('profile-delete', ctx.client_ip, ctx.session['user'], 'ok', profile.get('name', ''))
+    return {'deleted': pid}
+
+
+# ---------------------------------------------------------------- 诊断 / 备份
+
+def api_diagnose(ctx):
+    ctx.app.require_auth(ctx)
+    started = time.time()
+    try:
+        report = manager.diagnostics_report('frpc')
+    except (ValueError, OSError) as exc:
+        raise HttpError(500, '诊断执行失败：' + str(exc), 'E_DIAG',
+                        hint='查看服务日志获取详情')
+    items = report.get('checks') if isinstance(report, dict) else None
+    # 注意：这里不能用 'ok' 表示"检查是否全部通过"——外层信封的 ok 表示
+    # "请求是否成功"，两者同名会让前端把"诊断发现问题"误判成接口失败。
+    return {'elapsed_ms': int((time.time() - started) * 1000),
+            'passed': bool(report.get('ok')) if isinstance(report, dict) else False,
+            'items': items or [], 'raw': report}
+
+
+def api_backups(ctx):
+    ctx.app.require_auth(ctx)
+    rows = []
+    for item in manager.list_backups():
+        path = item.get('path')
+        rows.append({'name': Path(path).name if path else '',
+                     'time': item.get('time'),
+                     'reason': item.get('reason'),
+                     'files': item.get('files') or [],
+                     'path': str(path or '')})
+    return {'items': rows}
+
+
+def api_backup_create(ctx):
+    ctx.app.require_auth(ctx)
+    with ctx.app.write_lock:
+        path = manager.backup(manager.managed_paths(), 'manual')
+    web_audit('backup-create', ctx.client_ip, ctx.session['user'], 'ok', str(path))
+    return {'path': str(path), 'name': Path(path).name}
+
+
+def api_restore(ctx):
+    ctx.app.require_auth(ctx)
+    body = ctx.json_body()
+    name = str(body.get('name', '')).strip()
+    if not re.fullmatch(r'[A-Za-z0-9._-]+', name) or name in ('.', '..'):
+        raise HttpError(400, '备份名称不合法', 'E_INVALID')
+    if str(body.get('confirm', '')) != name:
+        raise HttpError(400, '请确认恢复：需要提交与备份名相同的 confirm 字段',
+                        'E_CONFIRM_REQUIRED')
+    directory = manager.ROOT / 'backups' / name
+    if not directory.is_dir():
+        raise HttpError(404, '备份不存在：' + name, 'E_NOT_FOUND')
+    with ctx.app.write_lock:
+        with manager.non_interactive():
+            try: manager.backup(manager.managed_paths(), 'pre-restore')
+            except (ValueError, OSError): pass
+            reason = manager.read_json(directory / 'manifest.json', {}).get('reason', '')
+            if reason == 'upgrade':
+                restored = manager.restore_upgrade_snapshot(directory)
+            else:
+                restored = manager.restore_backup(directory)
+    web_audit('restore', ctx.client_ip, ctx.session['user'], 'ok', name)
+    return {'restored': restored, 'name': name}
+
+
+# ---------------------------------------------------------------- 设置
+
+def _masked_panel():
+    cfg = ctx_cfg = None
+    cfg = load_web_config()
+    return {
+        'bind': cfg.get('bind'),
+        'port': cfg.get('port'),
+        'username': cfg.get('username'),
+        'password_set': bool(cfg.get('password_hash')),
+        'idle_timeout_minutes': cfg.get('idle_timeout_minutes'),
+        'login_max_failures': cfg.get('login_max_failures'),
+        'login_lock_minutes': cfg.get('login_lock_minutes'),
+        'first_run': bool(cfg.get('must_change_password')),
+        'escape': None,
+    }
+
+
+def api_settings(ctx):
+    ctx.app.require_auth(ctx)
+    data = _masked_panel()
+    data['escape'] = ctx.app.escape_summary()
+    data['autostart'] = _autostart_state()
+    return data
+
+
+def _autostart_state():
+    try:
+        return manager.autostart_enabled('frpc')
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def api_autostart(ctx):
+    ctx.app.require_auth(ctx)
+    body = ctx.json_body()
+    enabled = bool(body.get('enabled'))
+    with ctx.app.write_lock:
+        with manager.non_interactive():
+            manager.set_autostart('frpc', enabled)
+    web_audit('autostart', ctx.client_ip, ctx.session['user'], 'ok', str(enabled))
+    return {'enabled': _autostart_state()}
+
+
+# ---------------------------------------------------------------- 设置：改端口/绑定/凭据（带逃生窗口）
+
+def _validate_bind(value):
+    import ipaddress
+    try:
+        ipaddress.ip_address(str(value))
+    except ValueError:
+        raise HttpError(400, '绑定地址必须是合法 IP（如 127.0.0.1 或 0.0.0.0）', 'E_INVALID')
+
+
+def api_settings_apply(ctx):
+    """修改绑定/端口。成功则新监听立即生效，旧监听保留 5 分钟逃生窗口。"""
+    ctx.app.require_auth(ctx)
+    body = ctx.json_body()
+    cfg = load_web_config()
+    old_bind, old_port = str(cfg.get('bind')), int(cfg.get('port'))
+
+    new_bind = str(body.get('bind', old_bind)).strip() or old_bind
+    try:
+        new_port = int(body.get('port', old_port))
+    except (TypeError, ValueError):
+        raise HttpError(400, '端口必须是数字', 'E_INVALID')
+    _validate_bind(new_bind)
+    if not 1 <= new_port <= 65535:
+        raise HttpError(400, '端口必须在 1-65535 之间', 'E_INVALID')
+
+    if new_bind == old_bind and new_port == old_port:
+        return {'changed': False, 'escape': ctx.app.escape_summary()}
+    if not _port_available(new_bind, new_port):
+        raise HttpError(409, '端口 %d 已被占用' % new_port, 'E_PORT_IN_USE',
+                        hint='换一个端口，或先停止占用该端口的程序')
+
+    cfg['bind'] = new_bind
+    cfg['port'] = new_port
+    save_web_config(cfg)
+    ctx.app.config = cfg
+
+    # 启动第二个监听；失败则回滚配置，旧监听从未中断
+    try:
+        server = _make_server(ctx.app, new_bind, new_port)
+    except OSError as exc:
+        cfg['bind'], cfg['port'] = old_bind, old_port
+        save_web_config(cfg)
+        ctx.app.config = cfg
+        raise HttpError(500, '新地址监听失败，配置已回滚：' + str(exc), 'E_BIND_FAILED',
+                        hint='旧地址仍然可用，请检查防火墙或端口权限')
+    entry = _serve_in_thread(ctx.app, server, 'new')
+    with ctx.app.escape_lock:
+        old_entry = None
+        for item in ctx.app.listeners:
+            if item is not entry and item.get('label') == 'main':
+                old_entry = item
+        ctx.app.escape = {'old': 'http://%s:%d/' % (old_bind, old_port),
+                          'new': 'http://%s:%d/' % (new_bind, new_port),
+                          'until': time.time() + ESCAPE_WINDOW_SECONDS,
+                          'old_entry': old_entry}
+    web_audit('settings-apply', ctx.client_ip, ctx.session['user'], 'ok',
+              '%s:%d -> %s:%d' % (old_bind, old_port, new_bind, new_port))
+    return {'changed': True, 'escape': ctx.app.escape_summary()}
+
+
+def api_settings_confirm(ctx):
+    """确认新地址可用：立即关闭旧监听。"""
+    ctx.app.require_auth(ctx)
+    with ctx.app.escape_lock:
+        escape = ctx.app.escape
+        if not escape:
+            return {'escape': None, 'message': '当前没有进行中的切换'}
+        old_entry = escape.get('old_entry')
+        ctx.app.escape = None
+    if old_entry:
+        _shutdown_listener(old_entry)
+        try: ctx.app.listeners.remove(old_entry)
+        except ValueError: pass
+    web_audit('escape-confirm', ctx.client_ip, ctx.session['user'], 'ok')
+    return {'escape': None, 'message': '旧监听已关闭'}
+
+
+def api_settings_rollback(ctx):
+    """回滚到旧配置（逃生窗口内可用）。"""
+    ctx.app.require_auth(ctx)
+    with ctx.app.escape_lock:
+        escape = ctx.app.escape
+        if not escape:
+            return {'escape': None, 'message': '当前没有可回滚的切换'}
+        old_entry = escape.get('old_entry')
+        ctx.app.escape = None
+    cfg = load_web_config()
+    backup = manager.ROOT / (WEB_CONFIG_NAME + '.bak')
+    if backup.exists():
+        try:
+            cfg = json.loads(backup.read_text(encoding='utf-8'))
+            save_web_config(cfg)
+            ctx.app.config = cfg
+        except (ValueError, OSError) as exc:
+            raise HttpError(500, '回滚配置失败：' + str(exc), 'E_ROLLBACK')
+    for item in list(ctx.app.listeners):
+        if item.get('label') == 'new':
+            _shutdown_listener(item)
+            try: ctx.app.listeners.remove(item)
+            except ValueError: pass
+    web_audit('escape-rollback', ctx.client_ip, ctx.session['user'], 'ok')
+    return {'escape': None, 'message': '已回滚到旧配置（旧监听仍在服务）'}
+
+
+def api_settings_password(ctx):
+    """修改用户名/密码：新旧凭据同时有效 5 分钟，避免记错密码被锁死。"""
+    session = ctx.app.require_auth(ctx)
+    body = ctx.json_body()
+    cfg = load_web_config()
+    new_user = str(body.get('username', cfg.get('username'))).strip()
+    new_password = str(body.get('password', ''))
+    if new_user and len(new_user) < 2:
+        raise HttpError(400, '用户名至少 2 个字符', 'E_INVALID')
+    if new_password:
+        if len(new_password) < 8:
+            raise HttpError(400, '密码至少 8 位', 'E_INVALID')
+        cfg['password_hash_old'] = cfg.get('password_hash', '')
+        cfg['password_expires_at'] = time.time() + ESCAPE_WINDOW_SECONDS
+        cfg['password_hash'] = hash_password(new_password)
+        cfg['must_change_password'] = False
+    if new_user:
+        cfg['username'] = new_user
+    save_web_config(cfg)
+    ctx.app.config = cfg
+    web_audit('settings-password', ctx.client_ip, session['user'], 'ok')
+    return {'username': cfg.get('username'), 'password_changed': bool(new_password),
+            'old_password_valid_for': ESCAPE_WINDOW_SECONDS if new_password else 0}
+
+
+# ---------------------------------------------------------------- 危险操作
+
+def api_uninstall(ctx):
+    body = ctx.json_body()
+    if str(body.get('confirm', '')) != 'frpc':
+        raise HttpError(400, '请确认卸载：需要提交 confirm=frpc', 'E_CONFIRM_REQUIRED')
+    # 卸载会删掉本进程所在的文件；先回响应，再脱离会话执行
+    web_audit('uninstall', ctx.client_ip, ctx.session['user'], 'ok')
+    threading.Thread(target=_run_uninstall_detached, daemon=True).start()
+    return {'message': '卸载已开始，管理端将在数秒内停止'}
+
+
+def _run_uninstall_detached():
+    time.sleep(1.5)
+    try:
+        with manager.non_interactive():
+            manager.uninstall('frpc', purge=bool(global_purge_flag[0]), yes=True)
+    except (ValueError, OSError):
+        pass
+
+
+global_purge_flag = [False]
+
+
+def api_upgrade(ctx):
+    ctx.app.require_auth(ctx)
+    body = ctx.json_body()
+    target = str(body.get('target', '') or '').strip() or None
+    if target and not re.fullmatch(r'v[0-9A-Za-z._-]+', target):
+        raise HttpError(400, '版本号不合法', 'E_INVALID')
+    web_audit('upgrade', ctx.client_ip, ctx.session['user'], 'ok', target or 'latest')
+    thread = threading.Thread(target=_run_upgrade_detached, args=(target,), daemon=True)
+    thread.start()
+    return {'message': '升级已开始，完成后管理端会自动重启'}
+
+
+def _run_upgrade_detached(target):
+    time.sleep(0.5)
+    try:
+        with manager.non_interactive():
+            manager.upgrade('frpc', target=target, yes=True)
+    except (ValueError, OSError):
+        pass
+
+
+# ---------------------------------------------------------------- 自映射（面板暴露到公网）
+
+EXPOSE_TCP_NAME = '_webui-tcp'
+EXPOSE_HTTP_NAME = '_webui-http'
+
+
+def api_expose_create(ctx):
+    """把管理端本身映射到公网：TCP 端口 或 HTTP 域名。"""
+    ctx.app.require_auth(ctx)
+    body = ctx.json_body()
+    kind = str(body.get('type', 'tcp')).lower()
+    cfg = load_web_config()
+    pid = _active_pid()
+    items = manager.mappings(pid)
+    for name in (EXPOSE_TCP_NAME, EXPOSE_HTTP_NAME):
+        items = [m for m in items if str(m.get('name')) != name]
+    if kind == 'tcp':
+        remote = body.get('remote_port')
+        if not remote:
+            raise HttpError(400, '请填写公网端口', 'E_INVALID')
+        item = {'name': EXPOSE_TCP_NAME, 'type': 'tcp', 'local_ip': '127.0.0.1',
+                'local_port': int(cfg.get('port', 7501)),
+                'remote_port': remote, 'enabled': True}
+    elif kind == 'http':
+        domain = str(body.get('domain', '')).strip()
+        if not domain:
+            raise HttpError(400, '请填写域名', 'E_INVALID')
+        item = {'name': EXPOSE_HTTP_NAME, 'type': 'http', 'local_ip': '127.0.0.1',
+                'local_port': int(cfg.get('port', 7501)), 'domain': domain,
+                'enabled': True}
+    else:
+        raise HttpError(400, '仅支持 tcp 或 http', 'E_INVALID')
+    if not cfg.get('password_hash'):
+        raise HttpError(400, '暴露到公网前必须先设置面板密码', 'E_NEED_PASSWORD',
+                        hint='到「设置」页设置用户名与密码')
+    items.append(item)
+    manager.validate_mappings(items)
+    with ctx.app.write_lock:
+        manager.save_mappings(pid, items)
+    web_audit('expose-create', ctx.client_ip, ctx.session['user'], 'ok', kind)
+    return {'item': item}
+
+
+def api_expose_delete(ctx):
+    ctx.app.require_auth(ctx)
+    pid = _active_pid()
+    items = manager.mappings(pid)
+    kept = [m for m in items if str(m.get('name')) not in (EXPOSE_TCP_NAME, EXPOSE_HTTP_NAME)]
+    if len(kept) == len(items):
+        return {'deleted': False}
+    with ctx.app.write_lock:
+        manager.save_mappings(pid, kept)
+    web_audit('expose-delete', ctx.client_ip, ctx.session['user'], 'ok')
+    return {'deleted': True}
+
+
 # ---------------------------------------------------------------- 路由
 
 ROUTES = [
@@ -746,6 +1325,36 @@ ROUTES = [
     ('POST',   r'^/api/service/start$',   api_service_start,   True),
     ('POST',   r'^/api/service/stop$',    api_service_stop,    True),
     ('POST',   r'^/api/service/restart$', api_service_restart, True),
+    # 映射 CRUD
+    ('GET',    r'^/api/mappings$',                     api_mappings,         True),
+    ('POST',   r'^/api/mappings$',                     api_mapping_create,   True),
+    ('PUT',    r'^/api/mappings/(?P<name>[A-Za-z0-9_-]{1,64})$', api_mapping_update, True),
+    ('POST',   r'^/api/mappings/(?P<name>[A-Za-z0-9_-]{1,64})/toggle$', api_mapping_toggle, True),
+    ('DELETE', r'^/api/mappings/(?P<name>[A-Za-z0-9_-]{1,64})$', api_mapping_delete, True),
+    # 服务端 CRUD
+    ('GET',    r'^/api/profiles$',                    api_profiles,         True),
+    ('POST',   r'^/api/profiles$',                    api_profile_create,   True),
+    ('PUT',    r'^/api/profiles/(?P<pid>[a-f0-9]{24})$', api_profile_update, True),
+    ('POST',   r'^/api/profiles/(?P<pid>[a-f0-9]{24})/switch$', api_profile_switch, True),
+    ('DELETE', r'^/api/profiles/(?P<pid>[a-f0-9]{24})$', api_profile_delete, True),
+    # 诊断 / 备份
+    ('POST',   r'^/api/diagnose$',     api_diagnose,      True),
+    ('GET',    r'^/api/backups$',      api_backups,       True),
+    ('POST',   r'^/api/backups$',      api_backup_create, True),
+    ('POST',   r'^/api/restore$',      api_restore,       True),
+    # 设置
+    ('GET',    r'^/api/settings$',            api_settings,          True),
+    ('POST',   r'^/api/settings/apply$',      api_settings_apply,    True),
+    ('POST',   r'^/api/settings/confirm$',    api_settings_confirm,  True),
+    ('POST',   r'^/api/settings/rollback$',   api_settings_rollback, True),
+    ('POST',   r'^/api/settings/password$',   api_settings_password, True),
+    ('POST',   r'^/api/autostart$',           api_autostart,         True),
+    # 自映射
+    ('POST',   r'^/api/expose$',      api_expose_create, True),
+    ('DELETE', r'^/api/expose$',      api_expose_delete, True),
+    # 危险操作
+    ('POST',   r'^/api/uninstall$',   api_uninstall,     True),
+    ('POST',   r'^/api/upgrade$',     api_upgrade,       True),
 ]
 
 
@@ -828,7 +1437,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if needs_auth:
                     # 统一在此处校验登录态 + CSRF，避免每个 handler 各写一遍漏掉
                     app.require_auth(ctx)
-                result = handler(ctx)
+                kwargs = _match.groupdict() if _match else {}
+                result = handler(ctx, **kwargs) if kwargs else handler(ctx)
                 if result is not None:
                     ok(self, result if isinstance(result, dict) else {'data': result})
             except HttpError as exc:
@@ -1065,6 +1675,24 @@ def run(bind=None, port=None, foreground=True, open_browser=False):
         print('    用户名：%s' % cfg.get('username'))
         print('    密码　：%s' % generated)
     web_audit('start', result='ok', detail='%s:%d' % (bind, port))
+    def _escape_watchdog():
+        """逃生窗口超时后自动关闭旧监听。"""
+        while True:
+            time.sleep(2)
+            with app.escape_lock:
+                escape = app.escape
+                if not escape: continue
+                if time.time() < escape.get('until', 0): continue
+                old_entry = escape.get('old_entry')
+                app.escape = None
+            if old_entry:
+                _shutdown_listener(old_entry)
+                try: app.listeners.remove(old_entry)
+                except ValueError: pass
+                web_audit('escape-timeout', result='ok')
+
+    threading.Thread(target=_escape_watchdog, name='escape-watchdog', daemon=True).start()
+
     # 前台与常驻服务共用同一阻塞逻辑：服务线程已在后台跑，主线程等待退出信号。
     # systemd/launchd 停止服务发的是 SIGTERM，必须接住否则直接硬杀（请求被切断）。
     stop_event = threading.Event()
@@ -1119,9 +1747,27 @@ def main(argv=None):
             i += 2; continue
         if item == '--set-password':
             set_password = True; i += 1; continue
+        if item == '--install-service':
+            ok, message = manager.web_service_install()
+            print(('已安装并启动 Web 服务：' if ok else '安装失败：') + (message or '完成'))
+            if ok:
+                cfg = load_web_config()
+                print('  访问地址：http://%s:%s/' % (cfg.get('bind'), cfg.get('port')))
+            return
+        if item == '--uninstall-service':
+            removed = manager.web_service_uninstall()
+            print('已停止并移除 Web 服务。' if removed else '当前没有可移除的 Web 服务。')
+            return
+        if item == '--status':
+            print('Web 服务状态：' + manager.web_service_status())
+            cfg = load_web_config()
+            print('  监听地址：http://%s:%s/' % (cfg.get('bind'), cfg.get('port')))
+            print('  配置路径：' + str(web_config_path()))
+            return
         if item in ('-h', '--help'):
             print('用法：frpc web [--bind 地址] [--port 端口] [--set-bind 地址] '
-                  '[--set-port 端口] [--set-password]')
+                  '[--set-port 端口] [--set-password] [--install-service] '
+                  '[--uninstall-service] [--status]')
             return
         raise ValueError('未知参数：' + item)
     if set_password:

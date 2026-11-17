@@ -23,7 +23,7 @@ $native = Join-Path $root 'native'
 $bin = Join-Path $root 'bin'
 $services = Join-Path $root 'services'
 $repo = 'https://raw.githubusercontent.com/1911981822/frp-simple-bash/main'
-$ManagerVersion = 'v1.0.0-rc.18'
+$ManagerVersion = 'v1.0.0-rc.19'
 $mirror = if (Test-Path Env:FRP_MIRROR_URL) { [string]$env:FRP_MIRROR_URL } else { 'https://download.sueiyuan.top' }
 if ($mirror -eq 'off') { $mirror = '' }
 if ($mirror -and $mirror -notmatch '^https://') { throw 'Mirror URL must use HTTPS, or be empty/off.' }
@@ -37,7 +37,7 @@ function Get-HttpsFile([string]$Url, [string]$Destination) {
         $request.AllowAutoRedirect = $false
         $request.Timeout = 120000
         $request.ReadWriteTimeout = 120000
-        $request.UserAgent = 'frp-simple-bash/v1.0.0-rc.18'
+        $request.UserAgent = 'frp-simple-bash/v1.0.0-rc.19'
         $response = $request.GetResponse()
         try {
             $status = [int]$response.StatusCode
@@ -137,7 +137,15 @@ function Save-RepositoryFile([string]$relative) {
         Save-Download $urls $dest $expected
     }
 }
-foreach ($relative in @('install-frps.ps1','install-frpc.ps1','install-windows.ps1','lib/manager.py','bin/frps.ps1','bin/frpc.ps1','bin/frps.cmd','bin/frpc.cmd','uninstall-frps.ps1','uninstall-frpc.ps1','uninstall-windows.ps1')) { Save-RepositoryFile $relative }
+foreach ($relative in @('install-frps.ps1','install-frpc.ps1','install-windows.ps1','lib/manager.py','lib/webui.py','bin/frps.ps1','bin/frpc.ps1','bin/frps.cmd','bin/frpc.cmd','bin/frpc-web.ps1','bin/frpc-web.cmd','uninstall-frps.ps1','uninstall-frpc.ps1','uninstall-windows.ps1')) { Save-RepositoryFile $relative }
+# Web console static assets (prebuilt, shipped in the release bundle)
+$webDist = Join-Path $sourceRoot 'web\dist'
+if (Test-Path $webDist) {
+  $destDist = Join-Path $root 'web\dist'
+  if (Test-Path $destDist) { Remove-Item -Recurse -Force $destDist }
+  New-Item -ItemType Directory -Force -Path (Join-Path $root 'web') | Out-Null
+  Copy-Item -Recurse -Force $webDist $destDist
+}
 $temp = Join-Path $env:TEMP ('frp-simple-bash-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $temp | Out-Null
 try {

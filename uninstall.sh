@@ -53,6 +53,24 @@ elif [[ "$(uname -s)" == Darwin ]] && command -v launchctl >/dev/null; then
     rm -f -- "$plist"
   fi
 fi
+# Web 管理端：随 frpc 一起移除（它是 frpc 的管理界面，单独残留会指向已删文件）
+if [[ "$role" == frpc ]]; then
+  if command -v systemctl >/dev/null && [[ -d /run/systemd/system ]]; then
+    systemctl disable --now frp-simple-bash-web >/dev/null 2>&1 || true
+    rm -f -- /etc/systemd/system/frp-simple-bash-web.service
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  elif command -v rc-service >/dev/null; then
+    rc-service frp-simple-bash-web stop >/dev/null 2>&1 || true
+    rc-update del frp-simple-bash-web default >/dev/null 2>&1 || true
+    rm -f -- /etc/init.d/frp-simple-bash-web
+  elif [[ "$(uname -s)" == Darwin ]] && command -v launchctl >/dev/null; then
+    launchctl disable "system/frp-simple-bash.web" >/dev/null 2>&1 || true
+    launchctl bootout "system/frp-simple-bash.web" >/dev/null 2>&1 || true
+    rm -f -- /Library/LaunchDaemons/frp-simple-bash.web.plist
+  fi
+  rm -f -- /usr/local/bin/frpc-web
+fi
+
 command="/usr/local/bin/$role"
 if [[ -L "$command" ]]; then [[ "$(readlink "$command")" == "/opt/frp-simple-bash/bin/$role" ]] || { echo "拒绝删除非本项目命令链接" >&2; exit 1; }; rm -f -- "$command"; fi
 native="/opt/frp-simple-bash/native/$role"
@@ -92,7 +110,8 @@ PY
       systemctl daemon-reload >/dev/null 2>&1 || true
     fi
     rm -f -- "$config_root/auto-port.toml" "$config_root/ports-state.json" \
-             "$config_root/logs/ports-audit.jsonl"
+             "$config_root/logs/ports-audit.jsonl" "$config_root/web.json" \
+             "$config_root/web.json.bak"
     if [[ -f "$config_root/state.json" ]]; then
       python3 - "$config_root/state.json" <<'PY'
 import json, sys

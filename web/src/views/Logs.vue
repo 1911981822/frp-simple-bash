@@ -1,7 +1,10 @@
 <template>
   <div class="page">
     <header class="page-head">
-      <h2>日志与诊断</h2>
+      <div class="tabs">
+        <span class="tab active">实时日志</span>
+        <router-link class="tab" to="/diagnose">连接诊断</router-link>
+      </div>
       <div class="page-tools">
         <select v-model="level" class="small">
           <option value="">全部级别</option>

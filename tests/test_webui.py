@@ -389,5 +389,117 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         service.assert_called_once()
 
+    # ---- P3-P5 接口回归 ----
+
+    def test_profile_create_generates_admin_password(self):
+        """Web 新建服务端必须生成 admin_password，否则切换/启动会 KeyError。"""
+        _, _, cookie = self.fx.login()
+        _, sess, _ = self.fx.json('GET', '/api/session', cookie=cookie)
+        with patch.object(w.manager, 'create_profile', return_value='a' * 24) as create, \
+             patch.object(w.manager, 'active', return_value=''), \
+             patch.object(w.manager, 'switch'):
+            status, payload, _ = self.fx.json('POST', '/api/profiles', cookie=cookie,
+                                              csrf=sess['csrf'],
+                                              body={'name': 'srv1', 'server_addr': '1.2.3.4',
+                                                    'server_port': 7000, 'token': 'tok12345678'})
+        self.assertEqual(status, 200)
+        _profile, secret = create.call_args[0]
+        self.assertTrue(secret.get('admin_password'))   # 关键：不能缺
+
+    def test_mapping_create_validates_duplicate_name(self):
+        _, _, cookie = self.fx.login()
+        _, sess, _ = self.fx.json('GET', '/api/session', cookie=cookie)
+        with patch.object(w.manager, 'active', return_value='a' * 24), \
+             patch.object(w.manager, 'load_profile', return_value={'id': 'a' * 24}), \
+             patch.object(w.manager, 'mappings', return_value=[
+                 {'name': 'ssh', 'type': 'tcp', 'local_ip': '127.0.0.1',
+                  'local_port': 22, 'remote_port': 6000, 'enabled': True}]):
+            status, payload, _ = self.fx.json('POST', '/api/mappings', cookie=cookie,
+                                              csrf=sess['csrf'],
+                                              body={'name': 'ssh', 'type': 'tcp',
+                                                    'local_port': 22, 'remote_port': 6001})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload['code'], 'E_DUPLICATE_NAME')
+
+    def test_mapping_delete_requires_confirm(self):
+        _, _, cookie = self.fx.login()
+        _, sess, _ = self.fx.json('GET', '/api/session', cookie=cookie)
+        with patch.object(w.manager, 'active', return_value='a' * 24), \
+             patch.object(w.manager, 'load_profile', return_value={'id': 'a' * 24}):
+            status, payload, _ = self.fx.json('DELETE', '/api/mappings/ssh', cookie=cookie,
+                                              csrf=sess['csrf'], body={})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload['code'], 'E_CONFIRM_REQUIRED')
+
+    def test_restore_requires_confirm(self):
+        _, _, cookie = self.fx.login()
+        _, sess, _ = self.fx.json('GET', '/api/session', cookie=cookie)
+        status, payload, _ = self.fx.json('POST', '/api/restore', cookie=cookie,
+                                          csrf=sess['csrf'], body={'name': 'x'})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload['code'], 'E_CONFIRM_REQUIRED')
+
+    def test_settings_apply_rejects_bad_port(self):
+        _, _, cookie = self.fx.login()
+        _, sess, _ = self.fx.json('GET', '/api/session', cookie=cookie)
+        status, payload, _ = self.fx.json('POST', '/api/settings/apply', cookie=cookie,
+                                          csrf=sess['csrf'], body={'port': 70000})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload['code'], 'E_INVALID')
+
+    def test_settings_apply_rejects_bad_bind(self):
+        _, _, cookie = self.fx.login()
+        _, sess, _ = self.fx.json('GET', '/api/session', cookie=cookie)
+        status, payload, _ = self.fx.json('POST', '/api/settings/apply', cookie=cookie,
+                                          csrf=sess['csrf'], body={'bind': 'not-an-ip'})
+        self.assertEqual(status, 400)
+
+    def test_expose_requires_password(self):
+        _, _, cookie = self.fx.login()
+        _, sess, _ = self.fx.json('GET', '/api/session', cookie=cookie)
+        with patch.object(w, 'load_web_config',
+                          return_value=dict(w.DEFAULT_CONFIG, password_hash='')), \
+             patch.object(w.manager, 'active', return_value='a' * 24), \
+             patch.object(w.manager, 'load_profile', return_value={'id': 'a' * 24}), \
+             patch.object(w.manager, 'mappings', return_value=[]):
+            status, payload, _ = self.fx.json('POST', '/api/expose', cookie=cookie,
+                                              csrf=sess['csrf'],
+                                              body={'type': 'tcp', 'remote_port': 7001})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload['code'], 'E_NEED_PASSWORD')
+
+    def test_uninstall_requires_exact_confirm(self):
+        _, _, cookie = self.fx.login()
+        _, sess, _ = self.fx.json('GET', '/api/session', cookie=cookie)
+        status, payload, _ = self.fx.json('POST', '/api/uninstall', cookie=cookie,
+                                          csrf=sess['csrf'], body={'confirm': 'yes'})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload['code'], 'E_CONFIRM_REQUIRED')
+
+    def test_diagnose_uses_passed_not_ok(self):
+        _, _, cookie = self.fx.login()
+        _, sess, _ = self.fx.json('GET', '/api/session', cookie=cookie)
+        with patch.object(w.manager, 'diagnostics_report',
+                          return_value={'ok': False, 'checks': [
+                              {'name': 'config', 'ok': False, 'detail': '缺失'}]}):
+            status, payload, _ = self.fx.json('POST', '/api/diagnose', cookie=cookie,
+                                              csrf=sess['csrf'])
+        self.assertEqual(status, 200)
+        self.assertTrue(payload['ok'])          # 请求成功
+        self.assertFalse(payload['passed'])     # 但诊断未通过
+        self.assertEqual(len(payload['items']), 1)
+
+    def test_all_routes_require_auth(self):
+        """除 login/health 外，所有接口未登录都必须 401。"""
+        public = {('GET', '/api/health'), ('POST', '/api/login')}
+        for verb, pattern, _handler, needs_auth in w.ROUTES:
+            if not needs_auth: continue
+            sample = (pattern.replace('(?P<name>[A-Za-z0-9_-]{1,64})', 'abc')
+                            .replace('(?P<pid>[a-f0-9]{24})', 'a' * 24)
+                            .replace('^', '').replace('$', ''))
+            if (verb, sample) in public: continue
+            status, _, _ = self.fx.json(verb if verb != 'HEAD' else 'GET', sample)
+            self.assertEqual(status, 401, '%s %s 未受保护' % (verb, sample))
+
 if __name__ == '__main__':
     unittest.main()

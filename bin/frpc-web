@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Web 管理端入口：定位安装根后执行 lib/webui.py。
+set -Eeuo pipefail
+entry="${BASH_SOURCE[0]}"
+if readlink -f / >/dev/null 2>&1; then
+  entry="$(readlink -f -- "$entry" 2>/dev/null || printf '%s' "$entry")"
+else
+  for _hop in 1 2 3 4 5; do
+    [ -L "$entry" ] || break
+    _target="$(readlink -- "$entry")"
+    case "$_target" in
+      /*) entry="$_target" ;;
+      *)  entry="$(dirname -- "$entry")/$_target" ;;
+    esac
+  done
+fi
+base="$(cd -- "$(dirname -- "$entry")/.." && pwd)"
+exec python3 "$base/lib/webui.py" "$@"

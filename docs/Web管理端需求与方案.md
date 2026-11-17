@@ -482,3 +482,62 @@ web/src/components/      StatusBadge / EmptyState / ErrorState / ConfirmDialog
 - 全量 **338 条通过**
 - 真实启动验证：首页 200 / 静态 200 / health / HEAD 200 / 405 / 登录 / overview 均正常
 - 构建：主包 104KB（gzip 41KB）+ 按路由分割的懒加载块
+
+---
+
+## 15. P2-P6 完成记录（v1.0.0-rc.19）
+
+### 15.1 已实现的接口（共 33 条）
+
+| 分组 | 接口 |
+|---|---|
+| 认证 | `POST /api/login`、`POST /api/logout`、`GET /api/session`、`GET /api/health` |
+| 状态 | `GET /api/status`、`GET /api/overview`、`GET /api/events`(SSE) |
+| 服务控制 | `POST /api/service/start`、`/stop`、`/restart`（支持 detached 延迟重启） |
+| 映射 | `GET/POST /api/mappings`、`PUT/DELETE /api/mappings/{name}`、`POST /api/mappings/{name}/toggle` |
+| 服务端 | `GET/POST /api/profiles`、`PUT/DELETE /api/profiles/{id}`、`POST /api/profiles/{id}/switch` |
+| 日志 | `GET /api/logs`、`GET /api/logs/stream`(SSE)、`GET /api/audit` |
+| 诊断 | `POST /api/diagnose` |
+| 备份 | `GET/POST /api/backups`、`POST /api/restore` |
+| 设置 | `GET /api/settings`、`POST /api/settings/apply|confirm|rollback|password`、`POST /api/autostart` |
+| 公网访问 | `POST/DELETE /api/expose` |
+| 危险操作 | `POST /api/uninstall`、`POST /api/upgrade` |
+
+### 15.2 页面
+
+| 页面 | 状态 |
+|---|---|
+| 概览 | ✅ 状态带 + 4 指标 + 需关注 + 启停重启 + 地址复制 + 公网访问 |
+| 端口映射 | ✅ 列表/搜索/筛选/新增/编辑/启停/删除/一键复制/冲突校验 |
+| 服务端（FRPS） | ✅ 卡片列表/新建/编辑/切换/删除（输入名称确认） |
+| 日志与诊断 | ✅ 实时日志(SSE) + 连接诊断（Tab 切换） |
+| 设置 | ✅ 面板访问/逃生窗口/账号安全/自启动/备份恢复/危险操作 |
+
+### 15.3 关键设计决策
+
+1. **非交互上下文**：新增 `manager.non_interactive()`，Web 复用 CLI 业务函数时
+   `confirm()` 直接放行（确认已由前端完成），而 `choose()/ask()` 会抛错，
+   避免静默卡住。这样 CLI 与 Web 不会出现两套业务逻辑。
+2. **诊断字段命名**：`POST /api/diagnose` 用 `passed` 表示"检查是否通过"，
+   避免与信封 `ok`（请求是否成功）冲突——否则"诊断发现问题"会被前端当成接口失败。
+3. **新建服务端自动激活**：当前没有选中服务端时，新建后自动设为当前。
+4. **新建服务端补齐 `admin_password`**：`render()` 与本地 admin API 依赖该字段，
+   Web 建的服务端若不生成，切换/启动会 `KeyError`。
+5. **自映射**：特殊命名 `_webui-tcp` / `_webui-http`，暴露前强制要求已设面板密码。
+6. **逃生窗口**：改端口/绑定时启动第二个监听，旧监听保留 300 秒；后台 watchdog
+   到点自动关闭；改密码则新旧凭据同时有效 300 秒。
+7. **危险操作**：卸载/升级在后台线程执行（因为会删掉/替换当前进程的文件），
+   响应先返回再执行。
+
+### 15.4 常驻服务
+
+- 单元模板：`templates/frp-simple-bash-web.{service,openrc,plist}`
+- 入口：`bin/frpc-web`（+ `.cmd` / `.ps1`）
+- 安装时自动注册（`FRP_NO_WEB=1` 跳过）；卸载 frpc 时自动移除
+- CLI：`frpc web --install-service | --uninstall-service | --status`
+
+### 15.5 验证
+
+- 全量 **348 测试通过**（webui 50 条）
+- 端到端实测：新建服务端（自动激活）→ 新建两条映射 → 停用 → 备份 → 备份列表 → 诊断 → 重复端口被拒
+- 发布包 48 个文件，含 `lib/webui.py`、`web/dist/**`、三个服务模板、三个入口脚本

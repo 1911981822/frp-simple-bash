@@ -1,0 +1,22 @@
+[Unit]
+Description=frp-simple-bash Web management console (frpc)
+# 管理端要调用 systemctl 控制 frpc，因此必须在 frpc 之后启动但不强依赖其运行
+After=network-online.target frpc.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/opt/frp-simple-bash/bin/frpc-web
+Restart=on-failure
+RestartSec=5
+# 管理端需要 root 权限来启停服务、写防火墙；这里只做最小化加固
+PrivateTmp=true
+UMask=0077
+# 让 SIGTERM 有足够时间关闭监听
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

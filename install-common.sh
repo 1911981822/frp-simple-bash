@@ -327,6 +327,19 @@ if [[ "$source_root" != "$install_root" ]]; then
   else
     echo '提示：未找到 web/dist，Web 管理端不可用（frpc web 会报错）。' >&2
   fi
+  # Web 管理端入口脚本
+  for file in frpc-web frpc-web.ps1 frpc-web.cmd; do
+    [[ -f "$source_root/bin/$file" ]] && install -m 755 "$source_root/bin/$file" "$install_root/bin/$file"
+  done
+fi
+
+# Web 管理端作为常驻服务安装（FRP_NO_WEB=1 可跳过）
+if [[ "$component" == frpc && "${FRP_NO_WEB:-0}" != "1" && -f "$install_root/bin/frpc-web" ]]; then
+  if [[ "$manager" == systemd || "$manager" == openrc || "$manager" == launchd ]]; then
+    if ! "$install_root/bin/frpc-web" --install-service >/dev/null 2>&1; then
+      echo '提示：Web 管理端服务未能自动安装，可稍后手动执行：frpc web --install-service' >&2
+    fi
+  fi
 fi
 # Only the component being installed gets its command symlink. The other
 # component's bin/ entry exists (shared menu shell) but is NOT exposed as a

@@ -1,0 +1,12 @@
+#!/sbin/openrc-run
+description="frp-simple-bash Web management console (frpc)"
+command="/opt/frp-simple-bash/bin/frpc-web"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/etc/frp/logs/web.log"
+error_log="/etc/frp/logs/web.log"
+
+depend() {
+    need net
+    after frpc
+}

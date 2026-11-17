@@ -11,6 +11,7 @@ const routes = [
   { path: '/mappings', component: () => import('./views/Mappings.vue'), meta: { title: '端口映射' } },
   { path: '/profiles', component: () => import('./views/Profiles.vue'), meta: { title: '服务端' } },
   { path: '/logs', component: () => import('./views/Logs.vue'), meta: { title: '日志与诊断' } },
+  { path: '/diagnose', component: () => import('./views/Diagnose.vue'), meta: { title: '连接诊断' } },
   { path: '/settings', component: () => import('./views/Settings.vue'), meta: { title: '设置' } },
 ]
 

@@ -30,7 +30,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.18'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.19'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -481,6 +481,26 @@ def verify(role, content):
         r = run_cmd([str(binary(role)), 'verify', '-c', str(tmp)], capture_output=True, timeout=15)
         if r.returncode: raise ValueError('frp 配置校验失败；原配置已保留（输出可能含敏感字段，未回显）')
     finally: unlink_quiet(tmp)
+
+def update_profile(pid, profile, secret):
+    """非交互地保存服务端配置（Web 端复用）。
+
+    与 edit_profile() 的"保存并返回"走同一套校验与原子写入，
+    但完全不依赖终端交互。
+    """
+    current = load_profile(pid)
+    merged = dict(current)
+    merged.update(profile)
+    merged['id'] = pid
+    unique_name(merged.get('name', ''), pid)
+    validate_profile(merged, pid)
+    with lock(), transaction():
+        atomic(pdir(pid) / 'profile.toml', toml(merged))
+        atomic(pdir(pid) / 'secrets.toml', toml(secret))
+        rebuild_index()
+        if pid == active(): apply(pid)
+        audit('profile-updated', pid)
+    return merged
 
 def render(pid):
     p = load_profile(pid); s = secrets_for(pid); items = mappings(pid)
@@ -1173,6 +1193,8 @@ def _box(kind, message, detail=None):
     print('└' + '─' * inner + '┘')
 
 def ask(prompt, default=None, secret=False, example=None, allow_back=False, allow_empty=False):
+    if _NON_INTERACTIVE[0]:
+        raise ValueError('该操作目前需要在终端完成（Web 端暂未实现此交互）')
     """Prompt once. 'q' cancels the operation; 'b' (when allowed) goes one step back.
 
     allow_empty=True returns '' for a blank line (used for "leave empty to clear
@@ -1214,7 +1236,27 @@ def ask(prompt, default=None, secret=False, example=None, allow_back=False, allo
             return ''
         return v
 
+_NON_INTERACTIVE = [False]
+
+@contextlib.contextmanager
+def non_interactive(enabled=True):
+    """非交互上下文：供 Web 端调用带 confirm() 的业务函数。
+
+    Web 端自己负责确认（前端二次确认 + 输入确认词），所以进入本上下文后
+    confirm() 直接返回 True；而 choose()/ask() 这类必须人来输入的交互
+    会抛错，暴露"该流程还没做 Web 版本"，避免静默卡住或选错项。
+    """
+    previous = _NON_INTERACTIVE[0]
+    _NON_INTERACTIVE[0] = enabled
+    try:
+        yield
+    finally:
+        _NON_INTERACTIVE[0] = previous
+
+
 def confirm(prompt, danger=False):
+    if _NON_INTERACTIVE[0]:
+        return True
     if danger:
         answer = ask(f'{prompt}（确认请输入 YES，其他内容或回车取消）')
         return (answer or '').strip() == 'YES'
@@ -1296,6 +1338,8 @@ def choose(items, title='请选择', back_label='返回上一级', groups=None, 
     只有一条"离开"语义：0 = 退一层。没有"连按两次""b 别名""回车也能返回"这些
     额外规则，用户只需要记住一个键。
     """
+    if _NON_INTERACTIVE[0]:
+        raise ValueError('该操作目前需要在终端完成（Web 端暂未实现此交互）')
     idx = len(items)
     width = len(str(idx))
 
@@ -3029,6 +3073,29 @@ def autostart(role):
     result_ok(f'已设置 {role} 启动类型为「{label}」；当前运行状态：'
               + color_state(SERVICE_STATES.get(str(current).lower(), current or '未知')) + '。')
     return True
+
+def set_autostart(role, enabled, manual=False):
+    """非交互设置开机自启（Web 端复用）。Windows 额外支持 manual。"""
+    if os.name == 'nt':
+        action = 'enable' if enabled else ('manual' if manual else 'disable')
+    else:
+        action = 'enable' if enabled else 'disable'
+    service(role, action)
+    return service(role, 'status')
+
+def autostart_enabled(role):
+    """当前是否开机自启；平台不支持时返回 None。"""
+    try:
+        if os.name == 'nt':
+            out = _cmd_out(['sc', 'qc', role])
+            return 'AUTO_START' in out.upper()
+        if shutil.which('systemctl'):
+            out = _cmd_out(['systemctl', 'is-enabled', role])
+            return out.strip().lower() in ('enabled', 'enabled-runtime', 'static')
+        out = _cmd_out(['rc-update', 'show', 'default'])
+        return role in out
+    except (OSError, ValueError):
+        return None
 
 def _clear_runtime_state():
     """Drop stale runtime markers after the active profile disappears (F6)."""
@@ -5018,6 +5085,108 @@ def ports_command(argv, flags=None):
         outcome = ports_revert()
         _report_revert(outcome); return
     raise ValueError('支持 ports status|plan|apply|enable|disable|clients|rules|revert')
+WEB_SERVICE = 'frp-simple-bash-web'
+
+def _web_unit_paths():
+    """返回 (unit_path, kind)；kind ∈ systemd/openrc/launchd/unknown。"""
+    if os.name == 'nt':
+        return None, 'windows'
+    if _systemd_available():
+        return Path('/etc/systemd/system') / (WEB_SERVICE + '.service'), 'systemd'
+    if shutil.which('rc-service') or Path('/etc/init.d').is_dir():
+        return Path('/etc/init.d') / WEB_SERVICE, 'openrc'
+    if sys.platform == 'darwin':
+        return Path('/Library/LaunchDaemons/frp-simple-bash.web.plist'), 'launchd'
+    return None, 'unknown'
+
+def web_service_installed():
+    path, kind = _web_unit_paths()
+    if kind == 'windows': return False
+    return bool(path and path.exists())
+
+def web_service_install():
+    """安装并启动 Web 管理端常驻服务。返回 (ok, message)。"""
+    path, kind = _web_unit_paths()
+    if kind == 'windows':
+        return False, 'Windows 请在安装时由 install-windows.ps1 注册服务'
+    if path is None:
+        return False, '当前平台不支持自动注册服务（请手动用 nohup/screen 运行 frpc-web）'
+    template = INSTALL_ROOT / 'templates' / ('frp-simple-bash-web.' + (
+        'service' if kind == 'systemd' else 'openrc' if kind == 'openrc' else 'plist'))
+    if not template.exists():
+        return False, '缺少服务模板：' + str(template)
+    try:
+        if kind == 'systemd':
+            atomic(path, template.read_text(encoding='utf-8'))
+            os.chmod(str(path), 0o644)
+            run_cmd(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=30)
+            out = run_cmd(['systemctl', 'enable', '--now', WEB_SERVICE],
+                          capture_output=True, text=True, timeout=60)
+            return out.returncode == 0, (out.stderr or out.stdout).strip()[:300]
+        if kind == 'openrc':
+            atomic(path, template.read_text(encoding='utf-8'))
+            os.chmod(str(path), 0o755)
+            run_cmd(['rc-update', 'add', WEB_SERVICE, 'default'],
+                    capture_output=True, text=True, timeout=30)
+            out = run_cmd(['rc-service', WEB_SERVICE, 'restart'],
+                          capture_output=True, text=True, timeout=60)
+            return out.returncode == 0, (out.stderr or out.stdout).strip()[:300]
+        atomic(path, template.read_text(encoding='utf-8'))
+        os.chmod(str(path), 0o644)
+        run_cmd(['launchctl', 'bootout', 'system/' + WEB_SERVICE],
+                capture_output=True, text=True, timeout=30)
+        out = run_cmd(['launchctl', 'bootstrap', 'system', str(path)],
+                      capture_output=True, text=True, timeout=60)
+        return out.returncode == 0, (out.stderr or out.stdout).strip()[:300]
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+
+def web_service_uninstall():
+    """停止并移除 Web 管理端服务（卸载 frpc 时调用）。"""
+    path, kind = _web_unit_paths()
+    if kind == 'windows' or path is None:
+        return False
+    try:
+        if kind == 'systemd':
+            run_cmd(['systemctl', 'disable', '--now', WEB_SERVICE],
+                    capture_output=True, text=True, timeout=60)
+        elif kind == 'openrc':
+            run_cmd(['rc-service', WEB_SERVICE, 'stop'], capture_output=True, text=True, timeout=60)
+            run_cmd(['rc-update', 'del', WEB_SERVICE, 'default'], capture_output=True, text=True, timeout=30)
+        else:
+            run_cmd(['launchctl', 'bootout', 'system/' + WEB_SERVICE],
+                    capture_output=True, text=True, timeout=60)
+        if path.exists(): unlink_quiet(path)
+        if kind == 'systemd':
+            run_cmd(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=30)
+        return True
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+def web_service_status():
+    """返回 Web 服务状态文本（未安装时返回 '未安装'）。"""
+    path, kind = _web_unit_paths()
+    if kind == 'windows':
+        return '不适用'
+    if path is None:
+        return '不适用'
+    if not path.exists():
+        return '未安装'
+    try:
+        if kind == 'systemd':
+            out = run_cmd(['systemctl', 'is-active', WEB_SERVICE],
+                          capture_output=True, text=True, timeout=20)
+            return (out.stdout or '').strip() or '未知'
+        if kind == 'openrc':
+            out = run_cmd(['rc-service', WEB_SERVICE, 'status'],
+                          capture_output=True, text=True, timeout=20)
+            return '已停止' if out.returncode else '运行中'
+        out = run_cmd(['launchctl', 'print', 'system/' + WEB_SERVICE],
+                      capture_output=True, text=True, timeout=20)
+        return '运行中' if out.returncode == 0 else '已停止'
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return '未知'
+
 def install(role, yes=False, no_start=False, non_interactive=False):
     script = Path(__file__).resolve().parent.parent / ('install-' + role + ('.ps1' if os.name == 'nt' else '.sh'))
     if not script.exists(): raise ValueError('安装脚本未安装')

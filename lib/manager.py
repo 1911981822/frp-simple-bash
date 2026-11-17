@@ -14,6 +14,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 try:
     import tomllib as _toml_lib
@@ -31,7 +32,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.20'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.21'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -786,6 +787,8 @@ ERROR_CODES = {
 }
 
 def err(code, message):
+    if _quiet():
+        raise ValueError('[%s] %s' % (code, message))
     """Raise a coded error: '<message>[Exxx]'. Never changes the exception type.
 
     The code must exist in ERROR_CODES (详细设计 §15.1); this makes the table
@@ -1222,6 +1225,7 @@ def _kv(label_text, value, width=12):
 
 def _box(kind, message, detail=None):
     """Render a result inside a frame; long text wraps instead of overflowing."""
+    if _quiet(): return
     inner = _ui_width()
     print()
     print('┌' + '─' * inner + '┐')
@@ -1235,7 +1239,7 @@ def _box(kind, message, detail=None):
     print('└' + '─' * inner + '┘')
 
 def ask(prompt, default=None, secret=False, example=None, allow_back=False, allow_empty=False):
-    if _NON_INTERACTIVE[0]:
+    if _quiet():
         raise ValueError('该操作目前需要在终端完成（Web 端暂未实现此交互）')
     """Prompt once. 'q' cancels the operation; 'b' (when allowed) goes one step back.
 
@@ -1278,7 +1282,7 @@ def ask(prompt, default=None, secret=False, example=None, allow_back=False, allo
             return ''
         return v
 
-_NON_INTERACTIVE = [False]
+_NI_LOCAL = threading.local()
 
 @contextlib.contextmanager
 def non_interactive(enabled=True):
@@ -1288,21 +1292,26 @@ def non_interactive(enabled=True):
     confirm() 直接返回 True；而 choose()/ask() 这类必须人来输入的交互
     会抛错，暴露"该流程还没做 Web 版本"，避免静默卡住或选错项。
     """
-    previous = _NON_INTERACTIVE[0]
-    _NON_INTERACTIVE[0] = enabled
+    previous = getattr(_NI_LOCAL, 'active', False)
+    _NI_LOCAL.active = enabled
     try:
-        if enabled:
-            # Web 调用时不要把这些"终端结果框"打进服务日志（会刷屏 journald）
-            with contextlib.redirect_stdout(io.StringIO()):
-                yield
-        else:
-            yield
+        yield
     finally:
-        _NON_INTERACTIVE[0] = previous
+        _NI_LOCAL.active = previous
+
+
+def _quiet():
+    """当前线程是否处于"不要往终端输出"的 Web 调用上下文。
+
+    用线程局部标志而不是重定向全局 sys.stdout：redirect_stdout 是进程级的，
+    两个并发 Web 请求交错进出会把全局 stdout 永久指向废弃的 StringIO，
+    之后 journal 里再也看不到任何输出。
+    """
+    return bool(getattr(_NI_LOCAL, 'active', False))
 
 
 def confirm(prompt, danger=False):
-    if _NON_INTERACTIVE[0]:
+    if _quiet():
         return True
     if danger:
         answer = ask(f'{prompt}（确认请输入 YES，其他内容或回车取消）')
@@ -1313,18 +1322,21 @@ def clear_screen():
     if UI_CLEAR and _is_tty(): print('\033[2J\033[H', end='')
 
 def section(title):
+    if _quiet(): return
     print()
     print(RULE)
     print(' ' + title)
     print(RULE)
 
 def pause(message='按回车继续'):
+    if _quiet(): return
     if sys.stdin.isatty():
         try: input(f'  {message} … ')
         except EOFError: pass
 
 def _report(title, lines):
     """Frame a multi-line report; keeps every original line intact."""
+    if _quiet(): return
     inner = _ui_width()
     print()
     print('┌' + '─' * inner + '┐')
@@ -1385,7 +1397,7 @@ def choose(items, title='请选择', back_label='返回上一级', groups=None, 
     只有一条"离开"语义：0 = 退一层。没有"连按两次""b 别名""回车也能返回"这些
     额外规则，用户只需要记住一个键。
     """
-    if _NON_INTERACTIVE[0]:
+    if _quiet():
         raise ValueError('该操作目前需要在终端完成（Web 端暂未实现此交互）')
     idx = len(items)
     width = len(str(idx))
@@ -1682,40 +1694,80 @@ def backup_menu():
         except MENU_ERRORS as exc: result_error(str(exc))
         pause()
 
+_DIAG_ADVICE = {
+    'config': '检查配置文件语法；从「备份与恢复」还原，或重新运行配置向导',
+    'dashboard-port': 'Dashboard 端口不可达：检查 frps 的 webServer 配置与防火墙/安全组',
+    'dashboard-auth': '认证失败：核对 Dashboard 用户名与密码',
+    'bindPort': '业务端口不通：检查云安全组与服务器防火墙是否放行',
+    'vhostHTTPPort': 'HTTP 域名端口不通：检查安全组是否放行该端口',
+    'vhostHTTPSPort': 'HTTPS 域名端口不通：检查安全组是否放行该端口',
+    'connection': '连接未就绪：核对 token、TLS、服务端地址与端口',
+    'server-port': '服务端端口不可达：确认 frps 已启动且安全组放行',
+    'admin-port': '本地管理端口不可用：确认 frpc 正在运行',
+    'proxy-error': '有映射未就绪：检查对应本地服务是否在运行、端口是否正确',
+}
+
+def _diagnostic(name):
+    return {'name': name, 'advice': _DIAG_ADVICE.get(str(name), '')}
+
+
 def diagnostics_report(role):
-    """Machine-readable diagnostic snapshot; never includes secrets."""
-    report = {'component': role, 'service_state': service(role, 'status').strip(), 'config_path': str(ROOT / (role + '.toml')), 'checks': []}
+    """Machine-readable diagnostic snapshot; never includes secrets.
+
+    每项都带 advice（中文建议），Web 端直接展示，避免"只报错不给下一步"。
+    """
+    def check(name, ok, detail):
+        return {'name': name, 'ok': bool(ok), 'detail': str(detail),
+                'advice': _DIAG_ADVICE.get(name.split('-')[-1] if False else name, '')
+                          or _DIAG_ADVICE.get(name, '')}
+
+    report = {'component': role, 'service_state': service(role, 'status').strip(),
+              'config_path': str(ROOT / (role + '.toml')), 'checks': []}
     config = ROOT / (role + '.toml')
     if not config.exists():
-        report['checks'].append({'name': 'config', 'ok': False, 'detail': '配置不存在'})
+        report['checks'].append(check('config', False, '配置不存在'))
+        report['ok'] = False
         return report
     try:
-        data = read_toml(config); verify(role, config.read_text(encoding='utf-8'))
-        report['checks'].append({'name': 'config', 'ok': True, 'detail': '语法校验通过'})
+        data = read_toml(config)
+        verify(role, config.read_text(encoding='utf-8'))
+        report['checks'].append(check('config', True, '语法校验通过'))
     except (ValueError, OSError) as exc:
-        report['checks'].append({'name': 'config', 'ok': False, 'detail': str(exc)}); return report
+        report['checks'].append(check('config', False, exc))
+        report['ok'] = False
+        return report
+
     if role == 'frps':
         web = data.get('webServer', {})
         if web.get('port'):
-            host = web.get('addr', '127.0.0.1'); probe = '127.0.0.1' if host in ('0.0.0.0', '::') else host
+            host = web.get('addr', '127.0.0.1')
+            probe = '127.0.0.1' if host in ('0.0.0.0', '::') else host
             reachable = port_reachable(probe, web['port'])
-            report['checks'].append({'name': 'dashboard-port', 'ok': reachable, 'detail': f'{probe}:{web["port"]}'})
+            report['checks'].append(check('dashboard-port', reachable,
+                                          '%s:%s' % (probe, web['port'])))
             try:
-                api(f'{api_scheme(web)}://{api_host(probe)}:{web["port"]}/api/serverinfo', web.get('user', ''), web.get('password', ''))
-                report['checks'].append({'name': 'dashboard-auth', 'ok': True, 'detail': '认证成功'})
+                api('%s://%s:%s/api/serverinfo' % (api_scheme(web), api_host(probe), web['port']),
+                    web.get('user', ''), web.get('password', ''))
+                report['checks'].append(check('dashboard-auth', True, '认证成功'))
             except urllib.error.HTTPError as exc:
-                report['checks'].append({'name': 'dashboard-auth', 'ok': False, 'detail': f'HTTP {exc.code}'})
+                report['checks'].append(check('dashboard-auth', False, 'HTTP %s' % exc.code))
             except (OSError, ValueError) as exc:
-                report['checks'].append({'name': 'dashboard-auth', 'ok': False, 'detail': str(exc)})
+                report['checks'].append(check('dashboard-auth', False, exc))
         for key in ('bindPort', 'vhostHTTPPort', 'vhostHTTPSPort'):
-            if data.get(key): report['checks'].append({'name': 'firewall-' + key, 'ok': not firewall_hint(data[key], 'tcp'), 'detail': '; '.join(firewall_hint(data[key], 'tcp'))})
+            if data.get(key):
+                hints = firewall_hint(data[key], 'tcp')
+                report['checks'].append(check('firewall-' + key, not hints, '; '.join(hints)))
     elif active():
-        p = load_profile(active())
-        report['active_profile'] = {'id': p['id'], 'name': p['name'], 'server': label(p)}
-        reachable = port_reachable(p['server_addr'], p['server_port'])
-        report['checks'].append({'name': 'server-port', 'ok': reachable, 'detail': f'{p["server_addr"]}:{p["server_port"]}'})
-        result = connection(p['id'], fresh=True)
-        report['checks'].append({'name': 'connection', 'ok': result['state'] == 'connected', 'detail': result['state']})
+        profile = load_profile(active())
+        report['active_profile'] = {'id': profile['id'], 'name': profile['name'],
+                                    'server': label(profile)}
+        reachable = port_reachable(profile['server_addr'], profile['server_port'])
+        report['checks'].append(check('server-port', reachable,
+                                      '%s:%s' % (profile['server_addr'],
+                                                 profile['server_port'])))
+        result = connection(profile['id'], fresh=True)
+        report['checks'].append(check('connection', result['state'] == 'connected',
+                                      result['state']))
     report['ok'] = all(item['ok'] for item in report['checks'])
     return report
 
@@ -5155,7 +5207,8 @@ def web_service_install():
     """安装并启动 Web 管理端常驻服务。返回 (ok, message)。"""
     path, kind = _web_unit_paths()
     if kind == 'windows':
-        return False, 'Windows 请在安装时由 install-windows.ps1 注册服务'
+        return False, ('Windows 暂不支持自动注册常驻 Web 服务；'
+                       '可手动运行 bin\\frpc-web.ps1，或用 WinSW 自行注册')
     if path is None:
         return False, '当前平台不支持自动注册服务（请手动用 nohup/screen 运行 frpc-web）'
     template = INSTALL_ROOT / 'templates' / ('frp-simple-bash-web.' + (
@@ -5209,6 +5262,45 @@ def web_service_uninstall():
         return True
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
+
+def run_detached(argv):
+    """在**服务 cgroup 之外**执行命令，避免脚本停掉本服务时把自己杀掉。
+
+    通过 systemd-run 起临时 unit；没有 systemd 时退化为 setsid。
+    返回 (ok, message)。
+    """
+    try:
+        if _systemd_available() and shutil.which('systemd-run'):
+            unit = 'frp-detached-' + secrets.token_hex(4)
+            proc = run_cmd(['systemd-run', '--collect', '--quiet',
+                            '--unit', unit, '--'] + list(argv),
+                           capture_output=True, text=True, timeout=60)
+            return proc.returncode == 0, (proc.stderr or '').strip()[:200]
+        if shutil.which('setsid'):
+            subprocess.Popen(list(argv), start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True, ''
+        subprocess.Popen(list(argv), start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True, ''
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+
+
+def web_service_restart_detached():
+    """重启 Web 服务（用于升级后加载新代码）。
+
+    必须在独立单元里执行：否则重启会杀掉发起者本身，导致升级"看起来成功、
+    实际还在跑旧代码"。
+    """
+    path, kind = _web_unit_paths()
+    if kind == 'systemd':
+        return run_detached(['systemctl', 'restart', WEB_SERVICE])
+    if kind == 'openrc':
+        return run_detached(['rc-service', WEB_SERVICE, 'restart'])
+    if kind == 'launchd':
+        return run_detached(['launchctl', 'kickstart', '-k', 'system/' + WEB_SERVICE])
+    return False, '当前平台不支持自动重启'
 
 def web_service_status():
     """返回 Web 服务状态文本（未安装时返回 '未安装'）。"""
@@ -5466,7 +5558,13 @@ def template_path(role):
 
 def unit_differs(role):
     """True when the registered unit content differs from the current template."""
-    unit, template = installed_unit_path(role), template_path(role)
+    if role == WEB_SERVICE:
+        unit, kind = _web_unit_paths()
+        if unit is None: return False
+        template = INSTALL_ROOT / 'templates' / ('frp-simple-bash-web.' + (
+            'service' if kind == 'systemd' else 'openrc' if kind == 'openrc' else 'plist'))
+    else:
+        unit, template = installed_unit_path(role), template_path(role)
     if not unit or not template: return False
     if not unit.exists() or not template.exists(): return False
     try: return unit.read_bytes() != template.read_bytes()
@@ -5485,7 +5583,11 @@ def refresh_units(roles=None, yes=False):
     if not manager:
         result_info('当前平台没有可刷新的服务单元（Windows 服务由安装器管理）。')
         return []
-    stale = [r for r in (roles or ('frps', 'frpc')) if unit_differs(r)]
+    wanted = list(roles or ('frps', 'frpc'))
+    # Web 管理端也是独立单元，模板更新后必须一起刷新（否则永远拿不到加固修复）
+    if web_service_installed() and WEB_SERVICE not in wanted:
+        wanted.append(WEB_SERVICE)
+    stale = [r for r in wanted if unit_differs(r)]
     if not stale: return []
     names = '、'.join(stale)
     result_info('检测到服务单元模板已更新：' + names,
@@ -5495,7 +5597,16 @@ def refresh_units(roles=None, yes=False):
         return []
     refreshed, failed = [], []
     for role in stale:
-        unit, template = installed_unit_path(role), template_path(role)
+        if role == WEB_SERVICE:
+            unit, web_kind = _web_unit_paths()
+            template = INSTALL_ROOT / 'templates' / ('frp-simple-bash-web.' + (
+                'service' if web_kind == 'systemd' else 'openrc' if web_kind == 'openrc'
+                else 'plist'))
+            if unit is None or not template.exists():
+                failed.append(role + '（缺少模板或平台不支持）')
+                continue
+        else:
+            unit, template = installed_unit_path(role), template_path(role)
         try:
             old = unit.read_bytes() if unit.exists() else None
             atomic(unit, template.read_text(encoding='utf-8'))
@@ -5584,7 +5695,7 @@ def upgrade(role, target=None, yes=False):
         err('E004', '管理器发布包 SHA256 不匹配，已拒绝更新。')
     import tarfile, io as _io, tempfile as _tempfile
     manager_files = (
-        'lib/manager.py', 'lib/download.sh', 'install-common.sh',
+        'lib/manager.py', 'lib/download.sh', 'lib/webui.py', 'install-common.sh',
         'install-frps.sh', 'install-frpc.sh', 'install-windows.ps1',
         'install-frps.ps1', 'install-frpc.ps1', 'uninstall.sh',
         'uninstall-frps.ps1', 'uninstall-frpc.ps1', 'uninstall-windows.ps1')

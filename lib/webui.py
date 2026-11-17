@@ -38,8 +38,11 @@ def bind_manager(module):
     若这里再 import 一次，会得到第二份模块实例（缓存/异常类/全局状态各一份），
     调试时极难定位，所以由调用方把真实模块传进来。
     """
-    global manager
+    global manager, ConfigCorruptError
     manager = module
+    # manager 以 __main__ 运行时，这里必须同步换成"那一份"的异常类，
+    # 否则 except ConfigCorruptError 永远匹配不上，损坏配置会被当成 400 用户输入错误
+    ConfigCorruptError = module.ConfigCorruptError
 
 WEB_CONFIG_NAME = 'web.json'
 ConfigCorruptError = manager.ConfigCorruptError
@@ -69,14 +72,23 @@ def web_config_path():
 
 
 def load_web_config():
-    """读取 web.json，缺失字段填默认值（容错，不让坏配置炸掉启动）。"""
+    """读取 web.json，缺失字段填默认值（容错，不让坏配置炸掉启动）。
+
+    配置**存在但无法解析**是严重状态：静默回落到默认值会让 password_hash 变成
+    空，面板从此任何密码都登不进，且没有任何提示。这里标记 _corrupt，
+    由 ensure_web_config 自动修复（重新生成一次性密码）并写审计。
+    """
     path = web_config_path()
     data = {}
+    corrupt = False
     if path.exists():
         try:
-            data = json.loads(path.read_text(encoding='utf-8'))
+            raw = path.read_text(encoding='utf-8')
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                data, corrupt = {}, True
         except (ValueError, OSError):
-            data = {}
+            data, corrupt = {}, True
     if not isinstance(data, dict):
         data = {}
     cfg = dict(DEFAULT_CONFIG)
@@ -95,6 +107,8 @@ def load_web_config():
             cfg[key] = DEFAULT_CONFIG[key]
     if not cfg.get('session_secret'):
         cfg['session_secret'] = secrets.token_hex(32)
+    if corrupt:
+        cfg['_corrupt'] = True
     return cfg
 
 
@@ -108,7 +122,7 @@ def save_web_config(cfg):
             os.chmod(str(bak), 0o600)
         except (OSError, ValueError):
             pass
-    payload = dict(cfg)                 # 写回全部键（含扩展字段）
+    payload = {k: v for k, v in cfg.items() if not str(k).startswith('_')}
     manager.atomic(path, json.dumps(payload, ensure_ascii=False, indent=2) + '\n')
     try:
         os.chmod(str(path), 0o600)
@@ -140,10 +154,23 @@ def verify_password(password, stored):
 
 
 def ensure_web_config():
-    """确保 web.json 存在；首次创建时生成随机密码并返回它（只返回一次）。"""
+    """确保 web.json 存在；首次创建或损坏修复时生成随机密码并返回它。"""
     path = web_config_path()
     if path.exists():
-        return load_web_config(), None
+        cfg = load_web_config()
+        if not cfg.get('_corrupt') and cfg.get('password_hash'):
+            return cfg, None
+        # 配置损坏 / 凭据丢失：重新生成口令并落盘，否则面板永远登不进
+        password = secrets.token_urlsafe(12)
+        repaired = dict(DEFAULT_CONFIG)
+        repaired['password_hash'] = hash_password(password)
+        repaired['must_change_password'] = True
+        repaired['session_secret'] = secrets.token_hex(32)
+        repaired.pop('_corrupt', None)
+        save_web_config(repaired)
+        web_audit('config-repaired', result='warn',
+                  detail='web.json 损坏或缺少凭据，已重建并生成新密码')
+        return load_web_config(), password
     password = secrets.token_urlsafe(12)
     cfg = dict(DEFAULT_CONFIG)
     cfg['password_hash'] = hash_password(password)
@@ -506,7 +533,8 @@ def api_health(ctx):
     cfg = ctx.app.config
     # 首次运行或凭据丢失（password_hash 为空）都要提示，否则用户不知道密码从哪来
     first_run = bool(cfg.get('must_change_password')) or not cfg.get('password_hash')
-    return {'status': 'ok', 'first_run': first_run}
+    return {'status': 'ok', 'first_run': first_run,
+            'config_corrupt': bool(cfg.get('_corrupt'))}
 
 
 
@@ -616,11 +644,35 @@ def api_status(ctx):
         'pending': bool(data.get('pending')),
         'manager_version': manager.installed_manager_version(),
         'active_profile': _profile_brief(data.get('active_profile')),
-        'profile_error': data.get('profile_error'),
+        'profile_error': (_sanitize(data.get('profile_error'))
+                          if data.get('profile_error') else None),
         'concerns': manager.status_concerns('frpc', data),
         'session': {'user': session['user'],
                     'expires_in': ctx.app.sessions.remaining(ctx.session_token)},
     }
+
+
+def _find_expose_mapping(profile, items):
+    """找出指向本管理端的自映射（_webui-tcp / _webui-http）。"""
+    if not isinstance(profile, dict): return None
+    try:
+        cfg = load_web_config()
+        port = int(cfg.get('port') or 7501)
+    except (TypeError, ValueError, ValueError):
+        port = 7501
+    for item in items or []:
+        if str(item.get('name')) not in (EXPOSE_TCP_NAME, EXPOSE_HTTP_NAME): continue
+        try:
+            if int(item.get('local_port') or 0) != port: continue
+        except (TypeError, ValueError):
+            continue
+        return {'name': item.get('name'), 'type': item.get('type'),
+                'remote_port': item.get('remote_port'), 'domain': item.get('domain'),
+                'server_addr': profile.get('server_addr'),
+                'external': ('%s:%s' % (profile.get('server_addr'), item.get('remote_port'))
+                             if item.get('type') in ('tcp', 'udp')
+                             else '%s://%s' % (item.get('type'), item.get('domain')))}
+    return None
 
 
 def _profile_brief(profile):
@@ -702,6 +754,7 @@ def api_overview(ctx):
                    'offline': (len(enabled) - online_count) if online_count is not None else None},
         'listener': {'bind': ctx.app.config.get('bind'), 'port': ctx.app.config.get('port')},
         'expose': ctx.app.escape_summary(),
+        'expose_mapping': _find_expose_mapping(profile, mappings),
     }
 
 
@@ -740,8 +793,14 @@ def api_events(ctx):
     if not _sse_start(ctx):
         return None
     last = None
+    rounds = 0
     try:
         while True:
+            rounds += 1
+            # 每 10 轮复查会话：改密吊销会话后，已连上的流必须失效
+            if rounds % 10 == 0 and not ctx.app.sessions.get(ctx.session_token):
+                _sse_write(ctx.handler, 'expired', {})
+                return None
             try:
                 data = manager.status('frpc')
                 conn = (data.get('connection') or {}).get('state')
@@ -782,8 +841,14 @@ def api_logs_stream(ctx):
             for line in tail:
                 _sse_write(ctx.handler, 'log', {'line': line})
             offset = size
+        rounds = 0
         while True:
+            rounds += 1
+            if rounds % 10 == 0 and not ctx.app.sessions.get(ctx.session_token):
+                _sse_write(ctx.handler, 'expired', {})
+                return None
             if not path.exists():
+                _sse_write(ctx.handler, 'reset', {})
                 time.sleep(1); continue
             size = path.stat().st_size
             if size < offset:            # 日志被轮转
@@ -804,6 +869,30 @@ def api_logs_stream(ctx):
         return None
 
 
+def api_logs_download(ctx):
+    """下载完整日志文件（text/plain + Content-Disposition）。"""
+    ctx.app.require_auth(ctx)
+    path = manager.ROOT / 'logs' / 'frpc.log'
+    if not path.exists():
+        raise HttpError(404, '日志文件不存在', 'E_NOT_FOUND',
+                        hint='服务可能从未启动，或日志已轮转')
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        raise HttpError(500, '读取日志失败', 'E_IO', hint=str(exc)[:120])
+    handler = ctx.handler
+    handler.send_response(200)
+    handler.send_header('Content-Type', 'text/plain; charset=utf-8')
+    handler.send_header('Content-Length', str(len(content)))
+    handler.send_header('Content-Disposition', 'attachment; filename="frpc.log"')
+    _common_headers(handler)
+    handler.end_headers()
+    if handler.command != 'HEAD':
+        try: handler.wfile.write(content)
+        except (BrokenPipeError, ConnectionResetError): pass
+    return None
+
+
 def api_audit(ctx):
     """读取 Web 审计日志（最近 N 条，可按结果过滤）。"""
     ctx.app.require_auth(ctx)
@@ -815,14 +904,24 @@ def api_audit(ctx):
     path = manager.ROOT / 'logs' / 'web-audit.jsonl'
     rows = []
     if path.exists():
-        try:
-            text = path.read_text(encoding='utf-8', errors='replace')
-        except OSError:
-            text = ''
-        for line in text.splitlines()[-limit:]:
+        for line in _tail_lines(path, limit):
             try: rows.append(json.loads(line))
             except ValueError: continue
     return {'items': rows, 'limit': limit}
+
+
+def _tail_lines(path, count):
+    """只读文件尾部（最多 512KB）取最后 N 行，避免大日志整文件读入内存。"""
+    try:
+        size = path.stat().st_size
+        with path.open('rb') as handle:
+            if size > 512 * 1024:
+                handle.seek(size - 512 * 1024)
+                handle.readline()            # 丢掉被截断的首行
+            data = handle.read()
+    except OSError:
+        return []
+    return data.decode('utf-8', errors='replace').splitlines()[-count:]
 
 
 def api_logs(ctx):
@@ -837,9 +936,8 @@ def api_logs(ctx):
     shown = 'logs/frpc.log'
     if not path.exists():
         return {'lines': [], 'path': shown, 'exists': False}
-    content = path.read_text(encoding='utf-8', errors='replace').splitlines()
-    return {'lines': content[-lines:], 'path': shown, 'exists': True,
-            'total': len(content)}
+    content = _tail_lines(path, lines)
+    return {'lines': content, 'path': shown, 'exists': True, 'total': len(content)}
 
 
 # ---------------------------------------------------------------- 映射 CRUD
@@ -933,6 +1031,20 @@ def api_mappings(ctx):
             'active_profile': _profile_brief(manager.load_profile(active_id)) if active_id else None}
 
 
+def _save_mappings_quiet(pid, items):
+    """Web 端保存映射：静默（不往 journal 打结果框、不读 stdin）+ 返回是否待重启。"""
+    with manager.non_interactive():
+        manager.save_mappings(pid, items)
+    return bool(manager.state().get('pending'))
+
+
+def _locate(items, name):
+    for index, item in enumerate(items):
+        if str(item.get('name')) == name:
+            return index, item
+    raise HttpError(404, '映射不存在：' + name, 'E_NOT_FOUND')
+
+
 def api_mapping_create(ctx):
     ctx.app.require_auth(ctx)
     body = ctx.json_body()
@@ -946,9 +1058,9 @@ def api_mapping_create(ctx):
             raise HttpError(400, '映射名称已存在：' + item['name'], 'E_DUPLICATE_NAME')
         items.append(item)
         manager.validate_mappings(items)
-        manager.save_mappings(pid, items)
+        pending = _save_mappings_quiet(pid, items)
     web_audit('mapping-create', ctx.client_ip, ctx.session['user'], 'ok', item['name'])
-    return {'item': item}
+    return {'item': item, 'pending': pending}
 
 
 def _require_profile(pid):
@@ -959,16 +1071,10 @@ def _require_profile(pid):
         return manager.load_profile(pid)
     except FileNotFoundError:
         raise HttpError(404, '服务端不存在：' + str(pid), 'E_NOT_FOUND')
-    except ConfigCorruptError as exc:
+    except manager.ConfigCorruptError as exc:
         raise HttpError(500, '服务端配置已损坏：' + Path(exc.path).name, 'E_CONFIG_CORRUPT',
                         hint='可从「设置 → 备份与恢复」还原，或重新创建服务端')
 
-
-def _find_mapping(pid, name):
-    for index, item in enumerate(manager.mappings(pid)):
-        if str(item.get('name')) == name:
-            return index, item
-    raise HttpError(404, '映射不存在：' + name, 'E_NOT_FOUND')
 
 
 def api_mapping_update(ctx, name):
@@ -976,31 +1082,31 @@ def api_mapping_update(ctx, name):
     body = ctx.json_body()
     pid = _active_pid()
     with ctx.app.write_lock:
-        index, current = _find_mapping(pid, name)
+        items = manager.mappings(pid)          # 只读一次，index 与列表必然一致
+        index, current = _locate(items, name)
         item = _mapping_from_body(body, current)
-        items = manager.mappings(pid)
         if item['name'] != name and any(
                 str(m.get('name')) == item['name']
                 for i, m in enumerate(items) if i != index):
             raise HttpError(400, '映射名称已存在：' + item['name'], 'E_DUPLICATE_NAME')
         items[index] = item
         manager.validate_mappings(items)
-        manager.save_mappings(pid, items)
+        pending = _save_mappings_quiet(pid, items)
     web_audit('mapping-update', ctx.client_ip, ctx.session['user'], 'ok', name)
-    return {'item': item}
+    return {'item': item, 'pending': pending}
 
 
 def api_mapping_toggle(ctx, name):
     ctx.app.require_auth(ctx)
     pid = _active_pid()
     with ctx.app.write_lock:
-        index, current = _find_mapping(pid, name)
         items = manager.mappings(pid)
+        index, current = _locate(items, name)
         items[index] = dict(current, enabled=not current.get('enabled', True))
         manager.validate_mappings(items)
-        manager.save_mappings(pid, items)
+        pending = _save_mappings_quiet(pid, items)
     web_audit('mapping-toggle', ctx.client_ip, ctx.session['user'], 'ok', name)
-    return {'item': items[index]}
+    return {'item': items[index], 'pending': pending}
 
 
 def api_mapping_delete(ctx, name):
@@ -1011,12 +1117,12 @@ def api_mapping_delete(ctx, name):
                         'E_CONFIRM_REQUIRED')
     pid = _active_pid()
     with ctx.app.write_lock:
-        index, _current = _find_mapping(pid, name)
         items = manager.mappings(pid)
+        index, _current = _locate(items, name)
         items.pop(index)
-        manager.save_mappings(pid, items)
+        pending = _save_mappings_quiet(pid, items)
     web_audit('mapping-delete', ctx.client_ip, ctx.session['user'], 'ok', name)
-    return {'deleted': name}
+    return {'deleted': name, 'pending': pending}
 
 
 # ---------------------------------------------------------------- 服务端 CRUD
@@ -1039,23 +1145,44 @@ def api_profiles(ctx):
 
 
 PROFILE_FIELDS = ('name', 'server_addr', 'server_port', 'tls_enable',
-                  'transport_protocol', 'log_level')
+                  'transport_protocol', 'log_level', 'admin_port',
+                  'dashboard_port', 'dashboard_addr', 'dashboard_scheme')
+TRANSPORT_PROTOCOLS = ('tcp', 'kcp', 'quic', 'websocket', 'wss')
+LOG_LEVELS = ('trace', 'debug', 'info', 'warn', 'error')
 
 def _profile_from_body(body, existing=None):
     base = dict(existing or {})
     item = {}
     for key in PROFILE_FIELDS:
         if key in body:
+            # 显式 null 视为"未提供"，否则会把 None 写进 profile.toml 让该配置永久不可用
+            if body[key] is None: continue
             item[key] = body[key]
         elif key in base:
             item[key] = base[key]
-    if 'server_port' in item:
-        item['server_port'] = _to_int(item['server_port'], '服务器端口')
-    if 'admin_port' in item:
-        item['admin_port'] = _to_int(item['admin_port'], '本地管理端口')
+    for key in ('server_port', 'admin_port', 'dashboard_port'):
+        if key in item:
+            item[key] = _to_int(item[key], key)
     if 'tls_enable' in item:
         item['tls_enable'] = _strict_bool(item['tls_enable'], 'tls_enable',
                                           bool(base.get('tls_enable', True)))
+    if 'transport_protocol' in item:
+        value = str(item['transport_protocol']).lower()
+        if value not in TRANSPORT_PROTOCOLS:
+            raise HttpError(400, '传输协议只支持 ' + '/'.join(TRANSPORT_PROTOCOLS),
+                            'E_INVALID', details=[{'field': 'transport_protocol'}])
+        item['transport_protocol'] = value
+    if 'log_level' in item:
+        value = str(item['log_level']).lower()
+        if value not in LOG_LEVELS:
+            raise HttpError(400, '日志级别只支持 ' + '/'.join(LOG_LEVELS),
+                            'E_INVALID', details=[{'field': 'log_level'}])
+        item['log_level'] = value
+    if 'dashboard_scheme' in item:
+        value = str(item['dashboard_scheme']).lower()
+        if value not in ('http', 'https'):
+            raise HttpError(400, 'Dashboard 协议只支持 http/https', 'E_INVALID')
+        item['dashboard_scheme'] = value
     return item
 
 
@@ -1111,12 +1238,25 @@ def api_profile_update(ctx, pid):
 
 def api_profile_switch(ctx, pid):
     ctx.app.require_auth(ctx)
-    _require_profile(pid)
+    profile = _require_profile(pid)
+    body = ctx.json_body() if ctx.body else {}
+    # 先探测可达性：不可达时先返回"需要确认"，避免把 frpc 切到连不上的地址
+    if not body.get('force'):
+        try:
+            reachable = manager.port_reachable(profile['server_addr'],
+                                               int(profile['server_port']))
+        except (ValueError, OSError):
+            reachable = True
+        if not reachable:
+            return {'switched': False, 'reachable': False,
+                    'message': '新服务端 %s:%s 当前不可达（地址/端口错误或被防火墙拦截）'
+                               % (profile['server_addr'], profile['server_port']),
+                    'hint': '确认仍要切换请提交 force=true'}
     with ctx.app.write_lock:
         with manager.non_interactive():
             manager.switch(pid)
     web_audit('profile-switch', ctx.client_ip, ctx.session['user'], 'ok', pid)
-    return {'active_id': manager.active()}
+    return {'switched': True, 'reachable': True, 'active_id': manager.active()}
 
 
 def api_profile_delete(ctx, pid):
@@ -1130,7 +1270,7 @@ def api_profile_delete(ctx, pid):
         with manager.non_interactive():
             manager.delete_profile_id(pid)
     web_audit('profile-delete', ctx.client_ip, ctx.session['user'], 'ok', profile.get('name', ''))
-    return {'deleted': pid}
+    return {'deleted': pid, 'active_id': manager.active()}
 
 
 # ---------------------------------------------------------------- 诊断 / 备份
@@ -1141,7 +1281,7 @@ def api_diagnose(ctx):
     try:
         report = manager.diagnostics_report('frpc')
     except (ValueError, OSError) as exc:
-        raise HttpError(500, '诊断执行失败：' + str(exc), 'E_DIAG',
+        raise HttpError(500, '诊断执行失败：' + _sanitize(exc), 'E_DIAG',
                         hint='查看服务日志获取详情')
     items = report.get('checks') if isinstance(report, dict) else None
     # 注意：这里不能用 'ok' 表示"检查是否全部通过"——外层信封的 ok 表示
@@ -1169,7 +1309,7 @@ def api_backup_create(ctx):
     with ctx.app.write_lock:
         path = manager.backup(manager.managed_paths(), 'manual')
     web_audit('backup-create', ctx.client_ip, ctx.session['user'], 'ok', str(path))
-    return {'path': str(path), 'name': Path(path).name}
+    return {'path': 'backups/' + Path(path).name, 'name': Path(path).name}
 
 
 def api_restore(ctx):
@@ -1188,13 +1328,23 @@ def api_restore(ctx):
         with manager.non_interactive():
             try: manager.backup(manager.managed_paths(), 'pre-restore')
             except (ValueError, OSError): pass
-            reason = manager.read_json(directory / 'manifest.json', {}).get('reason', '')
+            manifest = manager.read_json(directory / 'manifest.json', {})
+            if not isinstance(manifest, dict):
+                raise HttpError(400, '备份清单格式非法', 'E_INVALID')
+            reason = manifest.get('reason', '')
             if reason == 'upgrade':
                 restored = manager.restore_upgrade_snapshot(directory)
             else:
                 restored = manager.restore_backup(directory)
+    # 备份里可能包含 web.json：恢复后必须重载内存配置，否则磁盘口令与内存口令不一致
+    try:
+        ctx.app.config = load_web_config()
+    except (ValueError, OSError):
+        pass
     web_audit('restore', ctx.client_ip, ctx.session['user'], 'ok', name)
     return {'restored': restored, 'name': name}
+
+
 
 
 # ---------------------------------------------------------------- 设置
@@ -1233,7 +1383,9 @@ def _autostart_state():
 def api_autostart(ctx):
     ctx.app.require_auth(ctx)
     body = ctx.json_body()
-    enabled = bool(body.get('enabled'))
+    enabled = _strict_bool(body.get('enabled'), 'enabled', None)
+    if enabled is None:
+        raise HttpError(400, '缺少 enabled 参数', 'E_INVALID')
     with ctx.app.write_lock:
         with manager.non_interactive():
             manager.set_autostart('frpc', enabled)
@@ -1260,6 +1412,10 @@ def api_settings_apply(ctx):
     """
     ctx.app.require_auth(ctx)
     body = ctx.json_body()
+    with ctx.app.write_lock:
+        return _settings_apply_locked(ctx, body)
+
+def _settings_apply_locked(ctx, body):
     cfg = load_web_config()
     old_bind, old_port = str(cfg.get('bind')), int(cfg.get('port'))
 
@@ -1275,6 +1431,10 @@ def api_settings_apply(ctx):
     _validate_bind(new_bind)
     if not 1 <= new_port <= 65535:
         raise HttpError(400, '端口必须在 1-65535 之间', 'E_INVALID')
+    # 绑定非回环地址 = 把 root 控制面暴露到网络：必须先设密码
+    if new_bind not in ('127.0.0.1', '::1') and not cfg.get('password_hash'):
+        raise HttpError(400, '绑定非回环地址前必须先设置管理端密码', 'E_NEED_PASSWORD',
+                        hint='到「设置 → 账号安全」设置密码后再改绑定地址')
 
     if new_bind == old_bind and new_port == old_port:
         return {'changed': False, 'escape': None}
@@ -1321,6 +1481,11 @@ def _close_listener(app, entry):
 def api_settings_confirm(ctx):
     """确认新地址可用：立即关闭旧监听。"""
     ctx.app.require_auth(ctx)
+    with ctx.app.write_lock:
+        return _settings_confirm_locked(ctx)
+
+
+def _settings_confirm_locked(ctx):
     with ctx.app.escape_lock:
         escape = ctx.app.escape
         if not escape:
@@ -1335,6 +1500,11 @@ def api_settings_confirm(ctx):
 def api_settings_rollback(ctx):
     """回滚到旧配置：关闭新监听，恢复旧配置（旧监听仍在服务）。"""
     ctx.app.require_auth(ctx)
+    with ctx.app.write_lock:
+        return _settings_rollback_locked(ctx)
+
+
+def _settings_rollback_locked(ctx):
     with ctx.app.escape_lock:
         escape = ctx.app.escape
         if not escape:
@@ -1361,7 +1531,18 @@ def api_settings_password(ctx):
     """修改用户名/密码：新旧凭据同时有效 5 分钟，避免记错密码被锁死。"""
     session = ctx.app.require_auth(ctx)
     body = ctx.json_body()
+    with ctx.app.write_lock:
+        return _settings_password_locked(ctx, body, session)
+
+
+def _settings_password_locked(ctx, body, session):
     cfg = load_web_config()
+    # 已登录不等于有权改密：必须提供当前密码，否则会话被盗即可改密锁死管理员
+    current = str(body.get('current_password', ''))
+    if not current or not verify_password(current, cfg.get('password_hash')):
+        if cfg.get('password_hash'):
+            raise HttpError(403, '当前密码不正确', 'E_CURRENT_PASSWORD',
+                            hint='请输入当前密码后再修改')
     new_user = str(body.get('username', cfg.get('username'))).strip()
     new_password = str(body.get('password', ''))
     if new_user and len(new_user) < 2:
@@ -1375,7 +1556,8 @@ def api_settings_password(ctx):
         cfg['password_expires_at'] = time.time() + ESCAPE_WINDOW_SECONDS
         cfg['password_hash'] = hash_password(new_password)
         cfg['must_change_password'] = False
-        cfg.pop('password_hash_old', None)   # 新一轮改密不再保留更早的旧哈希
+        # 注意：绝不能在这里清掉 password_hash_old —— 它正是"旧密码 5 分钟宽限期"
+        # 的唯一依据。清掉会让界面承诺的逃生通道立即失效。
         changed = True
     if new_user:
         cfg['username'] = new_user
@@ -1396,23 +1578,34 @@ def api_uninstall(ctx):
     body = ctx.json_body()
     if str(body.get('confirm', '')) != 'frpc':
         raise HttpError(400, '请确认卸载：需要提交 confirm=frpc', 'E_CONFIRM_REQUIRED')
+    purge = _strict_bool(body.get('purge'), 'purge', False)
     # 卸载会删掉本进程所在的文件；先回响应，再脱离会话执行
-    web_audit('uninstall', ctx.client_ip, ctx.session['user'], 'ok')
-    threading.Thread(target=_run_uninstall_detached, daemon=True).start()
-    return {'message': '卸载已开始，管理端将在数秒内停止'}
+    web_audit('uninstall', ctx.client_ip, ctx.session['user'], 'ok', 'purge=%s' % purge)
+    threading.Thread(target=_run_uninstall_detached, args=(purge,), daemon=True).start()
+    return {'message': '卸载已开始，管理端将在数秒内停止', 'purge': purge}
 
 
-def _run_uninstall_detached():
-    time.sleep(1.5)
+def _run_uninstall_detached(purge=False):
+    time.sleep(1.0)
     try:
-        with manager.non_interactive():
-            manager.uninstall('frpc', purge=bool(global_purge_flag[0]), yes=True)
-    except Exception as exc:            # 含 CalledProcessError：失败必须留痕
+        script = (manager.INSTALL_ROOT /
+                  ('uninstall-windows.ps1' if os.name == 'nt' else 'uninstall.sh'))
+        if not script.exists():
+            raise ValueError('卸载脚本不存在：' + str(script))
+        if os.name == 'nt':
+            argv = ['powershell', '-File', str(script), '-Component', 'frpc', '-Yes']
+        else:
+            argv = ['bash', str(script), 'frpc', '--yes']
+        if purge:
+            argv.append('--purge')
+        # 关键：必须在服务 cgroup 之外执行。否则脚本里"停止 web 服务"这一步
+        # 会把执行卸载的进程自己杀掉，导致卸载只做了一半。
+        ok, message = manager.run_detached(argv)
+        web_audit('uninstall', result='ok' if ok else 'error', detail=message)
+    except Exception as exc:            # 失败必须留痕
         web_audit('uninstall', result='error',
                   detail='%s: %s' % (type(exc).__name__, exc))
 
-
-global_purge_flag = [False]
 
 
 def api_upgrade(ctx):
@@ -1424,7 +1617,11 @@ def api_upgrade(ctx):
     web_audit('upgrade', ctx.client_ip, ctx.session['user'], 'ok', target or 'latest')
     thread = threading.Thread(target=_run_upgrade_detached, args=(target,), daemon=True)
     thread.start()
-    return {'message': '升级已开始，完成后管理端会自动重启'}
+    if manager.web_service_installed():
+        message = '升级已开始；完成后会自动重启管理端服务'
+    else:
+        message = '升级已开始；当前未安装常驻服务，请稍后手动重启 frpc web'
+    return {'message': message}
 
 
 def _run_upgrade_detached(target):
@@ -1432,6 +1629,12 @@ def _run_upgrade_detached(target):
     try:
         with manager.non_interactive():
             manager.upgrade('frpc', target=target, yes=True)
+        web_audit('upgrade', result='ok', detail='target=%s' % (target or 'latest'))
+        # 升级只替换磁盘文件；不重启的话服务还在跑旧代码（旧界面/旧接口）
+        if manager.web_service_installed():
+            ok, message = manager.web_service_restart_detached()
+            if not ok:
+                web_audit('upgrade-restart', result='error', detail=message or '')
     except Exception as exc:
         web_audit('upgrade', result='error',
                   detail='%s: %s' % (type(exc).__name__, exc))
@@ -1443,54 +1646,95 @@ EXPOSE_TCP_NAME = '_webui-tcp'
 EXPOSE_HTTP_NAME = '_webui-http'
 
 
+def _panel_port():
+    try:
+        return int(load_web_config().get('port') or 7501)
+    except (TypeError, ValueError):
+        return 7501
+
+
+def _is_ours_expose(item, panel_port):
+    """判断某条映射是不是本工具创建的自映射。
+
+    判据：名字是保留名 + 本地地址是 127.0.0.1 + 本地端口是面板端口。
+    改过面板端口后旧自映射的 local_port 是历史端口，用 `_looks_expose` 兜底识别。
+    """
+    if str(item.get('name')) not in (EXPOSE_TCP_NAME, EXPOSE_HTTP_NAME):
+        return False
+    if str(item.get('local_ip') or '') != '127.0.0.1':
+        return False
+    return True
+
+
 def api_expose_create(ctx):
     """把管理端本身映射到公网：TCP 端口 或 HTTP 域名。"""
     ctx.app.require_auth(ctx)
     body = ctx.json_body()
-    kind = str(body.get('type', 'tcp')).lower()
     cfg = load_web_config()
+    # 暴露前必须已设密码：面板以 root 运行
+    if not cfg.get('password_hash'):
+        raise HttpError(400, '暴露到公网前必须先设置面板密码', 'E_NEED_PASSWORD',
+                        hint='到「设置 → 账号安全」设置密码')
+    kind = str(body.get('type', 'tcp')).lower()
     pid = _active_pid()
-    items = manager.mappings(pid)
-    for name in (EXPOSE_TCP_NAME, EXPOSE_HTTP_NAME):
-        items = [m for m in items if str(m.get('name')) != name]
+    panel_port = _panel_port()
     if kind == 'tcp':
         remote = body.get('remote_port')
         if not remote:
             raise HttpError(400, '请填写公网端口', 'E_INVALID')
         item = {'name': EXPOSE_TCP_NAME, 'type': 'tcp', 'local_ip': '127.0.0.1',
-                'local_port': int(cfg.get('port', 7501)),
-                'remote_port': remote, 'enabled': True}
+                'local_port': panel_port, 'remote_port': _to_int(remote, '公网端口'),
+                'enabled': True}
     elif kind == 'http':
         domain = str(body.get('domain', '')).strip()
         if not domain:
             raise HttpError(400, '请填写域名', 'E_INVALID')
         item = {'name': EXPOSE_HTTP_NAME, 'type': 'http', 'local_ip': '127.0.0.1',
-                'local_port': int(cfg.get('port', 7501)), 'domain': domain,
-                'enabled': True}
+                'local_port': panel_port, 'domain': domain, 'enabled': True}
     else:
         raise HttpError(400, '仅支持 tcp 或 http', 'E_INVALID')
-    if not cfg.get('password_hash'):
-        raise HttpError(400, '暴露到公网前必须先设置面板密码', 'E_NEED_PASSWORD',
-                        hint='到「设置」页设置用户名与密码')
-    items.append(item)
-    manager.validate_mappings(items)
+
+    # 读-改-写必须在同一把锁内，否则并发会丢掉用户刚建的映射
     with ctx.app.write_lock:
+        items = manager.mappings(pid)
+        others = [m for m in items if not _is_ours_expose(m, panel_port)]
+        # 旧自映射（可能指向改过的旧端口）原位替换，避免"名称重复"卡死
+        same_kind = [m for m in items if _is_ours_expose(m, panel_port)
+                     and str(m.get('type')) == item['type']]
+        if same_kind:
+            items = others
+        else:
+            items = [m for m in others
+                     if str(m.get('name')) != item['name']]
+        items.append(item)
+        manager.validate_mappings(items)
         manager.save_mappings(pid, items)
     web_audit('expose-create', ctx.client_ip, ctx.session['user'], 'ok', kind)
-    return {'item': item}
+    return {'item': item, 'pending': bool(manager.state().get('pending'))}
 
 
 def api_expose_delete(ctx):
     ctx.app.require_auth(ctx)
     pid = _active_pid()
-    items = manager.mappings(pid)
-    kept = [m for m in items if str(m.get('name')) not in (EXPOSE_TCP_NAME, EXPOSE_HTTP_NAME)]
-    if len(kept) == len(items):
-        return {'deleted': False}
+    panel_port = _panel_port()
     with ctx.app.write_lock:
+        items = manager.mappings(pid)
+        ours = [m for m in items if _is_ours_expose(m, panel_port)]
+        if not ours:
+            return {'deleted': False}
+        kept = [m for m in items if not _is_ours_expose(m, panel_port)]
         manager.save_mappings(pid, kept)
     web_audit('expose-delete', ctx.client_ip, ctx.session['user'], 'ok')
-    return {'deleted': True}
+    return {'deleted': True, 'removed': len(ours),
+            'pending': bool(manager.state().get('pending'))}
+
+
+# ---------------------------------------------------------------- 危险操作
+
+# ---------------------------------------------------------------- 自映射（面板暴露到公网）
+
+EXPOSE_TCP_NAME = '_webui-tcp'
+EXPOSE_HTTP_NAME = '_webui-http'
 
 
 # ---------------------------------------------------------------- 路由
@@ -1505,6 +1749,7 @@ ROUTES = [
     ('GET',    r'^/api/events$',        api_events,   True),
     ('GET',    r'^/api/logs$',          api_logs,     True),
     ('GET',    r'^/api/logs/stream$',   api_logs_stream, True),
+    ('GET',    r'^/api/logs/download$', api_logs_download, True),
     ('GET',    r'^/api/audit$',         api_audit,    True),
     ('POST',   r'^/api/service/start$',   api_service_start,   True),
     ('POST',   r'^/api/service/stop$',    api_service_stop,    True),
@@ -1644,7 +1889,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except manager.QuitProgram:
                 fail(self, 500, '操作被中止', 'E_ABORTED',
                      hint='请重试；若反复出现请查看服务日志')
-            except ConfigCorruptError as exc:
+            except manager.ConfigCorruptError as exc:
                 # 配置文件损坏属于服务端故障，不是用户输错
                 web_audit('config-corrupt', ctx.client_ip, result='error', detail=exc.path)
                 fail(self, 500, '配置文件已损坏：' + Path(exc.path).name,
@@ -1909,6 +2154,12 @@ def _port_available(bind, port):
 
 def run(bind=None, port=None, foreground=True, open_browser=False):
     """启动 Web 管理端（常驻服务与前台运行共用此入口）。"""
+    # 确保 profiles/logs/backups 存在并执行日志轮转；只靠 Web 管理的主机
+    # 否则永远不会有轮转，frpc.log 会无限增长
+    try:
+        manager.initialize()
+    except (ValueError, OSError):
+        pass
     cfg, generated = ensure_web_config()
     if bind: cfg['bind'] = bind
     if port: cfg['port'] = int(port)

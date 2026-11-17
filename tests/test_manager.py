@@ -492,6 +492,7 @@ class ManagerTests(unittest.TestCase):
         import tarfile, hashlib, tempfile, io as _io
         files = {
             'frp-simple-bash/lib/manager.py': b'# new manager\n',
+            'frp-simple-bash/lib/webui.py': b'# new webui\n',
             'frp-simple-bash/lib/download.sh': b'# dl\n',
             'frp-simple-bash/install-common.sh': b'# ic\n',
             'frp-simple-bash/install-frps.sh': b'# is\n',
@@ -523,6 +524,9 @@ class ManagerTests(unittest.TestCase):
         self.assertIn('v9.9.9-test', (install_root / 'install-frpc.sh').read_text())
         self.assertTrue((install_root / 'install-windows.ps1').exists())
         self.assertEqual((install_root / 'bin' / 'frpc').stat().st_mode & 0o111, 0o111)
+        # Web 后端必须随升级更新，否则会出现"新前端 + 旧后端"
+        self.assertTrue((install_root / 'lib' / 'webui.py').exists())
+        self.assertIn('new webui', (install_root / 'lib' / 'webui.py').read_text())
     def test_upgrade_rejects_incomplete_bundle(self):
         import tarfile, hashlib, io as _io
         buf = _io.BytesIO()

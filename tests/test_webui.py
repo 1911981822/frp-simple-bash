@@ -697,5 +697,160 @@ class HttpApiTests(unittest.TestCase):
                 w.manager.result_ok('should not appear')
         self.assertEqual(buf.getvalue(), '')
 
+    # ---- 第二轮审查修复回归 ----
+
+    def test_password_grace_period_old_password_works(self):
+        """改密后 5 分钟内旧密码必须仍可登录（逃生通道）。"""
+        cookie, csrf = self._login_csrf()
+        status, payload, _ = self.fx.json('POST', '/api/settings/password', cookie=cookie,
+                                          csrf=csrf,
+                                          body={'current_password': 'testpass123',
+                                                'password': 'newpass456'})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload['password_changed'])
+        # 旧密码仍然可用
+        status, _, _ = self.fx.json('POST', '/api/login',
+                                    body={'username': 'admin', 'password': 'testpass123'})
+        self.assertEqual(status, 200)
+        # 新密码也可用
+        status, _, _ = self.fx.json('POST', '/api/login',
+                                    body={'username': 'admin', 'password': 'newpass456'})
+        self.assertEqual(status, 200)
+
+    def test_password_change_requires_current_password(self):
+        cookie, csrf = self._login_csrf()
+        status, payload, _ = self.fx.json('POST', '/api/settings/password', cookie=cookie,
+                                          csrf=csrf, body={'password': 'newpass456'})
+        self.assertEqual(status, 403)
+        self.assertEqual(payload['code'], 'E_CURRENT_PASSWORD')
+
+    def test_password_change_revokes_other_sessions(self):
+        cookie, csrf = self._login_csrf()
+        _, _, other = self.fx.login()          # 第二个会话（第 3 个返回值是 cookie）
+        self.fx.json('POST', '/api/settings/password', cookie=cookie, csrf=csrf,
+                     body={'current_password': 'testpass123', 'password': 'newpass789'})
+        status, _, _ = self.fx.json('GET', '/api/session', cookie=other)
+        self.assertEqual(status, 401)          # 其它会话已吊销
+
+    def test_web_config_corrupt_is_repaired_with_new_password(self):
+        (self.fx.tmp / w.WEB_CONFIG_NAME).write_text('{"bind": "127.0.0.1", "port"')
+        cfg, password = w.ensure_web_config()
+        self.assertTrue(password)              # 自动生成新密码
+        self.assertTrue(cfg.get('password_hash'))
+        self.assertTrue(w.verify_password(password, cfg['password_hash']))
+
+    def test_internal_keys_not_persisted(self):
+        cfg = w.load_web_config()
+        cfg['_corrupt'] = True
+        w.save_web_config(cfg)
+        raw = json.loads((self.fx.tmp / w.WEB_CONFIG_NAME).read_text())
+        self.assertNotIn('_corrupt', raw)
+
+    def test_mapping_create_returns_pending(self):
+        cookie, csrf = self._login_csrf()
+        with patch.object(w.manager, 'active', return_value='a' * 24), \
+             patch.object(w.manager, 'load_profile', return_value={'id': 'a' * 24}), \
+             patch.object(w.manager, 'mappings', return_value=[]), \
+             patch.object(w.manager, 'save_mappings'), \
+             patch.object(w.manager, 'validate_mappings'), \
+             patch.object(w.manager, 'state', return_value={'pending': True}):
+            status, payload, _ = self.fx.json('POST', '/api/mappings', cookie=cookie,
+                                              csrf=csrf,
+                                              body={'name': 'p', 'type': 'tcp',
+                                                    'local_port': 8080,
+                                                    'remote_port': 20009})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload['pending'])
+
+    def test_mapping_save_is_quiet(self):
+        """映射保存不能往服务 stdout 打结果框，也不能读 stdin。"""
+        import io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with w.manager.non_interactive():
+                w.manager.result_ok('should vanish')
+        self.assertEqual(buf.getvalue(), '')
+
+    def test_expose_replaces_stale_own_mapping(self):
+        """面板改过端口后，旧自映射必须能被新配置覆盖（不能报名称重复）。"""
+        cookie, csrf = self._login_csrf()
+        stale = {'name': w.EXPOSE_TCP_NAME, 'type': 'tcp', 'local_ip': '127.0.0.1',
+                 'local_port': 7000, 'remote_port': 6000, 'enabled': True}
+        store = {'items': [stale]}
+        with patch.object(w.manager, 'active', return_value='a' * 24), \
+             patch.object(w.manager, 'load_profile', return_value={'id': 'a' * 24}), \
+             patch.object(w.manager, 'mappings', side_effect=lambda pid: list(store['items'])), \
+             patch.object(w.manager, 'save_mappings',
+                          side_effect=lambda pid, items: store.__setitem__('items', list(items))), \
+             patch.object(w.manager, 'validate_mappings'), \
+             patch.object(w, 'load_web_config',
+                          return_value=dict(w.DEFAULT_CONFIG, port=7501,
+                                            password_hash='x')):
+            status, payload, _ = self.fx.json('POST', '/api/expose', cookie=cookie,
+                                              csrf=csrf,
+                                              body={'type': 'tcp', 'remote_port': 6001})
+        self.assertEqual(status, 200)
+        exposes = [m for m in store['items'] if m['name'] == w.EXPOSE_TCP_NAME]
+        self.assertEqual(len(exposes), 1)
+        self.assertEqual(exposes[0]['local_port'], 7501)
+
+    def test_expose_delete_keeps_user_mappings(self):
+        cookie, csrf = self._login_csrf()
+        user = {'name': 'ssh', 'type': 'tcp', 'local_ip': '127.0.0.1',
+                'local_port': 22, 'remote_port': 6000, 'enabled': True}
+        ours = {'name': w.EXPOSE_TCP_NAME, 'type': 'tcp', 'local_ip': '127.0.0.1',
+                'local_port': 7501, 'remote_port': 6001, 'enabled': True}
+        store = {'items': [user, ours]}
+        with patch.object(w.manager, 'active', return_value='a' * 24), \
+             patch.object(w.manager, 'load_profile', return_value={'id': 'a' * 24}), \
+             patch.object(w.manager, 'mappings', side_effect=lambda pid: list(store['items'])), \
+             patch.object(w.manager, 'save_mappings',
+                          side_effect=lambda pid, items: store.__setitem__('items', list(items))):
+            status, payload, _ = self.fx.json('DELETE', '/api/expose', cookie=cookie,
+                                              csrf=csrf)
+        self.assertEqual(status, 200)
+        self.assertEqual([m['name'] for m in store['items']], ['ssh'])
+
+    def test_settings_apply_parallel_with_password_no_lost_update(self):
+        """设置并发写：端口与密码都必须落盘（原来会互相覆盖）。"""
+        import http.client, threading
+        cookie, csrf = self._login_csrf()
+        results = []
+        def do_apply():
+            c = http.client.HTTPConnection('127.0.0.1', self.fx.port, timeout=10)
+            c.request('POST', '/api/settings/apply', json.dumps({'port': 7600}),
+                      {'Content-Type': 'application/json', 'Cookie': cookie,
+                       'X-CSRF-Token': csrf})
+            results.append(c.getresponse().status); c.close()
+        def do_password():
+            c = http.client.HTTPConnection('127.0.0.1', self.fx.port, timeout=10)
+            c.request('POST', '/api/settings/password',
+                      json.dumps({'current_password': 'testpass123',
+                                  'password': 'parallel789'}),
+                      {'Content-Type': 'application/json', 'Cookie': cookie,
+                       'X-CSRF-Token': csrf})
+            results.append(c.getresponse().status); c.close()
+        threads = [threading.Thread(target=do_apply), threading.Thread(target=do_password)]
+        for th in threads: th.start()
+        for th in threads: th.join()
+        cfg = w.load_web_config()
+        self.assertTrue(w.verify_password('parallel789', cfg['password_hash']))
+
+    def test_non_interactive_is_thread_local(self):
+        """并发进入 non_interactive 不能污染其它线程的输出。"""
+        import io as _io, threading
+        outsider = []
+        def worker():
+            with w.manager.non_interactive():
+                w.manager.result_ok('hidden')
+        def other():
+            buf = _io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                w.manager.result_ok('visible')
+            outsider.append(buf.getvalue())
+        th = threading.Thread(target=worker); th.start(); th.join()
+        th2 = threading.Thread(target=other); th2.start(); th2.join()
+        self.assertIn('visible', outsider[0])
+
 if __name__ == '__main__':
     unittest.main()

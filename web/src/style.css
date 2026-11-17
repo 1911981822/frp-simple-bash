@@ -202,3 +202,16 @@ input:focus, select:focus { outline:none; border-color:var(--accent); }
 .tab { padding:8px 14px; color:var(--muted); text-decoration:none; border-bottom:2px solid transparent; }
 .tab:hover { color:var(--fg); }
 .tab.active, .tab.router-link-active { color:var(--info-fg); border-bottom-color:var(--accent); }
+
+/* 全局状态点 */
+.status-dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+  background:currentColor; margin-right:6px; }
+.status-dot.tone-ok { color:var(--ok-fg); }
+.status-dot.tone-err { color:var(--err-fg); }
+.status-dot.tone-muted { color:var(--muted-fg); }
+/* 中断类操作：黄色描边（区别于不可逆的实心红） */
+button.warn-outline { background:transparent; border:1px solid var(--warn-line);
+  color:var(--warn-fg); }
+/* danger 按钮加深底色，保证白字对比度 ≥4.5:1 */
+button.danger { background:#b62324; }
+button.danger:hover:not(:disabled) { background:#cf2b2c; }

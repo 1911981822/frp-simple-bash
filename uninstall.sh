@@ -56,9 +56,14 @@ fi
 # Web 管理端：随 frpc 一起移除（它是 frpc 的管理界面，单独残留会指向已删文件）
 if [[ "$role" == frpc ]]; then
   if command -v systemctl >/dev/null && [[ -d /run/systemd/system ]]; then
-    systemctl disable --now frp-simple-bash-web >/dev/null 2>&1 || true
-    rm -f -- /etc/systemd/system/frp-simple-bash-web.service
-    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ -f /etc/systemd/system/frp-simple-bash-web.service ]] \
+       && ! grep -Fq 'ExecStart=/opt/frp-simple-bash/bin/frpc-web' /etc/systemd/system/frp-simple-bash-web.service; then
+      echo '拒绝删除非本项目的 Web 服务单元：/etc/systemd/system/frp-simple-bash-web.service' >&2
+    else
+      systemctl disable --now frp-simple-bash-web >/dev/null 2>&1 || true
+      rm -f -- /etc/systemd/system/frp-simple-bash-web.service
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
   elif command -v rc-service >/dev/null; then
     rc-service frp-simple-bash-web stop >/dev/null 2>&1 || true
     rc-update del frp-simple-bash-web default >/dev/null 2>&1 || true
@@ -68,7 +73,10 @@ if [[ "$role" == frpc ]]; then
     launchctl bootout "system/frp-simple-bash.web" >/dev/null 2>&1 || true
     rm -f -- /Library/LaunchDaemons/frp-simple-bash.web.plist
   fi
-  rm -f -- /usr/local/bin/frpc-web
+  if [[ -L /usr/local/bin/frpc-web ]]; then
+    [[ "$(readlink /usr/local/bin/frpc-web)" == "/opt/frp-simple-bash/bin/frpc-web" ]] \
+      && rm -f -- /usr/local/bin/frpc-web
+  fi
 fi
 
 command="/usr/local/bin/$role"
@@ -111,7 +119,7 @@ PY
     fi
     rm -f -- "$config_root/auto-port.toml" "$config_root/ports-state.json" \
              "$config_root/logs/ports-audit.jsonl" "$config_root/web.json" \
-             "$config_root/web.json.bak"
+             "$config_root/web.json.bak" "$config_root/logs/web.log"
     if [[ -f "$config_root/state.json" ]]; then
       python3 - "$config_root/state.json" <<'PY'
 import json, sys

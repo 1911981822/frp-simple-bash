@@ -13,6 +13,8 @@ const routes = [
   { path: '/logs', component: () => import('./views/Logs.vue'), meta: { title: '日志与诊断' } },
   { path: '/diagnose', component: () => import('./views/Diagnose.vue'), meta: { title: '连接诊断' } },
   { path: '/settings', component: () => import('./views/Settings.vue'), meta: { title: '设置' } },
+  // 兜底：未知路径回概览，避免刷新/后退时白屏
+  { path: '/:pathMatch(.*)*', redirect: '/overview' },
 ]
 
 const router = createRouter({ history: createWebHashHistory(), routes })

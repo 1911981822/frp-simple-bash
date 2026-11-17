@@ -58,6 +58,10 @@
             <input v-model.trim="panel.bind" placeholder="127.0.0.1 或 0.0.0.0"
                    autocomplete="off" autocapitalize="none" spellcheck="false" />
           </label>
+          <p v-if="bindIsPublic" class="alert tone-err small">
+            ⚠ 绑定到非回环地址会把管理端暴露到网络。面板以 root 运行，被突破等于服务器失守；
+            请确认已设置强密码，并考虑只允许特定 IP 访问。
+          </p>
           <label class="field">端口
             <input v-model.number="panel.port" type="number" inputmode="numeric"
                    min="1" max="65535" placeholder="7501" />
@@ -91,7 +95,11 @@
             <input v-model.trim="pwd.username" autocomplete="username"
                    autocapitalize="none" spellcheck="false" />
           </label>
-          <label class="field">新密码
+          <label class="field">当前密码
+          <input v-model="pwd.current" type="password" autocomplete="current-password"
+                 placeholder="修改密码需要验证当前密码" />
+        </label>
+        <label class="field">新密码
             <input v-model="pwd.password" type="password" autocomplete="new-password"
                    placeholder="至少 8 位" />
           </label>
@@ -227,7 +235,7 @@ const escapeError = ref('')
 let escapeTimer = null
 
 // 账号安全
-const pwd = reactive({ username: '', password: '', confirm: '' })
+const pwd = reactive({ username: '', current: '', password: '', confirm: '' })
 const pwdBusy = ref(false)
 const pwdError = ref('')
 const pwdOk = ref('')
@@ -256,6 +264,10 @@ const dialog = reactive({
   onConfirm: () => {},
 })
 
+const bindIsPublic = computed(() => {
+  const bind = String(panel.bind || '').trim()
+  return !!bind && !['127.0.0.1', '::1', 'localhost'].includes(bind)
+})
 const pageUrl = computed(() => location.origin + location.pathname)
 const countdownText = computed(() => hhmmss(secondsLeft.value))
 
@@ -447,7 +459,8 @@ async function changePassword() {
   if (password !== confirm) { pwdError.value = '两次输入的新密码不一致'; return }
   pwdBusy.value = true
   try {
-    const data = await post('/api/settings/password', { username, password })
+    const data = await post('/api/settings/password',
+                            { username, current_password: pwd.current, password })
     const name = data.username || username
     if (name) {
       if (settings.value) settings.value.username = name
@@ -457,6 +470,7 @@ async function changePassword() {
       settings.value.password_set = true
       settings.value.first_run = false
     }
+    pwd.current = ''
     pwd.password = ''
     pwd.confirm = ''
     if (data.password_changed) {

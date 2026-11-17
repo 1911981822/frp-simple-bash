@@ -24,7 +24,7 @@ export class ApiError extends Error {
 }
 
 // 相对 base 请求（支持子路径部署：由 <base> 或当前目录决定）
-function endpoint(path) {
+export function endpoint(path) {
   const base = document.baseURI.replace(/[^/]*$/, '')
   return new URL(path.replace(/^\//, ''), base).toString()
 }

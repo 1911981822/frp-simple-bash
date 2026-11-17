@@ -26,6 +26,17 @@
         <p v-if="notice.hint" class="alert-hint">{{ notice.hint }}</p>
       </div>
 
+      <!-- 新服务端不可达时，不直接切换，要求明确二次确认 -->
+      <div v-if="forceTarget" class="alert tone-err">
+        <div class="alert-head">
+          <span>「{{ forceTarget.name }}」当前不可达，仍要切换吗？切换后 frpc 可能无法连接。</span>
+          <span class="notice-actions">
+            <button class="ghost small" @click="forceTarget = null">取消</button>
+            <button class="danger small" @click="forceSwitch">仍要切换</button>
+          </span>
+        </div>
+      </div>
+
       <p v-if="!loaded" class="muted">正在加载…</p>
 
       <EmptyState v-else-if="!items.length" icon="🖥" title="还没有服务端"
@@ -148,7 +159,8 @@ const error = ref(null)
 const loading = ref(false)
 const loaded = ref(false)
 const updatedAt = ref('')
-const busyId = ref('')          // 正在切换的服务端 id
+const busyId = ref('')
+const forceTarget = ref(null)          // 正在切换的服务端 id
 const notice = ref(null)        // { tone, text, hint }
 let noticeTimer = null
 
@@ -344,13 +356,18 @@ async function makeActive(p) {
   try {
     // 切换包含可达性检测与重启，耗时可能超过默认 20 秒
     const data = await post('/api/profiles/' + encodeURIComponent(p.id) + '/switch',
-                            undefined, { timeout: 90000 })
+                            {}, { timeout: 90000 })
+    if (data && data.switched === false && data.reachable === false) {
+      // 后端预检发现新服务端不可达：不直接切换，让用户明确二次确认
+      forceTarget.value = p
+      showNotice('warn', '「' + p.name + '」当前不可达', data.hint || '')
+      return
+    }
     await load()
     if (data && data.active_id === p.id) {
       showNotice('ok', '已切换到「' + p.name + '」')
     } else {
-      // 后端检测到新服务端不可达时会自动回退，此时 active_id 仍是旧值
-      showNotice('warn', '切换未生效：未能连接到「' + p.name + '」，已保留原服务端',
+      showNotice('warn', '切换未生效，已保留原服务端',
                  '请检查该服务端的地址 / 端口 / token 与防火墙后重试。')
     }
   } catch (err) {
@@ -359,6 +376,24 @@ async function makeActive(p) {
   } finally {
     busyId.value = ''
   }
+}
+
+async function forceSwitch() {
+  const p = forceTarget.value
+  if (!p) return
+  forceTarget.value = null
+  busyId.value = p.id
+  dismissNotice()
+  try {
+    await post('/api/profiles/' + encodeURIComponent(p.id) + '/switch',
+               { force: true }, { timeout: 90000 })
+    await load()
+    showNotice('warn', '已强制切换到「' + p.name + '」',
+               '该服务端当前不可达，frpc 可能无法建立连接')
+  } catch (err) {
+    const apiErr = toApiError(err)
+    showNotice('err', '切换到「' + p.name + '」失败：' + apiErr.message, apiErr.hint)
+  } finally { busyId.value = '' }
 }
 
 function askDelete(p) {

@@ -253,12 +253,26 @@ snapshot_file() {
   fi
 }
 snapshot_file "$install_root/native/$component" "native/$component"
-for rel in bin/frps bin/frpc lib/manager.py lib/download.sh install-common.sh install-frps.sh install-frpc.sh uninstall.sh; do
+for rel in bin/frps bin/frpc bin/frpc-web bin/frpc-web.ps1 bin/frpc-web.cmd \
+           lib/manager.py lib/webui.py lib/download.sh \
+           install-common.sh install-frps.sh install-frpc.sh uninstall.sh; do
   snapshot_file "$install_root/$rel" "$rel"
 done
-for rel in templates/frps.service templates/frpc.service templates/frps.openrc templates/frpc.openrc; do
+for rel in templates/frps.service templates/frpc.service templates/frps.openrc templates/frpc.openrc \
+           templates/frp-simple-bash-web.service templates/frp-simple-bash-web.openrc \
+           templates/frp-simple-bash-web.plist; do
   snapshot_file "$install_root/$rel" "$rel"
 done
+# Web 前端目录整体快照（资源名带构建哈希，无法逐文件列举）
+if [[ -d "$install_root/web/dist" ]]; then
+  mkdir -p "$rollback_dir/web"
+  cp -a "$install_root/web/dist" "$rollback_dir/web/dist" 2>/dev/null || true
+fi
+if [[ "$manager" == systemd ]]; then
+  snapshot_file "/etc/systemd/system/frp-simple-bash-web.service" "unit/frp-simple-bash-web.service"
+fi
+if [[ "$manager" == openrc ]]; then snapshot_file "/etc/init.d/frp-simple-bash-web" "unit/frp-simple-bash-web.openrc"; fi
+if [[ "$manager" == launchd ]]; then snapshot_file "/Library/LaunchDaemons/frp-simple-bash.web.plist" "unit/frp-simple-bash-web.plist"; fi
 if [[ "$manager" == systemd ]]; then snapshot_file "/etc/systemd/system/$component.service" "unit/$component.service"; fi
 if [[ "$manager" == openrc ]]; then snapshot_file "/etc/init.d/$component" "unit/$component.openrc"; fi
 if [[ "$manager" == launchd ]]; then snapshot_file "/Library/LaunchDaemons/frp-simple-bash.$component.plist" "unit/$component.plist"; fi
@@ -268,14 +282,35 @@ rollback_install() {
   local exit_code=$?
   trap - EXIT
   if ((install_ok == 0)); then
-    for rel in native/$component bin/frps bin/frpc lib/manager.py lib/download.sh \
+    # 停止 Web 服务（若已注册），否则回滚后会留下一个指向旧文件的运行中服务
+    if [[ "$manager" == systemd ]]; then
+      systemctl disable --now frp-simple-bash-web >/dev/null 2>&1 || true
+      rm -f -- /etc/systemd/system/frp-simple-bash-web.service || true
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    elif [[ "$manager" == openrc ]]; then
+      rc-service frp-simple-bash-web stop >/dev/null 2>&1 || true
+      rc-update del frp-simple-bash-web default >/dev/null 2>&1 || true
+      rm -f -- /etc/init.d/frp-simple-bash-web || true
+    elif [[ "$manager" == launchd ]]; then
+      launchctl bootout "system/frp-simple-bash.web" >/dev/null 2>&1 || true
+      rm -f -- /Library/LaunchDaemons/frp-simple-bash.web.plist || true
+    fi
+    for rel in native/$component bin/frps bin/frpc bin/frpc-web bin/frpc-web.ps1 bin/frpc-web.cmd \
+               lib/manager.py lib/webui.py lib/download.sh \
                install-common.sh install-frps.sh install-frpc.sh uninstall.sh \
-               templates/frps.service templates/frpc.service templates/frps.openrc templates/frpc.openrc; do
+               templates/frps.service templates/frpc.service templates/frps.openrc templates/frpc.openrc \
+               templates/frp-simple-bash-web.service templates/frp-simple-bash-web.openrc \
+               templates/frp-simple-bash-web.plist; do
       local saved="$rollback_dir/$rel" dest="$install_root/$rel"
       if [[ -e "$saved" || -L "$saved" ]]; then
         mkdir -p "$(dirname "$dest")" || true; cp -a -- "$saved" "$dest" || true
       fi
     done
+    if [[ -d "$rollback_dir/web/dist" ]]; then
+      rm -rf -- "$install_root/web/dist" || true
+      mkdir -p "$install_root/web" || true
+      cp -a -- "$rollback_dir/web/dist" "$install_root/web/dist" || true
+    fi
     if [[ "$manager" == systemd && -f "$rollback_dir/unit/$component.service" ]]; then
       mkdir -p /etc/systemd/system || true; cp -a -- "$rollback_dir/unit/$component.service" "/etc/systemd/system/$component.service" || true
     elif [[ "$manager" == openrc && -f "$rollback_dir/unit/$component.openrc" ]]; then
@@ -336,8 +371,11 @@ fi
 # Web 管理端作为常驻服务安装（FRP_NO_WEB=1 可跳过）
 if [[ "$component" == frpc && "${FRP_NO_WEB:-0}" != "1" && -f "$install_root/bin/frpc-web" ]]; then
   if [[ "$manager" == systemd || "$manager" == openrc || "$manager" == launchd ]]; then
-    if ! "$install_root/bin/frpc-web" --install-service >/dev/null 2>&1; then
-      echo '提示：Web 管理端服务未能自动安装，可稍后手动执行：frpc web --install-service' >&2
+    # OpenRC/launchd 的日志重定向不会自动创建父目录，必须先建好
+    mkdir -p "$config_root/logs" 2>/dev/null || true
+    if ! web_out="$("$install_root/bin/frpc-web" --install-service 2>&1)"; then
+      echo "提示：Web 管理端服务未能自动安装${web_out:+：$web_out}" >&2
+      echo "  可稍后手动执行：$install_root/bin/frpc-web --install-service" >&2
     fi
   fi
 fi

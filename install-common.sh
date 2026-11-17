@@ -310,8 +310,23 @@ if [[ "$source_root" != "$install_root" ]]; then
   for file in frps frpc; do install -m 755 "$source_root/bin/$file" "$install_root/bin/$file"; done
   install -m 644 "$source_root/lib/manager.py" "$install_root/lib/manager.py"
   install -m 644 "$source_root/lib/download.sh" "$install_root/lib/download.sh"
+  # Web 管理端后端（P1 起）：缺失时 `frpc web` 会直接报错
+  if [[ -f "$source_root/lib/webui.py" ]]; then
+    install -m 644 "$source_root/lib/webui.py" "$install_root/lib/webui.py"
+  fi
   for file in install-common.sh install-frps.sh install-frpc.sh uninstall.sh; do install -m 755 "$source_root/$file" "$install_root/$file"; done
   cp "$source_root/templates/"* "$install_root/templates/"
+  # Web 前端静态资源（构建产物随发布包分发，用户无需 Node）
+  if [[ -d "$source_root/web/dist" ]]; then
+    mkdir -p "$install_root/web"
+    rm -rf "$install_root/web/dist"
+    cp -a "$source_root/web/dist" "$install_root/web/dist"
+    if [[ "$source_root" == "$install_root" ]]; then :; fi
+  elif [[ -d "$install_root/web/dist" ]]; then
+    : # 老版本升级路径：保留已有前端资源
+  else
+    echo '提示：未找到 web/dist，Web 管理端不可用（frpc web 会报错）。' >&2
+  fi
 fi
 # Only the component being installed gets its command symlink. The other
 # component's bin/ entry exists (shared menu shell) but is NOT exposed as a

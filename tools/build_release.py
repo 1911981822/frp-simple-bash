@@ -27,9 +27,9 @@ RUNTIME_FILES = (
     'install-common.sh', 'install-frps.sh', 'install-frpc.sh',
     'install-frps.ps1', 'install-frpc.ps1', 'install-windows.ps1',
     'uninstall.sh', 'uninstall-frps.ps1', 'uninstall-frpc.ps1', 'uninstall-windows.ps1',
-    'lib/manager.py', 'lib/download.sh',
+    'lib/manager.py', 'lib/download.sh', 'lib/webui.py',
 )
-RUNTIME_DIRS = ('bin/', 'templates/')
+RUNTIME_DIRS = ('bin/', 'templates/', 'web/dist/')
 
 def _is_runtime(name):
     return name in RUNTIME_FILES or name.startswith(RUNTIME_DIRS)

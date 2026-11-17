@@ -253,5 +253,141 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(headers.get('X-Frame-Options'), 'DENY')
 
 
+    # ---- 审查修复回归（P1 review）----
+
+    def test_head_has_no_body(self):
+        status, raw, headers = self.fx.request('HEAD', '/api/health')
+        self.assertEqual(status, 200)
+        self.assertEqual(raw, b'')            # HEAD 不能带 body
+        self.assertTrue(int(headers.get('Content-Length') or 0) > 0)
+
+    def test_oversized_body_closes_connection(self):
+        import socket
+        sock = socket.create_connection(('127.0.0.1', self.fx.port), timeout=5)
+        try:
+            sock.sendall(b'POST /api/login HTTP/1.1\r\nHost: x\r\n'
+                         b'Content-Length: 99999999\r\n\r\n')
+            data = sock.recv(200)
+            self.assertIn(b'413', data)
+        finally:
+            sock.close()
+
+    def test_chunked_body_rejected(self):
+        status, payload, _ = self.fx.json('POST', '/api/login', headers={
+            'Transfer-Encoding': 'chunked'}, body=None)
+        self.assertEqual(status, 411)
+
+    def test_bare_api_path_returns_json_404(self):
+        _, _, cookie = self.fx.login()
+        status, payload, headers = self.fx.json('GET', '/api', cookie=cookie)
+        self.assertEqual(status, 404)
+        self.assertIn('application/json', headers.get('Content-Type', ''))
+
+    def test_bad_url_returns_400_not_crash(self):
+        import socket
+        sock = socket.create_connection(('127.0.0.1', self.fx.port), timeout=5)
+        try:
+            sock.sendall(b'GET http://[::1/ HTTP/1.1\r\nHost: x\r\n\r\n')
+            data = sock.recv(400)
+            self.assertIn(b'400', data)
+        finally:
+            sock.close()
+
+    def test_error_envelope_has_hint_and_request_id(self):
+        status, payload, headers = self.fx.json('POST', '/api/login',
+                                               body={'username': '', 'password': ''})
+        self.assertEqual(status, 400)
+        self.assertIsInstance(payload['code'], str)      # code 统一为字符串
+        self.assertIn('request_id', payload)
+        self.assertTrue(headers.get('X-Request-Id'))
+
+    def test_locked_login_has_retry_after(self):
+        self.fx.app.limiter = w.LoginLimiter(1, 1)
+        self.fx.json('POST', '/api/login', body={'username': 'admin', 'password': 'x'})
+        status, payload, _ = self.fx.json('POST', '/api/login',
+                                          body={'username': 'admin', 'password': 'x'})
+        self.assertEqual(status, 429)
+        self.assertGreater(payload.get('retry_after', 0), 0)
+        self.assertEqual(payload.get('code'), 'E_AUTH_LOCKED')
+
+    def test_audit_file_is_0600(self):
+        import os
+        self.fx.json('POST', '/api/login', body={'username': 'admin', 'password': 'bad'})
+        path = self.fx.tmp / 'logs' / 'web-audit.jsonl'
+        self.assertTrue(path.exists())
+        if os.name != 'nt':
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_backup_config_is_0600(self):
+        import os
+        cfg = w.load_web_config(); cfg['port'] = 7602; w.save_web_config(cfg)
+        cfg['port'] = 7603; w.save_web_config(cfg)
+        bak = self.fx.tmp / (w.WEB_CONFIG_NAME + '.bak')
+        self.assertTrue(bak.exists())
+        if os.name != 'nt':
+            self.assertEqual(bak.stat().st_mode & 0o777, 0o600)
+
+    def test_unknown_config_keys_preserved(self):
+        cfg = w.load_web_config()
+        cfg['future_option'] = 'keep-me'
+        w.save_web_config(cfg)
+        self.assertEqual(w.load_web_config().get('future_option'), 'keep-me')
+
+    def test_invalid_port_falls_back(self):
+        (self.fx.tmp / w.WEB_CONFIG_NAME).write_text(json.dumps({'port': 70000}))
+        self.assertEqual(w.load_web_config()['port'], 7501)
+
+    def test_server_header_hides_python_version(self):
+        _, _, headers = self.fx.request('GET', '/api/health')
+        self.assertNotIn('Python', headers.get('Server', ''))
+
+    def test_health_does_not_leak_version(self):
+        _, payload, _ = self.fx.json('GET', '/api/health')
+        self.assertNotIn('version', payload)
+
+    def test_noncesrf_nonascii_is_403_not_500(self):
+        _, _, cookie = self.fx.login()
+        _, sess, _ = self.fx.json('GET', '/api/session', cookie=cookie)
+        status, payload, _ = self.fx.json('POST', '/api/logout', cookie=cookie,
+                                          csrf='caf\u00e9')
+        self.assertEqual(status, 403)
+
+    def test_overview_online_is_null_when_api_unreachable(self):
+        _, _, cookie = self.fx.login()
+        with patch.object(w.manager, 'mapping_online_status', return_value=None):
+            status, payload, _ = self.fx.json('GET', '/api/overview', cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertIsNone(payload['counts']['online'])   # 未知而非谎报 0
+
+    def test_overview_reports_mappings_error(self):
+        _, _, cookie = self.fx.login()
+        with patch.object(w.manager, 'mappings', side_effect=OSError('permission denied')):
+            status, payload, _ = self.fx.json('GET', '/api/overview', cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(payload.get('mappings_error'))   # 读取失败不能伪装成空
+
+    def test_overview_includes_concerns_and_views(self):
+        _, _, cookie = self.fx.login()
+        _, payload, _ = self.fx.json('GET', '/api/overview', cookie=cookie)
+        self.assertIn('service_view', payload)
+        self.assertIn('tone', payload['service_view'])
+        self.assertIn('concerns', payload)
+
+    def test_service_control_requires_csrf(self):
+        _, _, cookie = self.fx.login()
+        status, _, _ = self.fx.json('POST', '/api/service/start', cookie=cookie)
+        self.assertEqual(status, 403)
+
+    def test_service_start_invokes_manager(self):
+        _, _, cookie = self.fx.login()
+        _, sess, _ = self.fx.json('GET', '/api/session', cookie=cookie)
+        with patch.object(w.manager, 'service') as service, \
+             patch.object(w.manager, 'require_active'), \
+             patch.object(w.manager, 'status', return_value={'service_state': 'running'}):
+            status, payload, _ = self.fx.json('POST', '/api/service/start',
+                                              cookie=cookie, csrf=sess['csrf'])
+        self.assertEqual(status, 200)
+        service.assert_called_once()
+
 if __name__ == '__main__':
     unittest.main()

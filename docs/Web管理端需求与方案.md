@@ -409,3 +409,76 @@ sudo frpc web --disable               # 临时停用 Web 服务
 | 关键配置修改方式 | ✅ **Web 可改 + 5 分钟逃生窗口**（v1.1 变更，详见 §9） |
 
 **需求已定稿，进入施工。**
+---
+
+## 14. 审查整改记录（P1 完成后）
+
+对 P1 代码做了两轮独立审查：**代码审查**（功能/易维护性/复用性/闭环/多系统/容错/安全）与**人因工程审查**（易用性/便捷性）。以下是修复结果。
+
+### 14.1 代码审查修复（高危）
+
+| 问题 | 后果 | 修复 |
+|---|---|---|
+| 无请求体上限、无 socket 超时、无并发上限 | 未认证 slowloris 即可耗尽线程（实测 CL=100MB 卡死线程、30 空闲连接=30 线程） | `Handler.timeout=15` + 1MB 体积上限 + 64 并发信号量，超出直接 503 |
+| `webui.py`/`web/dist` 未入库、未进发布白名单、安装器不安装 | 装好后 `frpc web` 直接 `Errno 2`，`/` 返回 500 | `.gitignore` 加 `!web/dist/`、`build_release` 白名单、`install-common.sh` 安装、`UPGRADE_FILES` 与升级快照覆盖 `web/dist/` |
+
+### 14.2 代码审查修复（中危）
+
+- **HEAD 响应带 body** → HEAD 不再写 body，且自动复用 GET 处理器；方法不符返回 405 + `Allow`
+- **413 不关连接** → 未读净 body 时 `close_connection=True`，避免请求错位（CL desync）
+- **chunked 未处理** → 显式 411 拒绝
+- **非法 URL 未捕获** → `urlsplit` 包 try，返回 400
+- **错误信封缺 hint** → `{ok, code(字符串), error, hint, retry_after, details, request_id}` + `X-Request-Id` 头
+- **OSError 被当 400 且泄露路径** → ValueError→400，OSError→500「磁盘/权限问题」，500 统一泛化，细节只进审计
+- **`.bak` 与审计日志 0644** → 均 0600（原来泄漏 password_hash/session_secret/登录 IP）
+- **`verify_password` 无迭代边界** → 1000~2,000,000 之外直接 False
+- **非 ASCII CSRF 头抛 TypeError** → 先 `isascii()` 校验，返回 403 并记审计
+- **未知配置键被丢弃** → 读写保留全部键（`must_change_password` 等扩展字段不再失效）
+- **端口越界无校验** → 1-65535，非法回落并标记
+- **`Server` 头泄露 Python 版本 / health 泄露版本** → `sys_version=''`，health 只回 `{status, first_run}`
+- **dist 缺失泄露绝对路径** → 泛化文案 + 审计记录
+- **`assets/` 缓存按 URL 前缀判定** → 改为按真实路径，`/assets/../index.html` 不再长缓存
+- **SIGTERM 未处理** → 接 SIGTERM/SIGINT，优雅关闭所有监听并写审计
+- **双 manager 模块实例** → 新增 `bind_manager()`，由 manager 注入真实模块
+- **`_proxy_status_map` 返回 `{}` 无法区分未知** → 返回 `None` 表示读不到，新增公有 `mapping_online_status()`
+- **`/api` 被 SPA fallback 吞成 200 HTML** → 统一进 JSON 404
+- **SSE 声明 keep-alive 但无定界** → 明确 `Connection: close`
+
+### 14.3 人因工程修复
+
+| 问题 | 修复 |
+|---|---|
+| 导航 7 项且服务控制无入口 | 收为 **5 项**：概览 / 端口映射 / 服务端（FRPS）/ 日志与诊断 / 设置 |
+| 概览是空壳，最高频闭环（看状态→重启→复制）缺失 | 概览页落地：状态带 + 4 指标 + 需关注 + 待重启 + 启停重启 + 管理端地址一键复制 |
+| 首次登录无法自救（密码只打印在 stdout） | 登录页加「首次使用 / 忘记密码」帮助区，给 3 条可复制命令；`/api/health` 下发 `first_run` |
+| 锁定提示无倒计时、无法解除 | 429 下发 `retry_after`，前端实时倒计时并给解除命令 |
+| 错误文案不可操作、英文直出 | 四类分流：网络 / 401 / 429 / 5xx，各带 hint 与重试按钮 |
+| 登录页缺基本功 | 自动聚焦、密码显隐、CapsLock 提示、防重复提交、`autocapitalize=none` |
+| 前端丢弃 CSRF，写操作必 403 | 新增 `lib/api.js`：自动带 CSRF、401 跳登录、20s 超时、统一 `ApiError` |
+| 无退出登录入口 | 侧栏底部加入用户区 + 退出按钮 + 会话剩余时间 |
+| 状态只有英文枚举、无颜色语义 | 后端下发 `{label, tone}`（`service_view`/`connection_view`）；前端 `StatusBadge`（圆点+文字+底色，不只靠颜色）；`lib/status.js` 仅作兜底 |
+| 概览在线数恒为 0 | 修 `online` 恒空 bug；读不到时显示 `—`（未知），绝不谎报 0 |
+| 映射读取失败伪装成"没有映射" | `overview` 返回 `mappings_error`，前端显示「读取失败 + 去恢复备份」 |
+| 需关注清单在 Web 丢失 | 抽出 `manager.status_concerns()`，终端与 Web 共用同一份判定 |
+| 零响应式，手机不可用 | 3 档断点：≤820px 侧栏转顶部横条、≤480px 指标两列；触控目标 ≥40px |
+| 只有深色，原生控件白底 | `color-scheme: dark light` + 明暗两套 token |
+| 旧浏览器白屏无解释 | `nomodule` 兜底提示 |
+| 无访问日志/审计不可见 | 新增 `/api/audit`；CSRF 失败也记审计 |
+| 日志只能手动刷新 | `Logs.vue` 用 SSE 实时尾随，支持级别过滤/暂停/清屏 |
+
+### 14.4 前端基础设施
+
+新增（对应需求文档 §4.1）：
+```
+web/src/lib/api.js       统一请求、CSRF、401、超时、ApiError
+web/src/lib/status.js    枚举→中文→tone 兜底字典
+web/src/lib/format.js    时间/外部地址格式化
+web/src/components/      StatusBadge / EmptyState / ErrorState / ConfirmDialog
+```
+
+### 14.5 验证
+
+- webui 测试从 21 条增至 **40 条**（HEAD 无 body、413 关连接、411 chunked、405、非法 URL、错误信封、锁定 retry_after、审计 0600、`.bak` 0600、未知键保留、端口回落、Server 头、非 ASCII CSRF、在线未知语义、mappings_error、concerns、服务控制 CSRF、服务控制调用）
+- 全量 **338 条通过**
+- 真实启动验证：首页 200 / 静态 200 / health / HEAD 200 / 405 / 登录 / overview 均正常
+- 构建：主包 104KB（gzip 41KB）+ 按路由分割的懒加载块

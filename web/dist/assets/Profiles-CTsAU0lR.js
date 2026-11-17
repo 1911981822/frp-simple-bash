@@ -1,0 +1,1 @@
+import{_ as o}from"./_plugin-vue_export-helper-DlAUqK2U.js";import{c as t,b as s,k as r}from"./index-Cny8auPq.js";const c={},a={class:"page"};function n(l,e){return r(),t("div",a,[...e[0]||(e[0]=[s("h2",null,"服务端（FRPS）",-1),s("p",{class:"muted"},"下一阶段实现（P3）。",-1)])])}const d=o(c,[["render",n]]);export{d as default};

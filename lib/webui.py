@@ -17,6 +17,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import socketserver
 import sys
 import threading
@@ -29,10 +30,22 @@ if str(_LIB_DIR) not in sys.path:
     sys.path.insert(0, str(_LIB_DIR))
 import manager  # noqa: E402  （必须在 sys.path 调整之后）
 
+
+def bind_manager(module):
+    """由 manager.py 调用，注入"正在运行的那一份"manager 模块。
+
+    manager.py 既可能以 __main__ 运行（CLI），也可能被 import。
+    若这里再 import 一次，会得到第二份模块实例（缓存/异常类/全局状态各一份），
+    调试时极难定位，所以由调用方把真实模块传进来。
+    """
+    global manager
+    manager = module
+
 WEB_CONFIG_NAME = 'web.json'
 SESSION_COOKIE = 'frpweb'
 CSRF_HEADER = 'X-CSRF-Token'
 ESCAPE_WINDOW_SECONDS = 300
+MAX_BODY_BYTES = 1024 * 1024      # 单个请求体上限 1MB
 
 DEFAULT_CONFIG = {
     'schema_version': 1,
@@ -65,11 +78,14 @@ def load_web_config():
     if not isinstance(data, dict):
         data = {}
     cfg = dict(DEFAULT_CONFIG)
-    cfg.update({k: v for k, v in data.items() if k in DEFAULT_CONFIG})
+    cfg.update(data)                    # 保留未知键，避免 schema 演进时被静默丢弃
     try:
         cfg['port'] = int(cfg['port'])
     except (TypeError, ValueError):
         cfg['port'] = DEFAULT_CONFIG['port']
+    if not 1 <= cfg['port'] <= 65535:
+        cfg['port'] = DEFAULT_CONFIG['port']
+        cfg['_port_invalid'] = True
     for key in ('idle_timeout_minutes', 'login_max_failures', 'login_lock_minutes'):
         try:
             cfg[key] = int(cfg[key])
@@ -84,11 +100,13 @@ def save_web_config(cfg):
     """原子写入 web.json（0600），并保留上一份为 .bak 作为回滚点。"""
     path = web_config_path()
     if path.exists():
+        bak = path.parent / (WEB_CONFIG_NAME + '.bak')
         try:
-            (path.parent / (WEB_CONFIG_NAME + '.bak')).write_bytes(path.read_bytes())
-        except OSError:
+            manager.atomic(bak, path.read_text(encoding='utf-8'))
+            os.chmod(str(bak), 0o600)
+        except (OSError, ValueError):
             pass
-    payload = {k: cfg.get(k, DEFAULT_CONFIG.get(k)) for k in DEFAULT_CONFIG}
+    payload = dict(cfg)                 # 写回全部键（含扩展字段）
     manager.atomic(path, json.dumps(payload, ensure_ascii=False, indent=2) + '\n')
     try:
         os.chmod(str(path), 0o600)
@@ -112,6 +130,8 @@ def verify_password(password, stored):
     try:
         iterations = int(iterations)
     except (TypeError, ValueError):
+        return False
+    if not 1000 <= iterations <= 2000000:
         return False
     digest = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), iterations)
     return hmac.compare_digest(digest.hex(), expected)
@@ -140,6 +160,9 @@ def web_audit(action, client_ip='', username='', result='ok', detail=''):
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with path.open('a', encoding='utf-8') as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + '\n')
+        if os.name != 'nt':
+            try: os.chmod(str(path), 0o600)
+            except OSError: pass
     except OSError:
         pass
 
@@ -157,9 +180,13 @@ class SessionStore(object):
     def create(self, username):
         token = secrets.token_urlsafe(32)
         csrf = secrets.token_urlsafe(24)
+        now = time.time()
         with self._lock:
-            self._items[token] = {'user': username, 'csrf': csrf,
-                                  'seen': time.time()}
+            # 顺手清理过期会话，避免长期运行内存无界增长
+            for key in [k for k, v in self._items.items()
+                        if now - v['seen'] > self._idle]:
+                self._items.pop(key, None)
+            self._items[token] = {'user': username, 'csrf': csrf, 'seen': now}
         return token, csrf
 
     def get(self, token):
@@ -176,6 +203,13 @@ class SessionStore(object):
     def drop(self, token):
         with self._lock:
             self._items.pop(token, None)
+
+    def remaining(self, token):
+        """会话剩余秒数（前端显示倒计时用）。"""
+        with self._lock:
+            item = self._items.get(token)
+            if not item: return 0
+            return max(0, int(self._idle - (time.time() - item['seen'])))
 
 
 class LoginLimiter(object):
@@ -196,6 +230,12 @@ class LoginLimiter(object):
 
     def fail(self, ip):
         with self._lock:
+            now = time.time()
+            # 只保留仍在锁定中或最近有失败的记录，防止大量不同 IP 撑爆内存
+            if len(self._state) > 1024:
+                for key in [k for k, v in self._state.items()
+                            if v.get('until', 0) < now and not v.get('count')]:
+                    self._state.pop(key, None)
             item = self._state.setdefault(ip, {'count': 0, 'until': 0})
             item['count'] += 1
             if item['count'] >= self.max_failures:
@@ -211,11 +251,18 @@ class LoginLimiter(object):
 # ---------------------------------------------------------------- 请求上下文
 
 class HttpError(Exception):
-    def __init__(self, status, message, code=None):
+    """带"原因 + 建议"的错误（与终端 result_error 的四要素保持一致）。"""
+
+    def __init__(self, status, message, code=None, hint='', retry_after=None,
+                 details=None):
         Exception.__init__(self, message)
         self.status = status
         self.message = message
-        self.code = code or status
+        # code 统一为字符串，前端可以稳定 switch（避免 401 与 'E401' 混用）
+        self.code = str(code) if code is not None else 'E%d' % status
+        self.hint = hint
+        self.retry_after = retry_after
+        self.details = details or []
 
 
 class RequestContext(object):
@@ -282,14 +329,31 @@ class WebApp(object):
             return {}
         return {k: v.value for k, v in jar.items()}
 
+    def escape_summary(self):
+        """当前逃生窗口状态（无窗口时返回 None）。"""
+        with self.escape_lock:
+            if not self.escape: return None
+            remaining = int(self.escape.get('until', 0) - time.time())
+            if remaining <= 0: return None
+            return {'old': self.escape.get('old'), 'new': self.escape.get('new'),
+                    'seconds_left': remaining}
+
     def require_auth(self, ctx):
         session = self.current_session(ctx)
         if not session:
             raise HttpError(401, '未登录或会话已过期', 'E401')
         if ctx.method not in ('GET', 'HEAD'):
             token = ctx.headers.get(CSRF_HEADER, '')
-            if not token or not hmac.compare_digest(token, session['csrf']):
-                raise HttpError(403, 'CSRF 校验失败，请刷新页面重试', 'E403')
+            try:
+                token_ok = bool(token) and token.isascii() \
+                    and hmac.compare_digest(token, session['csrf'])
+            except (TypeError, ValueError):
+                token_ok = False
+            if not token_ok:
+                web_audit('csrf-failed', ctx.client_ip,
+                          session['user'] if session else '', 'failed')
+                raise HttpError(403, 'CSRF 校验失败，请刷新页面重试', 'E_CSRF',
+                                hint='页面可能已过期，刷新后重试')
         return session
 
 
@@ -311,6 +375,8 @@ def send_json(handler, payload, status=200, extra_headers=None):
     handler.send_header('Content-Length', str(len(body)))
     _common_headers(handler, extra_headers)
     handler.end_headers()
+    if getattr(handler, 'command', '') == 'HEAD':
+        return                       # HEAD 不能带 body，否则污染后续响应
     try:
         handler.wfile.write(body)
     except (BrokenPipeError, ConnectionResetError):
@@ -324,14 +390,54 @@ def ok(handler, data=None, **extra):
     send_json(handler, payload)
 
 
-def fail(handler, status, message, code=None):
-    send_json(handler, {'ok': False, 'code': code or status, 'error': message}, status)
+def fail(handler, status, message, code=None, hint='', retry_after=None,
+         details=None, request_id=''):
+    payload = {'ok': False, 'code': str(code) if code is not None else 'E%d' % status,
+               'error': message}
+    if hint: payload['hint'] = hint
+    if retry_after: payload['retry_after'] = int(retry_after)
+    if details: payload['details'] = details
+    payload['request_id'] = request_id or secrets.token_hex(6)
+    send_json(handler, payload, status, extra_headers={'X-Request-Id': payload['request_id']})
 
 
 # ---------------------------------------------------------------- API 处理
 
+_SERVICE_TONE = {
+    'running': ('ok', ), 'active': ('ok', ), 'started': ('ok', ),
+    'stopped': ('err', ), 'inactive': ('err', ), 'dead': ('err', ),
+    'failed': ('err', ),
+    'starting': ('warn', ), 'activating': ('warn', ),
+    'stopping': ('warn', ), 'deactivating': ('warn', ),
+    'not-installed': ('muted', ), 'unknown': ('warn', ),
+}
+_CONNECTION_TONE = {
+    'connected': 'ok', 'connecting': 'warn',
+    'auth-failed': 'err', 'tls-failed': 'err', 'config-error': 'err',
+    'proxy-error': 'err', 'unreachable': 'err', 'disconnected': 'err',
+    'timeout': 'warn', 'not-configured': 'warn', 'stopped': 'err',
+    'unknown': 'warn',
+}
+
+def _state_view(raw, table):
+    """把后台枚举转成 {raw, label, tone}，前端只负责展示。"""
+    key = str(raw or '').lower()
+    label = manager.SERVICE_STATES.get(key) or manager.CONNECTION_STATES.get(key) or raw or '未知'
+    if isinstance(table.get(key), tuple):
+        tone = table[key][0]
+    else:
+        tone = table.get(key, 'warn')
+    return {'raw': raw, 'label': label, 'tone': tone}
+
+
 def api_health(ctx):
-    return {'status': 'ok', 'version': manager.installed_manager_version()}
+    """公开接口：前端登录页据此判断是否首次使用。"""
+    cfg = ctx.app.config
+    first_run = bool(cfg.get('must_change_password'))
+    return {'status': 'ok', 'first_run': first_run}
+
+
+
 
 
 def api_session(ctx):
@@ -346,14 +452,25 @@ def api_login(ctx):
     app = ctx.app
     locked = app.limiter.locked(ctx.client_ip)
     if locked:
-        raise HttpError(429, '登录失败次数过多，请 %d 秒后再试' % locked, 'E429')
+        raise HttpError(429, '登录失败次数过多，已临时锁定',
+                        'E_AUTH_LOCKED', hint='等待倒计时结束，或重启 Web 服务立即解除',
+                        retry_after=locked)
     if not username or not password:
-        raise HttpError(400, '用户名和密码不能为空')
+        raise HttpError(400, '用户名和密码不能为空', 'E_INVALID',
+                        details=[{'field': 'username' if not username else 'password',
+                                  'message': '不能为空'}])
     cfg = app.config
-    if username != cfg.get('username') or not verify_password(password, cfg.get('password_hash')):
+    # 先算密码再比用户名：用户名错误时也付出同样的 PBKDF2 代价，
+    # 避免通过响应时间判断"账号是否存在"
+    password_ok = verify_password(password, cfg.get('password_hash'))
+    username_ok = (username == cfg.get('username'))
+    if not (username_ok and password_ok):
         app.limiter.fail(ctx.client_ip)
-        web_audit('login', ctx.client_ip, username, 'failed')
-        raise HttpError(401, '用户名或密码错误', 'E401')
+        web_audit('login', ctx.client_ip, username[:64], 'failed')
+        raise HttpError(401, '用户名或密码错误', 'E_AUTH_FAILED',
+                        hint='连续失败 %d 次将锁定 %d 分钟'
+                             % (cfg.get('login_max_failures', 5),
+                                cfg.get('login_lock_minutes', 15)))
     app.limiter.reset(ctx.client_ip)
     token, csrf = app.sessions.create(username)
     web_audit('login', ctx.client_ip, username, 'ok')
@@ -374,20 +491,36 @@ def api_logout(ctx):
     if token:
         ctx.app.sessions.drop(token)
         web_audit('logout', ctx.client_ip, ctx.session['user'] if ctx.session else '')
-    return {'logged_out': True}
+    # 同时让浏览器丢弃 Cookie，否则残留的无效 Cookie 会一直带着
+    ctx.handler.send_response(200)
+    ctx.handler.send_header('Content-Type', 'application/json; charset=utf-8')
+    ctx.handler.send_header(
+        'Set-Cookie', '%s=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict' % SESSION_COOKIE)
+    body = json.dumps({'ok': True, 'code': 0, 'error': None,
+                       'logged_out': True}).encode('utf-8')
+    ctx.handler.send_header('Content-Length', str(len(body)))
+    _common_headers(ctx.handler)
+    ctx.handler.end_headers()
+    ctx.handler.wfile.write(body)
 
 
 def api_status(ctx):
-    ctx.app.require_auth(ctx)
+    session = ctx.app.require_auth(ctx)
     data = manager.status('frpc')
+    conn_raw = (data.get('connection') or {}).get('state')
     return {
         'service_state': data.get('service_state'),
-        'connection_state': (data.get('connection') or {}).get('state'),
+        'service_view': _state_view(data.get('service_state'), _SERVICE_TONE),
+        'connection_state': conn_raw,
+        'connection_view': _state_view(conn_raw, _CONNECTION_TONE),
         'version': data.get('version'),
         'pending': bool(data.get('pending')),
         'manager_version': manager.installed_manager_version(),
         'active_profile': _profile_brief(data.get('active_profile')),
         'profile_error': data.get('profile_error'),
+        'concerns': manager.status_concerns('frpc', data),
+        'session': {'user': session['user'],
+                    'expires_in': ctx.app.sessions.remaining(ctx.session_token)},
     }
 
 
@@ -398,30 +531,203 @@ def _profile_brief(profile):
             'server_port': profile.get('server_port')}
 
 
+def api_service(ctx, action):
+    """服务控制：start / stop / restart。
+
+    restart 支持 {mode:'detached'} —— 用户在映射隧道里操作时，
+    立即重启会切断自己的连接，改由脱离会话的进程延迟重启。
+    """
+    ctx.app.require_auth(ctx)
+    if action == 'start':
+        manager.require_active()
+    if action == 'restart':
+        data = ctx.json_body() if ctx.body else {}
+        mode = str(data.get('mode', 'now')).lower()
+        if mode == 'detached':
+            manager.schedule_detached_restart('frpc', delay=2)
+            web_audit('service-restart', ctx.client_ip, ctx.session['user'], 'scheduled')
+            return {'action': 'restart', 'mode': 'detached',
+                    'message': '已在后台计划重启，当前连接若经映射会短暂断开'}
+    with ctx.app.write_lock:
+        manager.service('frpc', action)
+    web_audit('service-' + action, ctx.client_ip, ctx.session['user'], 'ok')
+    state = manager.status('frpc')
+    conn = (state.get('connection') or {}).get('state')
+    return {'action': action,
+            'service_state': state.get('service_state'),
+            'service_view': _state_view(state.get('service_state'), _SERVICE_TONE),
+            'connection_view': _state_view(conn, _CONNECTION_TONE)}
+
+
+def api_service_start(ctx): return api_service(ctx, 'start')
+def api_service_stop(ctx): return api_service(ctx, 'stop')
+def api_service_restart(ctx): return api_service(ctx, 'restart')
+
+
 def api_overview(ctx):
     ctx.app.require_auth(ctx)
     data = manager.status('frpc')
     profile = data.get('active_profile')
-    mappings, online = [], {}
+    mappings, mappings_error = [], None
     if isinstance(profile, dict):
         try:
             mappings = manager.mappings(profile['id'])
-        except (ValueError, OSError, KeyError, TypeError):
-            mappings = []
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            # 读取失败绝不能伪装成"没有映射"，否则用户会去点"新增"而不是"修权限"
+            mappings_error = str(exc)
     enabled = [m for m in mappings if m.get('enabled', True)]
+    # 在线状态来自 frpc 本地 admin API（读不到时整体为 None，前端显示"未知"而非假 0）
+    # _proxy_status_map 返回 None 表示"读不到"（frpc 未运行），此时应显示未知而非 0
+    online_map = None
+    if isinstance(profile, dict):
+        try:
+            online_map = manager.mapping_online_status(profile['id'])
+        except (ValueError, OSError, KeyError, TypeError):
+            online_map = None
+    online_count = (sum(1 for m in enabled if online_map.get(str(m.get('name'))))
+                    if online_map is not None else None)
+    conn_raw = (data.get('connection') or {}).get('state')
     return {
         'service_state': data.get('service_state'),
-        'connection_state': (data.get('connection') or {}).get('state'),
+        'service_view': _state_view(data.get('service_state'), _SERVICE_TONE),
+        'connection_state': conn_raw,
+        'connection_view': _state_view(conn_raw, _CONNECTION_TONE),
         'version': data.get('version'),
         'manager_version': manager.installed_manager_version(),
         'pending': bool(data.get('pending')),
+        'concerns': manager.status_concerns('frpc', data),
+        'mappings_error': mappings_error,
         'active_profile': _profile_brief(profile),
         'counts': {'total': len(mappings), 'enabled': len(enabled),
-                   'online': sum(1 for m in enabled if online.get(m.get('name'))),
-                   'offline': 0},
+                   'online': online_count,
+                   'offline': (len(enabled) - online_count) if online_count is not None else None},
         'listener': {'bind': ctx.app.config.get('bind'), 'port': ctx.app.config.get('port')},
         'expose': ctx.app.escape_summary(),
     }
+
+
+def _sse_start(ctx):
+    """给 SSE 响应写头。返回 False 表示已出错。"""
+    handler = ctx.handler
+    handler.send_response(200)
+    handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+    handler.send_header('Cache-Control', 'no-cache')
+    handler.send_header('Connection', 'close')
+    handler.send_header('X-Accel-Buffering', 'no')     # Nginx 反代下禁用缓冲
+    handler.close_connection = True                    # 流式响应不复用连接
+    handler.end_headers()
+    return True
+
+
+def _sse_write(handler, event, data):
+    payload = 'event: %s\ndata: %s\n\n' % (event, json.dumps(data, ensure_ascii=False))
+    handler.wfile.write(payload.encode('utf-8'))
+    handler.wfile.flush()
+
+
+def api_events(ctx):
+    """SSE：状态变化推送（每 3 秒一次快照，值不变时不推）。"""
+    ctx.app.require_auth(ctx)
+    _sse_start(ctx)
+    last = None
+    try:
+        while True:
+            try:
+                data = manager.status('frpc')
+                conn = (data.get('connection') or {}).get('state')
+                snapshot = {
+                    'service_state': data.get('service_state'),
+                    'service_view': _state_view(data.get('service_state'), _SERVICE_TONE),
+                    'connection_state': conn,
+                    'connection_view': _state_view(conn, _CONNECTION_TONE),
+                    'pending': bool(data.get('pending')),
+                }
+            except (ValueError, OSError) as exc:
+                snapshot = {'error': str(exc)}
+            if snapshot != last:
+                _sse_write(ctx.handler, 'status', snapshot)
+                last = snapshot
+            else:
+                ctx.handler.wfile.write(b': ping\n\n')
+                ctx.handler.wfile.flush()
+            time.sleep(3)
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        return None
+
+
+def api_logs_stream(ctx):
+    """SSE：日志尾随（按行增量推送）。"""
+    ctx.app.require_auth(ctx)
+    path = manager.ROOT / 'logs' / 'frpc.log'
+    _sse_start(ctx)
+    offset = 0
+    try:
+        # 首次推送最近 100 行，之后增量
+        if path.exists():
+            size = path.stat().st_size
+            with path.open('rb') as handle:
+                handle.seek(max(0, size - 256 * 1024))
+                tail = handle.read().decode('utf-8', errors='replace').splitlines()[-100:]
+            for line in tail:
+                _sse_write(ctx.handler, 'log', {'line': line})
+            offset = size
+        while True:
+            if not path.exists():
+                time.sleep(1); continue
+            size = path.stat().st_size
+            if size < offset:            # 日志被轮转
+                offset = 0
+                _sse_write(ctx.handler, 'reset', {})
+            if size > offset:
+                with path.open('rb') as handle:
+                    handle.seek(offset)
+                    chunk = handle.read(size - offset).decode('utf-8', errors='replace')
+                offset = size
+                for line in chunk.splitlines():
+                    _sse_write(ctx.handler, 'log', {'line': line})
+            else:
+                ctx.handler.wfile.write(b': ping\n\n')
+                ctx.handler.wfile.flush()
+                time.sleep(1)
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        return None
+
+
+def api_audit(ctx):
+    """读取 Web 审计日志（最近 N 条，可按结果过滤）。"""
+    ctx.app.require_auth(ctx)
+    try:
+        limit = int(ctx.param('limit', '50'))
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(500, limit))
+    path = manager.ROOT / 'logs' / 'web-audit.jsonl'
+    rows = []
+    if path.exists():
+        try:
+            text = path.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            text = ''
+        for line in text.splitlines()[-limit:]:
+            try: rows.append(json.loads(line))
+            except ValueError: continue
+    return {'items': rows, 'limit': limit}
+
+
+def api_logs(ctx):
+    """读取最近 N 行日志（非流式，供下载/首屏）。"""
+    ctx.app.require_auth(ctx)
+    try:
+        lines = int(ctx.param('lines', '200'))
+    except (TypeError, ValueError):
+        lines = 200
+    lines = max(1, min(2000, lines))
+    path = manager.ROOT / 'logs' / 'frpc.log'
+    if not path.exists():
+        return {'lines': [], 'path': str(path), 'exists': False}
+    content = path.read_text(encoding='utf-8', errors='replace').splitlines()
+    return {'lines': content[-lines:], 'path': str(path), 'exists': True,
+            'total': len(content)}
 
 
 # ---------------------------------------------------------------- 路由
@@ -433,23 +739,48 @@ ROUTES = [
     ('GET',    r'^/api/session$',       api_session,  True),
     ('GET',    r'^/api/status$',        api_status,   True),
     ('GET',    r'^/api/overview$',      api_overview, True),
+    ('GET',    r'^/api/events$',        api_events,   True),
+    ('GET',    r'^/api/logs$',          api_logs,     True),
+    ('GET',    r'^/api/logs/stream$',   api_logs_stream, True),
+    ('GET',    r'^/api/audit$',         api_audit,    True),
+    ('POST',   r'^/api/service/start$',   api_service_start,   True),
+    ('POST',   r'^/api/service/stop$',    api_service_stop,    True),
+    ('POST',   r'^/api/service/restart$', api_service_restart, True),
 ]
 
 
 def _match_route(method, path):
+    """按 path 匹配路由，再校验 method。
+
+    返回 (handler, match, needs_auth, allowed_methods)：
+      - 命中 → handler 非空
+      - path 存在但方法不对 → handler 为 None 且 allowed 非空（调用方回 405）
+      - 完全不存在 → 全为 None
+    HEAD 自动复用 GET 处理器（RFC 7231）。
+    """
+    allowed = []
     for verb, pattern, handler, needs_auth in ROUTES:
-        if verb != method: continue
         match = re.match(pattern, path)
-        if match:
-            return handler, match, needs_auth
-    return None, None, False
+        if not match: continue
+        if verb == method or (method == 'HEAD' and verb == 'GET'):
+            return handler, match, needs_auth, None
+        allowed.append(verb)
+    if method == 'HEAD' and 'GET' in allowed:
+        return None, None, False, None
+    if allowed:
+        if 'GET' in allowed and 'HEAD' not in allowed:
+            allowed.append('HEAD')
+        return None, None, False, sorted(set(allowed))
+    return None, None, False, None
 
 
 # ---------------------------------------------------------------- HTTP 处理器
 
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = 'frp-simple-bash-web'
+    sys_version = ''                    # 不暴露 Python 版本
     protocol_version = 'HTTP/1.1'
+    timeout = 15                        # 单个请求的 socket 超时，防 slowloris
 
     def log_message(self, fmt, *args):
         # 不把每个请求打到 stdout（避免噪声与潜在敏感 URL 泄漏）
@@ -457,17 +788,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _dispatch(self, method):
         app = self.server.app
-        parsed = urllib.parse.urlsplit(self.path)
-        path = parsed.path
-        query = urllib.parse.parse_qs(parsed.query)
+        try:
+            parsed = urllib.parse.urlsplit(self.path)
+            path = parsed.path
+            query = urllib.parse.parse_qs(parsed.query, max_num_fields=50)
+        except (ValueError, UnicodeError):
+            self.close_connection = True
+            fail(self, 400, '请求地址不合法', 'E_BAD_REQUEST')
+            return
         length = 0
         try:
             length = int(self.headers.get('Content-Length') or 0)
         except (TypeError, ValueError):
             length = 0
+        if length > MAX_BODY_BYTES or length < 0:
+            # 未读取的 body 会残留到下一次请求，必须关连接
+            self.close_connection = True
+            fail(self, 413, '请求体过大（上限 %d 字节）' % MAX_BODY_BYTES, 'E413')
+            return
         body = self.rfile.read(length) if length > 0 else b''
-        if path.startswith('/api/'):
-            handler, _match, needs_auth = _match_route(method, path)
+        transfer = (self.headers.get('Transfer-Encoding') or '').lower()
+        if transfer and transfer != 'identity':
+            self.close_connection = True
+            fail(self, 411, '不支持 Transfer-Encoding，请改用 Content-Length', 'E_LENGTH')
+            return
+        if path == '/api' or path.startswith('/api/'):
+            handler, _match, needs_auth, allowed = _match_route(method, path)
+            if handler is None and allowed:
+                send_json(self, {'ok': False, 'code': 'E_METHOD',
+                                 'error': '该接口不支持 %s 方法' % method,
+                                 'request_id': secrets.token_hex(6)},
+                          405, extra_headers={'Allow': ', '.join(allowed)})
+                return
             if handler is None:
                 fail(self, 404, '接口不存在：%s %s' % (method, path), 'E404')
                 return
@@ -480,13 +832,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if result is not None:
                     ok(self, result if isinstance(result, dict) else {'data': result})
             except HttpError as exc:
-                fail(self, exc.status, exc.message, exc.code)
+                request_id = secrets.token_hex(6)
+                if exc.status >= 500:
+                    web_audit('http-error', ctx.client_ip, result='error',
+                              detail='%s: %s' % (exc.code, exc.message))
+                fail(self, exc.status, exc.message, exc.code, exc.hint,
+                     exc.retry_after, exc.details, request_id)
             except manager.QuitProgram:
-                fail(self, 500, '操作被中止')
-            except (ValueError, OSError, KeyError, TypeError) as exc:
-                fail(self, 400, str(exc))
+                fail(self, 500, '操作被中止', 'E_ABORTED',
+                     hint='请重试；若反复出现请查看服务日志')
+            except ValueError as exc:
+                # 业务校验失败：文案本身是可读中文，直接回给用户
+                fail(self, 400, str(exc), 'E_INVALID',
+                     hint='请按提示修正后重试')
+            except OSError as exc:
+                # 磁盘/权限类问题属于服务端故障，不是用户输入错误
+                web_audit('io-error', ctx.client_ip, result='error',
+                          detail='%s: %s' % (type(exc).__name__, exc))
+                fail(self, 500, '写入配置失败（磁盘或权限问题）', 'E_IO',
+                     hint='检查 /etc/frp 目录权限与磁盘空间，详见服务日志')
+            except (KeyError, TypeError) as exc:
+                web_audit('internal-error', ctx.client_ip, result='error',
+                          detail='%s: %s' % (type(exc).__name__, exc))
+                fail(self, 500, '服务内部错误', 'E_INTERNAL',
+                     hint='请重试；若反复出现请查看审计日志')
             except Exception as exc:                      # 兜底，避免连接直接断
-                fail(self, 500, '服务器内部错误：%s' % exc)
+                web_audit('internal-error', ctx.client_ip, result='error',
+                          detail='%s: %s' % (type(exc).__name__, exc))
+                fail(self, 500, '服务器内部错误', 'E_INTERNAL',
+                     hint='请查看服务日志或审计日志')
             return
         if method in ('GET', 'HEAD'):
             self._serve_static(path)
@@ -505,10 +879,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         app = self.server.app
         dist = app.dist_dir
         if not dist.is_dir():
-            self._send_text(500, '前端资源缺失：%s 不存在（请重新安装或构建）' % dist)
+            web_audit('static-missing', result='error', detail=str(dist))
+            self._send_text(500, '前端资源缺失，请重新安装 frp-simple-bash（详见服务日志）')
             return
         relative = path.lstrip('/') or 'index.html'
-        if relative.startswith('assets/'):
+        in_assets = relative.startswith('assets/')
+        if in_assets:
             target = (dist / relative)
         elif relative == 'index.html' or '.' not in Path(relative).name:
             target = dist / 'index.html'          # SPA fallback
@@ -537,9 +913,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(content)))
         self.send_header('ETag', etag)
-        cache = 'public, max-age=31536000, immutable' if relative.startswith('assets/') else 'no-cache'
+        # 只有真实位于 dist/assets 下的文件才可长缓存
+        try:
+            real_assets = (dist / 'assets').resolve()
+            immutable = (resolved.parent == real_assets)
+        except OSError:
+            immutable = False
+        cache = 'public, max-age=31536000, immutable' if immutable else 'no-cache'
         self.send_header('Cache-Control', cache)
         self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        # 前端只加载同源资源，禁止内联脚本与外部域
+        self.send_header('Content-Security-Policy',
+                         "default-src 'self'; img-src 'self' data:; "
+                         "style-src 'self' 'unsafe-inline'; script-src 'self'; "
+                         "connect-src 'self'; frame-ancestors 'none'")
         self.end_headers()
         if self.command != 'HEAD':
             try:
@@ -566,6 +955,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         _common_headers(self)
         self.end_headers()
+        if self.command == 'HEAD':
+            return
         try:
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
@@ -574,10 +965,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 # ---------------------------------------------------------------- 服务器
 
+MAX_CONCURRENT = 64          # 并发连接上限，防未认证的 slowloris 耗尽线程
+_conn_slots = threading.BoundedSemaphore(MAX_CONCURRENT)
+
+
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    allow_reuse_address = os.name != 'nt'   # Windows 的 SO_REUSEADDR 会允许重复绑定
     app = None
+
+    def process_request(self, request, client_address):
+        # 超出上限时直接拒绝，避免线程无界增长
+        if not _conn_slots.acquire(blocking=False):
+            try:
+                request.sendall(b'HTTP/1.1 503 Service Unavailable\r\n'
+                                b'Content-Length: 0\r\nConnection: close\r\n\r\n')
+            except OSError:
+                pass
+            try: request.close()
+            except OSError: pass
+            return
+        try:
+            socketserver.ThreadingMixIn.process_request(self, request, client_address)
+        except Exception:
+            _conn_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            socketserver.ThreadingMixIn.process_request_thread(self, request, client_address)
+        finally:
+            _conn_slots.release()
 
 
 def _make_server(app, bind, port):
@@ -601,20 +1019,25 @@ def _shutdown_listener(entry):
     except Exception: pass
 
 
-# 逃生窗口：Web 端改端口/绑定时，新监听起来后旧监听继续服务一段时间
-def _escape_summary(self):
-    with self.escape_lock:
-        if not self.escape: return None
-        remaining = int(self.escape.get('until', 0) - time.time())
-        if remaining <= 0: return None
-        return {'old': self.escape.get('old'), 'new': self.escape.get('new'),
-                'seconds_left': remaining}
 
-
-WebApp.escape_summary = _escape_summary
 
 
 # ---------------------------------------------------------------- 入口
+
+def _port_available(bind, port):
+    """端口能否绑定（仅检测，不占用）。"""
+    import socket
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind((str(bind), int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        try: probe.close()
+        except OSError: pass
+
 
 def run(bind=None, port=None, foreground=True, open_browser=False):
     """启动 Web 管理端（常驻服务与前台运行共用此入口）。"""
@@ -642,18 +1065,26 @@ def run(bind=None, port=None, foreground=True, open_browser=False):
         print('    用户名：%s' % cfg.get('username'))
         print('    密码　：%s' % generated)
     web_audit('start', result='ok', detail='%s:%d' % (bind, port))
-    if not foreground:
-        # 常驻服务模式：主线程阻塞等待
-        try:
-            while True: time.sleep(3600)
-        except KeyboardInterrupt:
-            pass
-    else:
-        try:
-            while True: time.sleep(3600)
-        except KeyboardInterrupt:
-            pass
-    _shutdown_listener(app.listeners[0])
+    # 前台与常驻服务共用同一阻塞逻辑：服务线程已在后台跑，主线程等待退出信号。
+    # systemd/launchd 停止服务发的是 SIGTERM，必须接住否则直接硬杀（请求被切断）。
+    stop_event = threading.Event()
+
+    def _on_signal(signum, _frame):
+        stop_event.set()
+
+    for signame in ('SIGTERM', 'SIGINT'):
+        signum = getattr(signal, signame, None)
+        if signum is not None:
+            try: signal.signal(signum, _on_signal)
+            except (ValueError, OSError): pass
+    try:
+        stop_event.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        web_audit('stop', result='ok')
+        for entry in list(app.listeners):
+            _shutdown_listener(entry)
 
 
 def main(argv=None):
@@ -674,10 +1105,15 @@ def main(argv=None):
         if item in ('--port', '--set-port') and i + 1 < len(argv):
             if item == '--set-port':
                 cfg = load_web_config()
-                try: cfg['port'] = int(argv[i + 1])
+                try: new_port = int(argv[i + 1])
                 except ValueError: raise ValueError('端口必须是数字')
+                if not 1 <= new_port <= 65535:
+                    raise ValueError('端口必须在 1-65535 之间')
+                if not _port_available(cfg.get('bind', '127.0.0.1'), new_port):
+                    raise ValueError('端口 %d 已被占用，请换一个' % new_port)
+                cfg['port'] = new_port
                 save_web_config(cfg)
-                print('已保存端口：%s' % argv[i + 1])
+                print('已保存端口：%d（重启 Web 服务后生效）' % new_port)
             else:
                 port = int(argv[i + 1])
             i += 2; continue

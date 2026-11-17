@@ -1780,6 +1780,13 @@ def _table(headers, rows, widths):
         lines.append('  ' + ''.join(_pad_line(str(c), w) for c, w in zip(row, widths)))
     return '\n'.join(lines)
 
+def mapping_online_status(pid):
+    """映射在线状态 {name: bool}；None 表示读不到（frpc 未运行/管理端口不可达）。
+
+    对外的公有封装：Web 端等外部调用方不应直接碰私有函数。
+    """
+    return _proxy_status_map(pid)
+
 def _proxy_status_map(pid):
     """Best-effort {proxy_name: True/False} online state from the local admin API."""
     try:
@@ -1789,14 +1796,16 @@ def _proxy_status_map(pid):
         rows = [x for group in data.values() if isinstance(group, list) for x in group if isinstance(x, dict)]
         return {str(r.get('name', '')): (r.get('status') in ('online', 'running')) for r in rows}
     except (OSError, ValueError, KeyError, TypeError):
-        return {}
+        # None 表示"读不到"（frpc 未运行/管理端口不可达），与"没有在线映射"区分开，
+        # 上层可以据此显示"未知"而不是谎报 0 在线
+        return None
 
 def show_mappings(items, pid=None):
     """Mapping table with an online column so 'enabled' is not confused with 'working'."""
     if not items:
         result_info('当前服务端暂无端口映射。'); return
     section('当前服务端端口映射')
-    online = _proxy_status_map(pid) if pid else {}
+    online = (_proxy_status_map(pid) if pid else None) or {}
     rows = []
     try:
         prof = load_profile(pid) if pid else {}
@@ -2585,6 +2594,36 @@ def status_bar(role, data):
         parts.append(color_state('有待重启修改'))
     print('  ' + ' | '.join(str(p) for p in parts if p))
 
+def status_concerns(role, data):
+    """需要用户处理的事项（终端与 Web 共用同一份判定，避免逻辑漂移）。
+
+    返回 [{'level': 'err'|'warn', 'text': str}]。
+    「有修改等待重启」不在这里——它由状态块/状态带单独显示，避免重复。
+    """
+    concerns = []
+    state = str(data.get('service_state', '')).lower()
+    if state in ('failed', 'inactive', 'stopped'):
+        concerns.append({'level': 'err', 'text': '服务未运行，可先用「启动」或查看日志排查'})
+    if role == 'frpc':
+        conn = (data.get('connection') or {}).get('state', '')
+        if conn in ('auth-failed', 'tls-failed', 'config-error'):
+            concerns.append({'level': 'err',
+                             'text': '连接未就绪（' + CONNECTION_STATES.get(conn, conn)
+                                     + '）：检查 token / TLS / 服务端地址'})
+        elif conn in ('proxy-error', 'unreachable', 'disconnected'):
+            concerns.append({'level': 'err',
+                             'text': '连接异常（' + CONNECTION_STATES.get(conn, conn)
+                                     + '）：检查网络与服务端状态'})
+        elif conn in ('timeout', 'connecting'):
+            concerns.append({'level': 'warn',
+                             'text': '连接未完成（' + CONNECTION_STATES.get(conn, conn)
+                                     + '）：可稍后刷新或查看诊断'})
+        if data.get('profile_error'):
+            concerns.append({'level': 'err',
+                             'text': '当前服务端配置损坏：' + str(data['profile_error'])
+                                     + '；可从「备份与恢复」恢复或重新选择服务端'})
+    return concerns
+
 def _status_body(role, data):
     """Print the compact status fields and the 'needs attention' list (no title).
 
@@ -2624,23 +2663,14 @@ def _status_body(role, data):
             except (ValueError, OSError, KeyError, TypeError): print(_kv('映射数量', '不可读'))
             if data.get('pending'): print(_kv('生效', color_state('有修改等待重启')))
     # Surface only what needs attention; normal details stay compact.
-    concerns = []
-    state = str(data['service_state']).lower()
-    if state in ('failed', 'inactive', 'stopped'):
-        concerns.append('服务未运行，可先用「启动」或查看日志排查')
-    if role == 'frpc':
-        conn = data.get('connection', {}).get('state', '')
-        if conn in ('auth-failed', 'tls-failed', 'proxy-error', 'timeout', 'connecting', 'config-error', 'unreachable', 'disconnected'):
-            concerns.append('连接未就绪（' + CONNECTION_STATES.get(conn, conn) + '）：检查 token / TLS / 服务端可达性')
-        if data.get('profile_error'):
-            concerns.append('当前服务端配置损坏：' + str(data['profile_error']) + '；可从「备份与恢复配置」恢复或重新选择服务端')
-        # 「生效：有修改等待重启」已在上面一行显示，这里不再重复（避免同一事实出现两次）
+    concerns = status_concerns(role, data)
     if concerns:
         print()
         head = '\033[1;31m需关注\033[0m' if UI_COLOR else '需关注'
         print('  ' + head + '（以下事项需要处理）：')
         for c in concerns:
-            print('    - ' + color_state(c) if UI_COLOR else '    - ' + c)
+            text = c['text'] if isinstance(c, dict) else str(c)
+            print('    - ' + color_state(text) if UI_COLOR else '    - ' + text)
 
 def show_status(role, data=None):
     """Render a standalone status screen (title + body + rule)."""
@@ -5105,6 +5135,7 @@ UPGRADE_FILES = (
     'bin/frps.cmd', 'bin/frpc.cmd',
     'templates/frps.service', 'templates/frpc.service',
     'templates/frps.openrc', 'templates/frpc.openrc', 'templates/frpc.plist',
+    'lib/webui.py',
 )
 
 def upgrade_snapshot():
@@ -5115,8 +5146,14 @@ def upgrade_snapshot():
     staging = base / ('.staging-' + name)
     staging.mkdir(parents=True, mode=0o700)
     try:
+        targets = list(UPGRADE_FILES)
+        # web/dist 下的资源名带构建哈希，无法枚举，按目录整体快照
+        dist = INSTALL_ROOT / 'web' / 'dist'
+        if dist.is_dir():
+            targets.extend(str(p.relative_to(INSTALL_ROOT))
+                           for p in sorted(dist.rglob('*')) if p.is_file())
         copied, digests = [], {}
-        for rel in UPGRADE_FILES:
+        for rel in targets:
             src = INSTALL_ROOT / rel
             if not src.is_file() or src.is_symlink(): continue
             dst = staging / 'install-root' / rel
@@ -5344,7 +5381,8 @@ def upgrade(role, target=None, yes=False):
         seen = set()
         for x in members:
             rel = x.name[len('frp-simple-bash/'):] if x.name.startswith('frp-simple-bash/') else x.name
-            if not (rel in manager_files or rel.startswith('bin/') or rel.startswith('templates/')):
+            if not (rel in manager_files or rel.startswith('bin/')
+                    or rel.startswith('templates/') or rel.startswith('web/dist/')):
                 continue
             dest = INSTALL_ROOT / rel
             if not _within(dest, INSTALL_ROOT):
@@ -5560,6 +5598,9 @@ def run(argv=None):
         _spec = _ilu.spec_from_file_location('frp_webui', str(Path(__file__).resolve().parent / 'webui.py'))
         webui = _ilu.module_from_spec(_spec)
         _spec.loader.exec_module(webui)
+        # 把"当前正在运行的 manager 模块"注入给 webui：
+        # 否则 webui 里的 import manager 会再加载一份，导致缓存/异常类/全局状态双份
+        webui.bind_manager(sys.modules[__name__])
         webui.main(argv)
         return
     if cmd == 'configure': (configure_server if role == 'frps' else profile_wizard)(); return

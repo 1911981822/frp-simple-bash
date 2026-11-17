@@ -13,7 +13,7 @@
       </div>
     </header>
 
-    <ErrorState v-if="error" :error="error" :retry="load" />
+    <ErrorState v-if="error" :error="error" :retry="load" @retry="load" />
 
     <div v-if="!activeProfile && !showAll" class="alert tone-warn">
       <div class="alert-head">
@@ -148,7 +148,7 @@ const loading = ref(false); const busy = ref(''); const copied = ref('')
 const activeProfile = ref(null); const updatedAt = ref('')
 const showAll = ref(false); const keyword = ref(''); const filter = ref('all')
 const searchInput = ref(null)
-const form = reactive({ open: false, editing: false, name: '', type: 'tcp',
+const form = reactive({ open: false, editing: false, originalName: '', name: '', type: 'tcp',
                         local_ip: '127.0.0.1', local_port: null, remote_port: null,
                         domain: '', enabled: true, busy: false, error: '' })
 const dialog = reactive({ open: false, title: '', message: '', items: [],
@@ -190,13 +190,13 @@ async function load() {
 }
 
 function openCreate() {
-  Object.assign(form, { open: true, editing: false, name: '', type: 'tcp',
+  Object.assign(form, { open: true, editing: false, originalName: '', name: '', type: 'tcp',
     local_ip: '127.0.0.1', local_port: null, remote_port: null, domain: '',
     enabled: true, busy: false, error: '' })
 }
 
 function openEdit(m) {
-  Object.assign(form, { open: true, editing: true, name: m.name, type: m.type,
+  Object.assign(form, { open: true, editing: true, originalName: m.name, name: m.name, type: m.type,
     local_ip: m.local_ip, local_port: m.local_port, remote_port: m.remote_port || null,
     domain: m.domain || '', enabled: !!m.enabled, busy: false, error: '' })
 }
@@ -210,8 +210,11 @@ async function submitForm() {
   if (form.type === 'tcp' || form.type === 'udp') body.remote_port = form.remote_port
   else body.domain = form.domain
   try {
-    if (form.editing) await request('/api/mappings/' + encodeURIComponent(form.name),
-                                    { method: 'PUT', body })
+    if (form.editing) {
+      // 用"编辑前的名字"定位资源：名字本身可能被改掉
+      await request('/api/mappings/' + encodeURIComponent(form.originalName),
+                    { method: 'PUT', body })
+    }
     else await post('/api/mappings', body)
     form.open = false
     await load()

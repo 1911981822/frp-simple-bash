@@ -8,7 +8,7 @@
       </div>
     </header>
 
-    <ErrorState v-if="error" :error="error" :retry="load" />
+    <ErrorState v-if="error" :error="error" :retry="load" @retry="load" />
 
     <template v-if="data">
       <!-- 状态带 + 服务控制 -->

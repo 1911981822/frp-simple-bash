@@ -1,4 +1,5 @@
 """Web 管理端后端单元测试：配置、密码、会话、限流、路由、认证/CSRF、静态托管。"""
+import contextlib
 import importlib.util
 import json
 import shutil
@@ -47,6 +48,11 @@ class ServerFixture(object):
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
+        # 与生产路径一致：记录"当前对外服务"的监听
+        self.app.listeners.append({'server': self.server, 'thread': self.thread,
+                                   'label': 'main', 'bind': '127.0.0.1',
+                                   'port': self.port})
+        self.app.current_listener = self.app.listeners[-1]
 
     def url(self, path):
         return 'http://127.0.0.1:%d%s' % (self.port, path)
@@ -500,6 +506,196 @@ class HttpApiTests(unittest.TestCase):
             if (verb, sample) in public: continue
             status, _, _ = self.fx.json(verb if verb != 'HEAD' else 'GET', sample)
             self.assertEqual(status, 401, '%s %s 未受保护' % (verb, sample))
+
+    # ---- 逃生窗口状态机 ----
+
+    def _login_csrf(self):
+        _, _, cookie = self.fx.login()
+        _, sess, _ = self.fx.json('GET', '/api/session', cookie=cookie)
+        return cookie, sess['csrf']
+
+    def test_escape_window_second_apply_rejected(self):
+        """切换未确认时再次 apply 必须 409，避免监听泄漏。"""
+        cookie, csrf = self._login_csrf()
+        self.fx.app.escape = {'old': 'http://a/', 'new': 'http://b/',
+                              'until': time.time() + 300, 'old_entry': None,
+                              'old_cfg': {'bind': '127.0.0.1', 'port': 7501}}
+        status, payload, _ = self.fx.json('POST', '/api/settings/apply', cookie=cookie,
+                                          csrf=csrf, body={'port': 7902})
+        self.assertEqual(status, 409)
+        self.assertEqual(payload['code'], 'E_ESCAPE_PENDING')
+
+    def test_escape_confirm_clears_state(self):
+        cookie, csrf = self._login_csrf()
+        self.fx.app.escape = {'old': 'http://a/', 'new': 'http://b/',
+                              'until': time.time() + 300, 'old_entry': None,
+                              'old_cfg': {'bind': '127.0.0.1', 'port': 7501}}
+        status, payload, _ = self.fx.json('POST', '/api/settings/confirm', cookie=cookie,
+                                          csrf=csrf)
+        self.assertEqual(status, 200)
+        self.assertIsNone(self.fx.app.escape)
+
+    def test_escape_rollback_restores_config(self):
+        cookie, csrf = self._login_csrf()
+        cfg = w.load_web_config()
+        original = {'bind': cfg.get('bind'), 'port': cfg.get('port')}
+        cfg['port'] = 7903
+        w.save_web_config(cfg)
+        self.fx.app.escape = {'old': 'http://a/', 'new': 'http://b/',
+                              'until': time.time() + 300, 'old_entry': None,
+                              'old_cfg': original}
+        status, payload, _ = self.fx.json('POST', '/api/settings/rollback', cookie=cookie,
+                                          csrf=csrf)
+        self.assertEqual(status, 200)
+        self.assertEqual(w.load_web_config()['port'], original['port'])
+
+    def test_escape_summary_expires(self):
+        self.fx.app.escape = {'old': 'a', 'new': 'b', 'until': time.time() - 1,
+                              'old_entry': None, 'old_cfg': {}}
+        self.assertIsNone(self.fx.app.escape_summary())
+
+    def test_current_listener_tracked(self):
+        self.assertIsNotNone(self.fx.app.current_listener)
+
+    # ---- QA 修复回归 ----
+
+    def test_concurrent_mapping_creates_all_persisted(self):
+        """并发创建不能丢更新（原来 10 个只落盘 1 个）。"""
+        import http.client
+        cookie, csrf = self._login_csrf()
+        with patch.object(w.manager, 'active', return_value='a' * 24), \
+             patch.object(w.manager, 'load_profile', return_value={'id': 'a' * 24}):
+            store = {'items': []}
+            def fake_mappings(pid): return list(store['items'])
+            def fake_save(pid, items): store['items'] = list(items)
+            with patch.object(w.manager, 'mappings', side_effect=fake_mappings), \
+                 patch.object(w.manager, 'save_mappings', side_effect=fake_save), \
+                 patch.object(w.manager, 'validate_mappings'):
+                import threading
+                codes = []
+                def create(i):
+                    c = http.client.HTTPConnection('127.0.0.1', self.fx.port, timeout=10)
+                    c.request('POST', '/api/mappings',
+                              json.dumps({'name': 'c%d' % i, 'type': 'tcp',
+                                          'local_port': 9000 + i, 'remote_port': 20000 + i}),
+                              {'Content-Type': 'application/json', 'Cookie': cookie,
+                               'X-CSRF-Token': csrf})
+                    codes.append(c.getresponse().status); c.close()
+                threads = [threading.Thread(target=create, args=(i,)) for i in range(10)]
+                for th in threads: th.start()
+                for th in threads: th.join()
+        self.assertEqual(codes, [200] * 10)
+        self.assertEqual(len(store['items']), 10)     # 全部落盘
+
+    def test_missing_profile_returns_404(self):
+        cookie, csrf = self._login_csrf()
+        status, payload, _ = self.fx.json('PUT', '/api/profiles/' + 'a' * 24,
+                                          cookie=cookie, csrf=csrf, body={'name': 'x'})
+        self.assertEqual(status, 404)
+        self.assertEqual(payload['code'], 'E_NOT_FOUND')
+
+    def test_enabled_string_false_is_false(self):
+        """布尔字段不能把 "false" 强转成 true。"""
+        cookie, csrf = self._login_csrf()
+        with patch.object(w.manager, 'active', return_value='a' * 24), \
+             patch.object(w.manager, 'load_profile', return_value={'id': 'a' * 24}), \
+             patch.object(w.manager, 'mappings', return_value=[]), \
+             patch.object(w.manager, 'save_mappings') as save, \
+             patch.object(w.manager, 'validate_mappings'):
+            status, payload, _ = self.fx.json('POST', '/api/mappings', cookie=cookie,
+                                              csrf=csrf,
+                                              body={'name': 'b', 'type': 'tcp',
+                                                    'local_port': 8080,
+                                                    'remote_port': 20001,
+                                                    'enabled': 'false'})
+        self.assertEqual(status, 200)
+        self.assertFalse(payload['item']['enabled'])
+
+    def test_invalid_local_ip_rejected(self):
+        cookie, csrf = self._login_csrf()
+        with patch.object(w.manager, 'active', return_value='a' * 24), \
+             patch.object(w.manager, 'load_profile', return_value={'id': 'a' * 24}), \
+             patch.object(w.manager, 'mappings', return_value=[]):
+            status, payload, _ = self.fx.json('POST', '/api/mappings', cookie=cookie,
+                                              csrf=csrf,
+                                              body={'name': 'ip', 'type': 'tcp',
+                                                    'local_ip': '999.1.1.1',
+                                                    'local_port': 8080,
+                                                    'remote_port': 20002})
+        self.assertEqual(status, 400)
+        self.assertIn('IPv4', payload['error'])
+
+    def test_corrupt_profile_returns_500_with_filename(self):
+        cookie, csrf = self._login_csrf()
+        with patch.object(w.manager, 'load_profile',
+                          side_effect=w.ConfigCorruptError('/etc/frp/profiles/x/profile.toml',
+                                                           'bad toml')):
+            status, payload, _ = self.fx.json('PUT', '/api/profiles/' + 'a' * 24,
+                                              cookie=cookie, csrf=csrf, body={'name': 'x'})
+        self.assertEqual(status, 500)
+        self.assertEqual(payload['code'], 'E_CONFIG_CORRUPT')
+        self.assertNotIn('/etc/frp', payload['error'])    # 不回绝对路径
+
+    def test_head_on_sse_has_no_body_and_does_not_stream(self):
+        import socket
+        cookie, _csrf = self._login_csrf()
+        for path in ('/api/logs/stream', '/api/events'):
+            sock = socket.create_connection(('127.0.0.1', self.fx.port), timeout=5)
+            try:
+                sock.sendall(('HEAD %s HTTP/1.1\r\nHost: x\r\nCookie: %s\r\n\r\n'
+                              % (path, cookie)).encode())
+                sock.settimeout(2)
+                data = b''
+                try:
+                    while True:
+                        chunk = sock.recv(4096)
+                        if not chunk: break
+                        data += chunk
+                except OSError:
+                    pass
+                head, _, body = data.partition(b'\r\n\r\n')
+                self.assertEqual(body, b'', path)
+            finally:
+                sock.close()
+
+    def test_unknown_method_returns_json_405(self):
+        cookie, _ = self._login_csrf()
+        status, payload, headers = self.fx.json('PATCH', '/api/health', cookie=cookie)
+        self.assertEqual(status, 405)
+        self.assertEqual(payload['code'], 'E_METHOD')
+        self.assertIn('GET', headers.get('Allow', ''))
+
+    def test_first_run_true_when_no_password(self):
+        cfg = w.load_web_config()
+        cfg['password_hash'] = ''
+        w.save_web_config(cfg)
+        self.fx.app.config = w.load_web_config()
+        _, payload, _ = self.fx.json('GET', '/api/health')
+        self.assertTrue(payload['first_run'])
+
+    def test_port_fields_normalized_to_int(self):
+        cookie, csrf = self._login_csrf()
+        with patch.object(w.manager, 'active', return_value='a' * 24), \
+             patch.object(w.manager, 'load_profile', return_value={'id': 'a' * 24}), \
+             patch.object(w.manager, 'mappings', return_value=[]), \
+             patch.object(w.manager, 'save_mappings'), \
+             patch.object(w.manager, 'validate_mappings'):
+            status, payload, _ = self.fx.json('POST', '/api/mappings', cookie=cookie,
+                                              csrf=csrf,
+                                              body={'name': 't', 'type': 'tcp',
+                                                    'local_port': '9303',
+                                                    'remote_port': '20303'})
+        self.assertEqual(status, 200)
+        self.assertIsInstance(payload['item']['local_port'], int)
+        self.assertIsInstance(payload['item']['remote_port'], int)
+
+    def test_non_interactive_suppresses_cli_output(self):
+        import io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with w.manager.non_interactive():
+                w.manager.result_ok('should not appear')
+        self.assertEqual(buf.getvalue(), '')
 
 if __name__ == '__main__':
     unittest.main()

@@ -4,6 +4,7 @@ import contextlib
 import datetime as dt
 import hashlib
 import ipaddress
+import io
 import json
 import os
 from pathlib import Path
@@ -30,7 +31,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.19'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.20'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -267,11 +268,32 @@ def _load_toml(text):
     if _toml_lib is not None: return _toml_lib.loads(text)
     return _mini_toml(text)
 
+class ConfigCorruptError(ValueError):
+    """配置文件存在但无法解析（区别于用户输入校验失败）。
+
+    Web 端据此返回 5xx + 具体文件路径，而不是把解析器英文原文当 400 返回。
+    """
+
+    def __init__(self, path, detail):
+        ValueError.__init__(self, '%s 无法解析：%s' % (path, detail))
+        self.path = str(path)
+        self.detail = str(detail)
+
+
 def read_toml(path):
-    return _load_toml(Path(path).read_text(encoding='utf-8-sig'))
+    text = Path(path).read_text(encoding='utf-8-sig')
+    try:
+        return _load_toml(text)
+    except (ValueError, TypeError) as exc:
+        raise ConfigCorruptError(path, exc)
 
 def read_json(path, default=None):
-    return json.loads(path.read_text(encoding='utf-8')) if path.exists() else ({} if default is None else default)
+    if not path.exists(): return {} if default is None else default
+    text = path.read_text(encoding='utf-8')
+    try:
+        return json.loads(text)
+    except ValueError as exc:
+        raise ConfigCorruptError(path, exc)
 
 def save_json(path, data): atomic(path, json.dumps(data, ensure_ascii=False, indent=2) + '\n')
 
@@ -386,6 +408,26 @@ def address(v):
     if len(v) > 253 or not all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', part) for part in v.rstrip('.').split('.')): raise ValueError('请填写合法 IPv4、IPv6 或域名，不包含协议或端口')
     return v
 
+def local_address(v):
+    """localIP 校验：合法 IP 或看起来像域名的主机名。
+
+    "999.1.1.1" 这种"长得像 IPv4 但非法"的必须拒绝——frpc 不会替你校验，
+    只会在运行期表现为连不上，用户很难定位。
+    """
+    if not isinstance(v, str) or not v or any(c.isspace() for c in v):
+        raise ValueError('本地地址不能为空或包含空白')
+    try:
+        ipaddress.ip_address(v); return v
+    except ValueError:
+        pass
+    parts = v.split('.')
+    if len(parts) == 4 and all(part.isdigit() for part in parts):
+        raise ValueError('本地地址不是合法 IPv4：' + v)
+    if len(v) > 253 or not all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', part)
+                               for part in v.rstrip('.').split('.')):
+        raise ValueError('请填写合法 IPv4、IPv6 或主机名，不包含协议或端口')
+    return v
+
 def name(v):
     if not isinstance(v, str) or not 1 <= len(v) <= 64 or not re.fullmatch(r'[A-Za-z0-9_\-\u3400-\u9fff]+', v): raise ValueError('名称只允许中文、字母、数字、-、_，长度 1-64，不含空格')
     return v
@@ -444,7 +486,7 @@ def validate_mappings(items):
 def validate_mapping(m):
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', m['name']): raise ValueError('映射名称允许 1-64 个 ASCII 字母、数字、-、_')
     if m['type'] not in ('tcp', 'udp', 'http', 'https'): raise ValueError('仅支持 TCP/UDP/HTTP/HTTPS')
-    address(m.get('local_ip', '127.0.0.1')); port(m['local_port'])
+    local_address(m.get('local_ip', '127.0.0.1')); port(m['local_port'])
     if m['type'] in ('tcp', 'udp'): port(m['remote_port'])
     else:
         if not m.get('domain'): raise ValueError('HTTP/HTTPS 必须填写域名')
@@ -1249,7 +1291,12 @@ def non_interactive(enabled=True):
     previous = _NON_INTERACTIVE[0]
     _NON_INTERACTIVE[0] = enabled
     try:
-        yield
+        if enabled:
+            # Web 调用时不要把这些"终端结果框"打进服务日志（会刷屏 journald）
+            with contextlib.redirect_stdout(io.StringIO()):
+                yield
+        else:
+            yield
     finally:
         _NON_INTERACTIVE[0] = previous
 

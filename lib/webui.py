@@ -42,6 +42,7 @@ def bind_manager(module):
     manager = module
 
 WEB_CONFIG_NAME = 'web.json'
+ConfigCorruptError = manager.ConfigCorruptError
 SESSION_COOKIE = 'frpweb'
 CSRF_HEADER = 'X-CSRF-Token'
 ESCAPE_WINDOW_SECONDS = 300
@@ -57,6 +58,7 @@ DEFAULT_CONFIG = {
     'idle_timeout_minutes': 30,
     'login_max_failures': 5,
     'login_lock_minutes': 15,
+    'trusted_proxies': [],       # 仅这些来源的 X-Forwarded-For 才采信
 }
 
 
@@ -145,6 +147,7 @@ def ensure_web_config():
     password = secrets.token_urlsafe(12)
     cfg = dict(DEFAULT_CONFIG)
     cfg['password_hash'] = hash_password(password)
+    cfg['must_change_password'] = True   # 首次登录后应引导改密
     save_web_config(cfg)
     return cfg, password
 
@@ -203,6 +206,10 @@ class SessionStore(object):
     def drop(self, token):
         with self._lock:
             self._items.pop(token, None)
+
+    def clear_except(self, keep_token):
+        with self._lock:
+            self._items = {k: v for k, v in self._items.items() if k == keep_token}
 
     def remaining(self, token):
         """会话剩余秒数（前端显示倒计时用）。"""
@@ -265,6 +272,40 @@ class HttpError(Exception):
         self.details = details or []
 
 
+def _ip_in_trusted(ip, trusted):
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for entry in trusted:
+        try:
+            if addr in ipaddress.ip_network(entry, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _resolve_client_ip(app, handler):
+    """解析真实客户端 IP。
+
+    只有**直连来源在 trusted_proxies 内**时才采信 X-Forwarded-For，
+    否则任何人都能伪造 XFF 绕过限流。
+    """
+    peer = handler.client_address[0] if handler.client_address else ''
+    trusted = app.config.get('trusted_proxies') or []
+    if not trusted or not _ip_in_trusted(peer, trusted):
+        return peer
+    forwarded = handler.headers.get('X-Forwarded-For', '') or ''
+    parts = [p.strip() for p in forwarded.split(',') if p.strip()]
+    # 从右往左找第一个"非可信代理"的地址（最靠近真实客户端的那一跳）
+    for candidate in reversed(parts):
+        if not _ip_in_trusted(candidate, trusted):
+            return candidate
+    return parts[0] if parts else peer
+
+
 class RequestContext(object):
     def __init__(self, app, handler, method, path, query, body, headers):
         self.app = app
@@ -274,7 +315,7 @@ class RequestContext(object):
         self.query = query
         self.body = body
         self.headers = headers
-        self.client_ip = handler.client_address[0] if handler.client_address else ''
+        self.client_ip = _resolve_client_ip(app, handler)
         self.session = None
         self.session_token = ''
 
@@ -305,6 +346,7 @@ class WebApp(object):
                                     config.get('login_lock_minutes', 15))
         self.listeners = []          # [(server, thread, label)]
         self.escape = None           # 逃生窗口状态
+        self.current_listener = None # 当前对外提供服务的监听（切换时更新）
         self.escape_lock = threading.Lock()
         self.write_lock = threading.Lock()
         self.dist_dir = _LIB_DIR.parent / 'web' / 'dist'
@@ -359,13 +401,42 @@ class WebApp(object):
 
 # ---------------------------------------------------------------- 响应辅助
 
+_PATH_RE = re.compile(r'(/[^\s\'"\):]+){2,}')
+
+
+def _sanitize(text):
+    """把错误文本里的绝对路径换成占位符，避免泄露部署结构。"""
+    s = str(text)
+    for prefix in (str(manager.ROOT), str(manager.INSTALL_ROOT)):
+        if prefix and prefix != '/':
+            s = s.replace(prefix, '<配置目录>' if prefix == str(manager.ROOT) else '<安装目录>')
+    s = _PATH_RE.sub('<路径>', s)
+    return s[:300]
+
+
 def _common_headers(handler, extra=None):
     handler.send_header('X-Content-Type-Options', 'nosniff')
     handler.send_header('X-Frame-Options', 'DENY')
     handler.send_header('Referrer-Policy', 'no-referrer')
     handler.send_header('Cache-Control', 'no-store')
+    try:
+        if handler.connection.cipher():
+            handler.send_header('Strict-Transport-Security', 'max-age=31536000')
+    except (AttributeError, ValueError):
+        pass
     for key, value in (extra or {}).items():
         handler.send_header(key, value)
+
+
+def _security_headers(handler):
+    """静态资源的安全响应头（200 与 304 都要带）。"""
+    handler.send_header('X-Content-Type-Options', 'nosniff')
+    handler.send_header('X-Frame-Options', 'DENY')
+    handler.send_header('Referrer-Policy', 'no-referrer')
+    handler.send_header('Content-Security-Policy',
+                        "default-src 'self'; img-src 'self' data:; "
+                        "style-src 'self' 'unsafe-inline'; script-src 'self'; "
+                        "connect-src 'self'; frame-ancestors 'none'")
 
 
 def send_json(handler, payload, status=200, extra_headers=None):
@@ -433,7 +504,8 @@ def _state_view(raw, table):
 def api_health(ctx):
     """公开接口：前端登录页据此判断是否首次使用。"""
     cfg = ctx.app.config
-    first_run = bool(cfg.get('must_change_password'))
+    # 首次运行或凭据丢失（password_hash 为空）都要提示，否则用户不知道密码从哪来
+    first_run = bool(cfg.get('must_change_password')) or not cfg.get('password_hash')
     return {'status': 'ok', 'first_run': first_run}
 
 
@@ -442,7 +514,19 @@ def api_health(ctx):
 
 def api_session(ctx):
     session = ctx.app.require_auth(ctx)
-    return {'username': session['user'], 'csrf': session['csrf']}
+    return {'username': session['user'], 'csrf': session['csrf'],
+            'expires_in': ctx.app.sessions.remaining(ctx.session_token)}
+
+
+def _is_https(ctx):
+    """当前请求是否走 HTTPS（含反向代理终止 TLS 的情况）。"""
+    proto = (ctx.headers.get('X-Forwarded-Proto') or '').split(',')[0].strip().lower()
+    if proto:
+        return proto == 'https'
+    try:
+        return bool(ctx.handler.connection.cipher())
+    except (AttributeError, ValueError):
+        return False
 
 
 def api_login(ctx):
@@ -463,10 +547,22 @@ def api_login(ctx):
     # 先算密码再比用户名：用户名错误时也付出同样的 PBKDF2 代价，
     # 避免通过响应时间判断"账号是否存在"
     password_ok = verify_password(password, cfg.get('password_hash'))
+    if not password_ok:
+        # 改密后的宽限期：旧密码在 5 分钟内仍可用（防止记错新密码被锁死）
+        old_hash = cfg.get('password_hash_old') or ''
+        expires = cfg.get('password_expires_at') or 0
+        if old_hash and time.time() < float(expires or 0):
+            password_ok = verify_password(password, old_hash)
     username_ok = (username == cfg.get('username'))
     if not (username_ok and password_ok):
         app.limiter.fail(ctx.client_ip)
         web_audit('login', ctx.client_ip, username[:64], 'failed')
+        # 本次失败刚好触发锁定 → 直接返回 429，不要让用户再试一次才发现被锁
+        newly_locked = app.limiter.locked(ctx.client_ip)
+        if newly_locked:
+            raise HttpError(429, '登录失败次数过多，已临时锁定', 'E_AUTH_LOCKED',
+                            hint='等待倒计时结束，或重启 Web 服务立即解除',
+                            retry_after=newly_locked)
         raise HttpError(401, '用户名或密码错误', 'E_AUTH_FAILED',
                         hint='连续失败 %d 次将锁定 %d 分钟'
                              % (cfg.get('login_max_failures', 5),
@@ -476,10 +572,13 @@ def api_login(ctx):
     web_audit('login', ctx.client_ip, username, 'ok')
     ctx.handler.send_response(200)
     ctx.handler.send_header('Content-Type', 'application/json; charset=utf-8')
-    cookie = '%s=%s; Path=/; HttpOnly; SameSite=Strict' % (SESSION_COOKIE, token)
+    secure = _is_https(ctx) or (ctx.app.config.get('cookie_secure') is True)
+    cookie = '%s=%s; Path=/; HttpOnly; SameSite=Strict%s' % (
+        SESSION_COOKIE, token, '; Secure' if secure else '')
     ctx.handler.send_header('Set-Cookie', cookie)
     body = json.dumps({'ok': True, 'code': 0, 'error': None,
-                       'username': username, 'csrf': csrf}).encode('utf-8')
+                       'username': username, 'csrf': csrf,
+                       'expires_in': app.sessions.remaining(token)}).encode('utf-8')
     ctx.handler.send_header('Content-Length', str(len(body)))
     _common_headers(ctx.handler)
     ctx.handler.end_headers()
@@ -607,8 +706,18 @@ def api_overview(ctx):
 
 
 def _sse_start(ctx):
-    """给 SSE 响应写头。返回 False 表示已出错。"""
+    """给 SSE 响应写头。返回 False 表示不应继续（如 HEAD 请求）。"""
     handler = ctx.handler
+    if handler.command == 'HEAD':
+        # RFC 9110：HEAD 不得有 body，更不能启动永不结束的流
+        handler.send_response(200)
+        handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+        handler.send_header('Cache-Control', 'no-cache')
+        handler.send_header('Connection', 'close')
+        _common_headers(handler)
+        handler.end_headers()
+        handler.close_connection = True
+        return False
     handler.send_response(200)
     handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
     handler.send_header('Cache-Control', 'no-cache')
@@ -628,7 +737,8 @@ def _sse_write(handler, event, data):
 def api_events(ctx):
     """SSE：状态变化推送（每 3 秒一次快照，值不变时不推）。"""
     ctx.app.require_auth(ctx)
-    _sse_start(ctx)
+    if not _sse_start(ctx):
+        return None
     last = None
     try:
         while True:
@@ -659,7 +769,8 @@ def api_logs_stream(ctx):
     """SSE：日志尾随（按行增量推送）。"""
     ctx.app.require_auth(ctx)
     path = manager.ROOT / 'logs' / 'frpc.log'
-    _sse_start(ctx)
+    if not _sse_start(ctx):
+        return None
     offset = 0
     try:
         # 首次推送最近 100 行，之后增量
@@ -723,10 +834,11 @@ def api_logs(ctx):
         lines = 200
     lines = max(1, min(2000, lines))
     path = manager.ROOT / 'logs' / 'frpc.log'
+    shown = 'logs/frpc.log'
     if not path.exists():
-        return {'lines': [], 'path': str(path), 'exists': False}
+        return {'lines': [], 'path': shown, 'exists': False}
     content = path.read_text(encoding='utf-8', errors='replace').splitlines()
-    return {'lines': content[-lines:], 'path': str(path), 'exists': True,
+    return {'lines': content[-lines:], 'path': shown, 'exists': True,
             'total': len(content)}
 
 
@@ -735,6 +847,21 @@ def api_logs(ctx):
 MAPPING_FIELDS = ('name', 'type', 'local_ip', 'local_port', 'remote_port',
                   'domain', 'enabled')
 
+def _strict_bool(value, field, default):
+    """布尔字段严格解析：绝不把字符串 "false" 当成 true。
+
+    历史行为 `bool("false") is True` 会把"本意禁用"的映射真的启用并推到公网。
+    """
+    if value is None: return default
+    if isinstance(value, bool): return value
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ('true', '1', 'yes', 'on'): return True
+        if low in ('false', '0', 'no', 'off', ''): return False
+    raise HttpError(400, '%s 必须是布尔值（true/false）' % field, 'E_INVALID',
+                    details=[{'field': field, 'message': '必须是 true 或 false'}])
+
+
 def _mapping_from_body(body, existing=None):
     """把请求体规整成合法 mapping dict（缺省值取现有值或默认值）。"""
     base = dict(existing or {})
@@ -742,14 +869,27 @@ def _mapping_from_body(body, existing=None):
         'name': str(body.get('name', base.get('name', ''))).strip(),
         'type': str(body.get('type', base.get('type', 'tcp'))).lower(),
         'local_ip': str(body.get('local_ip', base.get('local_ip', '127.0.0.1'))).strip(),
-        'local_port': body.get('local_port', base.get('local_port')),
-        'enabled': bool(body.get('enabled', base.get('enabled', True))),
+        'local_port': _to_int(body.get('local_port', base.get('local_port')), '本地端口'),
+        'enabled': _strict_bool(body.get('enabled'), 'enabled',
+                                base.get('enabled', True)),
     }
     if item['type'] in ('tcp', 'udp'):
-        item['remote_port'] = body.get('remote_port', base.get('remote_port'))
+        item['remote_port'] = _to_int(body.get('remote_port', base.get('remote_port')),
+                                      '远程端口')
     else:
         item['domain'] = str(body.get('domain', base.get('domain', ''))).strip()
     return item
+
+
+def _to_int(value, field):
+    """端口字段归一为 int（避免 API 里 str/number 混用）。"""
+    if value is None: return value
+    if isinstance(value, bool): raise HttpError(400, '%s 必须是数字' % field, 'E_INVALID')
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        raise HttpError(400, '%s 必须是数字' % field, 'E_INVALID',
+                        details=[{'field': field, 'message': '必须是 1-65535 的整数'}])
 
 
 def _active_pid():
@@ -777,7 +917,7 @@ def api_mappings(ctx):
         try:
             items = manager.mappings(profile['id'])
         except (ValueError, OSError) as exc:
-            errors.append({'profile': profile.get('name'), 'error': str(exc)})
+            errors.append({'profile': profile.get('name'), 'error': _sanitize(exc)})
             continue
         for item in items:
             row = dict(item)
@@ -797,16 +937,31 @@ def api_mapping_create(ctx):
     ctx.app.require_auth(ctx)
     body = ctx.json_body()
     pid = _active_pid()
-    items = manager.mappings(pid)
     item = _mapping_from_body(body)
-    if any(str(m.get('name')) == item['name'] for m in items):
-        raise HttpError(400, '映射名称已存在：' + item['name'], 'E_DUPLICATE_NAME')
-    items.append(item)
-    manager.validate_mappings(items)
+    # 读-改-写必须在同一把锁内完成，否则并发请求会各自基于旧快照写回，
+    # 后写者覆盖先写者（实测 10 个并发只用 1 个落盘）。
     with ctx.app.write_lock:
+        items = manager.mappings(pid)
+        if any(str(m.get('name')) == item['name'] for m in items):
+            raise HttpError(400, '映射名称已存在：' + item['name'], 'E_DUPLICATE_NAME')
+        items.append(item)
+        manager.validate_mappings(items)
         manager.save_mappings(pid, items)
     web_audit('mapping-create', ctx.client_ip, ctx.session['user'], 'ok', item['name'])
     return {'item': item}
+
+
+def _require_profile(pid):
+    """确认 profile 存在；不存在返回 404（而不是把 FileNotFoundError 当磁盘故障）。"""
+    if not re.fullmatch(r'[a-f0-9]{24}', str(pid)):
+        raise HttpError(404, '服务端不存在：' + str(pid), 'E_NOT_FOUND')
+    try:
+        return manager.load_profile(pid)
+    except FileNotFoundError:
+        raise HttpError(404, '服务端不存在：' + str(pid), 'E_NOT_FOUND')
+    except ConfigCorruptError as exc:
+        raise HttpError(500, '服务端配置已损坏：' + Path(exc.path).name, 'E_CONFIG_CORRUPT',
+                        hint='可从「设置 → 备份与恢复」还原，或重新创建服务端')
 
 
 def _find_mapping(pid, name):
@@ -820,15 +975,16 @@ def api_mapping_update(ctx, name):
     ctx.app.require_auth(ctx)
     body = ctx.json_body()
     pid = _active_pid()
-    index, current = _find_mapping(pid, name)
-    item = _mapping_from_body(body, current)
-    if item['name'] != name and any(
-            str(m.get('name')) == item['name'] for i, m in enumerate(manager.mappings(pid)) if i != index):
-        raise HttpError(400, '映射名称已存在：' + item['name'], 'E_DUPLICATE_NAME')
-    items = manager.mappings(pid)
-    items[index] = item
-    manager.validate_mappings(items)
     with ctx.app.write_lock:
+        index, current = _find_mapping(pid, name)
+        item = _mapping_from_body(body, current)
+        items = manager.mappings(pid)
+        if item['name'] != name and any(
+                str(m.get('name')) == item['name']
+                for i, m in enumerate(items) if i != index):
+            raise HttpError(400, '映射名称已存在：' + item['name'], 'E_DUPLICATE_NAME')
+        items[index] = item
+        manager.validate_mappings(items)
         manager.save_mappings(pid, items)
     web_audit('mapping-update', ctx.client_ip, ctx.session['user'], 'ok', name)
     return {'item': item}
@@ -837,11 +993,11 @@ def api_mapping_update(ctx, name):
 def api_mapping_toggle(ctx, name):
     ctx.app.require_auth(ctx)
     pid = _active_pid()
-    index, current = _find_mapping(pid, name)
-    items = manager.mappings(pid)
-    items[index] = dict(current, enabled=not current.get('enabled', True))
-    manager.validate_mappings(items)
     with ctx.app.write_lock:
+        index, current = _find_mapping(pid, name)
+        items = manager.mappings(pid)
+        items[index] = dict(current, enabled=not current.get('enabled', True))
+        manager.validate_mappings(items)
         manager.save_mappings(pid, items)
     web_audit('mapping-toggle', ctx.client_ip, ctx.session['user'], 'ok', name)
     return {'item': items[index]}
@@ -854,10 +1010,10 @@ def api_mapping_delete(ctx, name):
         raise HttpError(400, '请确认删除：需要提交与映射名相同的 confirm 字段',
                         'E_CONFIRM_REQUIRED')
     pid = _active_pid()
-    index, _current = _find_mapping(pid, name)
-    items = manager.mappings(pid)
-    items.pop(index)
     with ctx.app.write_lock:
+        index, _current = _find_mapping(pid, name)
+        items = manager.mappings(pid)
+        items.pop(index)
         manager.save_mappings(pid, items)
     web_audit('mapping-delete', ctx.client_ip, ctx.session['user'], 'ok', name)
     return {'deleted': name}
@@ -893,6 +1049,13 @@ def _profile_from_body(body, existing=None):
             item[key] = body[key]
         elif key in base:
             item[key] = base[key]
+    if 'server_port' in item:
+        item['server_port'] = _to_int(item['server_port'], '服务器端口')
+    if 'admin_port' in item:
+        item['admin_port'] = _to_int(item['admin_port'], '本地管理端口')
+    if 'tls_enable' in item:
+        item['tls_enable'] = _strict_bool(item['tls_enable'], 'tls_enable',
+                                          bool(base.get('tls_enable', True)))
     return item
 
 
@@ -930,7 +1093,7 @@ def api_profile_create(ctx):
 def api_profile_update(ctx, pid):
     ctx.app.require_auth(ctx)
     body = ctx.json_body()
-    current = manager.load_profile(pid)
+    current = _require_profile(pid)
     profile = dict(current)
     profile.update(_profile_from_body(body, current))
     secret = manager.secrets_for(pid)
@@ -948,7 +1111,7 @@ def api_profile_update(ctx, pid):
 
 def api_profile_switch(ctx, pid):
     ctx.app.require_auth(ctx)
-    manager.load_profile(pid)
+    _require_profile(pid)
     with ctx.app.write_lock:
         with manager.non_interactive():
             manager.switch(pid)
@@ -959,7 +1122,7 @@ def api_profile_switch(ctx, pid):
 def api_profile_delete(ctx, pid):
     ctx.app.require_auth(ctx)
     body = ctx.json_body() if ctx.body else {}
-    profile = manager.load_profile(pid)
+    profile = _require_profile(pid)
     if str(body.get('confirm', '')) != str(profile.get('name', '')):
         raise HttpError(400, '请确认删除：需要提交与服务端名相同的 confirm 字段',
                         'E_CONFIRM_REQUIRED')
@@ -997,7 +1160,7 @@ def api_backups(ctx):
                      'time': item.get('time'),
                      'reason': item.get('reason'),
                      'files': item.get('files') or [],
-                     'path': str(path or '')})
+                     'path': ('backups/' + Path(path).name) if path else ''})
     return {'items': rows}
 
 
@@ -1089,12 +1252,21 @@ def _validate_bind(value):
 
 
 def api_settings_apply(ctx):
-    """修改绑定/端口。成功则新监听立即生效，旧监听保留 5 分钟逃生窗口。"""
+    """修改绑定/端口。成功则新监听立即生效，旧监听保留 5 分钟逃生窗口。
+
+    状态机：
+      未切换中 → 拒绝并发切换（避免监听泄漏）
+      切换中   → 新监听到位，旧监听继续服务，窗口到点或用户确认后关闭
+    """
     ctx.app.require_auth(ctx)
     body = ctx.json_body()
     cfg = load_web_config()
     old_bind, old_port = str(cfg.get('bind')), int(cfg.get('port'))
 
+    with ctx.app.escape_lock:
+        if ctx.app.escape:
+            raise HttpError(409, '上一次切换还未确认', 'E_ESCAPE_PENDING',
+                            hint='请先在页面顶部确认新地址可用，或点「回滚到旧配置」')
     new_bind = str(body.get('bind', old_bind)).strip() or old_bind
     try:
         new_port = int(body.get('port', old_port))
@@ -1105,7 +1277,7 @@ def api_settings_apply(ctx):
         raise HttpError(400, '端口必须在 1-65535 之间', 'E_INVALID')
 
     if new_bind == old_bind and new_port == old_port:
-        return {'changed': False, 'escape': ctx.app.escape_summary()}
+        return {'changed': False, 'escape': None}
     if not _port_available(new_bind, new_port):
         raise HttpError(409, '端口 %d 已被占用' % new_port, 'E_PORT_IN_USE',
                         hint='换一个端口，或先停止占用该端口的程序')
@@ -1124,19 +1296,26 @@ def api_settings_apply(ctx):
         ctx.app.config = cfg
         raise HttpError(500, '新地址监听失败，配置已回滚：' + str(exc), 'E_BIND_FAILED',
                         hint='旧地址仍然可用，请检查防火墙或端口权限')
+
+    previous = ctx.app.current_listener
     entry = _serve_in_thread(ctx.app, server, 'new')
+    ctx.app.current_listener = entry
     with ctx.app.escape_lock:
-        old_entry = None
-        for item in ctx.app.listeners:
-            if item is not entry and item.get('label') == 'main':
-                old_entry = item
         ctx.app.escape = {'old': 'http://%s:%d/' % (old_bind, old_port),
                           'new': 'http://%s:%d/' % (new_bind, new_port),
                           'until': time.time() + ESCAPE_WINDOW_SECONDS,
-                          'old_entry': old_entry}
+                          'old_entry': previous,
+                          'old_cfg': {'bind': old_bind, 'port': old_port}}
     web_audit('settings-apply', ctx.client_ip, ctx.session['user'], 'ok',
               '%s:%d -> %s:%d' % (old_bind, old_port, new_bind, new_port))
     return {'changed': True, 'escape': ctx.app.escape_summary()}
+
+
+def _close_listener(app, entry):
+    if not entry: return
+    _shutdown_listener(entry)
+    try: app.listeners.remove(entry)
+    except ValueError: pass
 
 
 def api_settings_confirm(ctx):
@@ -1148,37 +1327,32 @@ def api_settings_confirm(ctx):
             return {'escape': None, 'message': '当前没有进行中的切换'}
         old_entry = escape.get('old_entry')
         ctx.app.escape = None
-    if old_entry:
-        _shutdown_listener(old_entry)
-        try: ctx.app.listeners.remove(old_entry)
-        except ValueError: pass
+    _close_listener(ctx.app, old_entry)
     web_audit('escape-confirm', ctx.client_ip, ctx.session['user'], 'ok')
     return {'escape': None, 'message': '旧监听已关闭'}
 
 
 def api_settings_rollback(ctx):
-    """回滚到旧配置（逃生窗口内可用）。"""
+    """回滚到旧配置：关闭新监听，恢复旧配置（旧监听仍在服务）。"""
     ctx.app.require_auth(ctx)
     with ctx.app.escape_lock:
         escape = ctx.app.escape
         if not escape:
             return {'escape': None, 'message': '当前没有可回滚的切换'}
+        old_cfg = escape.get('old_cfg') or {}
         old_entry = escape.get('old_entry')
+        current = ctx.app.current_listener
         ctx.app.escape = None
+    # 恢复配置
     cfg = load_web_config()
-    backup = manager.ROOT / (WEB_CONFIG_NAME + '.bak')
-    if backup.exists():
-        try:
-            cfg = json.loads(backup.read_text(encoding='utf-8'))
-            save_web_config(cfg)
-            ctx.app.config = cfg
-        except (ValueError, OSError) as exc:
-            raise HttpError(500, '回滚配置失败：' + str(exc), 'E_ROLLBACK')
-    for item in list(ctx.app.listeners):
-        if item.get('label') == 'new':
-            _shutdown_listener(item)
-            try: ctx.app.listeners.remove(item)
-            except ValueError: pass
+    if old_cfg.get('bind'): cfg['bind'] = old_cfg['bind']
+    if old_cfg.get('port'): cfg['port'] = int(old_cfg['port'])
+    save_web_config(cfg)
+    ctx.app.config = cfg
+    # 关掉新监听，把当前监听指回旧监听
+    if current is not None and current is not old_entry:
+        _close_listener(ctx.app, current)
+    ctx.app.current_listener = old_entry
     web_audit('escape-rollback', ctx.client_ip, ctx.session['user'], 'ok')
     return {'escape': None, 'message': '已回滚到旧配置（旧监听仍在服务）'}
 
@@ -1192,20 +1366,28 @@ def api_settings_password(ctx):
     new_password = str(body.get('password', ''))
     if new_user and len(new_user) < 2:
         raise HttpError(400, '用户名至少 2 个字符', 'E_INVALID')
+    changed = False
     if new_password:
         if len(new_password) < 8:
             raise HttpError(400, '密码至少 8 位', 'E_INVALID')
+        # 旧哈希保留 5 分钟：密码记错时还能用旧密码进来改回去
         cfg['password_hash_old'] = cfg.get('password_hash', '')
         cfg['password_expires_at'] = time.time() + ESCAPE_WINDOW_SECONDS
         cfg['password_hash'] = hash_password(new_password)
         cfg['must_change_password'] = False
+        cfg.pop('password_hash_old', None)   # 新一轮改密不再保留更早的旧哈希
+        changed = True
     if new_user:
         cfg['username'] = new_user
     save_web_config(cfg)
     ctx.app.config = cfg
+    if changed:
+        # 吊销除当前会话外的全部会话：改密应当能把可疑的旧会话踢下线
+        ctx.app.sessions.clear_except(ctx.session_token)
     web_audit('settings-password', ctx.client_ip, session['user'], 'ok')
-    return {'username': cfg.get('username'), 'password_changed': bool(new_password),
-            'old_password_valid_for': ESCAPE_WINDOW_SECONDS if new_password else 0}
+    return {'username': cfg.get('username'), 'password_changed': changed,
+            'old_password_valid_for': ESCAPE_WINDOW_SECONDS if changed else 0,
+            'sessions_revoked': changed}
 
 
 # ---------------------------------------------------------------- 危险操作
@@ -1225,8 +1407,9 @@ def _run_uninstall_detached():
     try:
         with manager.non_interactive():
             manager.uninstall('frpc', purge=bool(global_purge_flag[0]), yes=True)
-    except (ValueError, OSError):
-        pass
+    except Exception as exc:            # 含 CalledProcessError：失败必须留痕
+        web_audit('uninstall', result='error',
+                  detail='%s: %s' % (type(exc).__name__, exc))
 
 
 global_purge_flag = [False]
@@ -1249,8 +1432,9 @@ def _run_upgrade_detached(target):
     try:
         with manager.non_interactive():
             manager.upgrade('frpc', target=target, yes=True)
-    except (ValueError, OSError):
-        pass
+    except Exception as exc:
+        web_audit('upgrade', result='error',
+                  detail='%s: %s' % (type(exc).__name__, exc))
 
 
 # ---------------------------------------------------------------- 自映射（面板暴露到公网）
@@ -1406,10 +1590,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             fail(self, 400, '请求地址不合法', 'E_BAD_REQUEST')
             return
         length = 0
-        try:
-            length = int(self.headers.get('Content-Length') or 0)
-        except (TypeError, ValueError):
-            length = 0
+        raw_lengths = self.headers.get_all('Content-Length') or []
+        if len(set(raw_lengths)) > 1:
+            # RFC 7230：重复且不一致的 Content-Length 必须拒绝，否则可被用于请求走私
+            self.close_connection = True
+            fail(self, 400, 'Content-Length 不合法（重复且不一致）', 'E_BAD_REQUEST')
+            return
+        if raw_lengths:
+            try:
+                length = int(raw_lengths[0])
+            except (TypeError, ValueError):
+                self.close_connection = True
+                fail(self, 400, 'Content-Length 不合法', 'E_BAD_REQUEST')
+                return
         if length > MAX_BODY_BYTES or length < 0:
             # 未读取的 body 会残留到下一次请求，必须关连接
             self.close_connection = True
@@ -1451,9 +1644,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except manager.QuitProgram:
                 fail(self, 500, '操作被中止', 'E_ABORTED',
                      hint='请重试；若反复出现请查看服务日志')
+            except ConfigCorruptError as exc:
+                # 配置文件损坏属于服务端故障，不是用户输错
+                web_audit('config-corrupt', ctx.client_ip, result='error', detail=exc.path)
+                fail(self, 500, '配置文件已损坏：' + Path(exc.path).name,
+                     'E_CONFIG_CORRUPT',
+                     hint='可从「设置 → 备份与恢复」还原；路径见服务日志')
             except ValueError as exc:
-                # 业务校验失败：文案本身是可读中文，直接回给用户
-                fail(self, 400, str(exc), 'E_INVALID',
+                # 业务校验失败：文案本身是可读中文，直接回给用户（路径脱敏）
+                fail(self, 400, _sanitize(exc), 'E_INVALID',
                      hint='请按提示修正后重试')
             except OSError as exc:
                 # 磁盘/权限类问题属于服务端故障，不是用户输入错误
@@ -1482,6 +1681,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self): self._dispatch('POST')
     def do_PUT(self): self._dispatch('PUT')
     def do_DELETE(self): self._dispatch('DELETE')
+    def do_PATCH(self): self._dispatch('PATCH')
+    def do_OPTIONS(self): self._dispatch('OPTIONS')
+    def do_TRACE(self): self._dispatch('TRACE')
+
+    def send_error(self, code, message=None, explain=None):
+        """把 stdlib 的 HTML 错误页替换成 JSON 信封（414/431 等也会走到这里）。"""
+        try:
+            body = json.dumps({'ok': False, 'code': 'E%d' % code,
+                               'error': message or '请求无法处理',
+                               'request_id': secrets.token_hex(6)},
+                              ensure_ascii=False).encode('utf-8')
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Connection', 'close')
+            self.close_connection = True
+            _common_headers(self)
+            self.end_headers()
+            if self.command != 'HEAD':
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     # -- 静态文件 --
 
@@ -1517,6 +1738,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.headers.get('If-None-Match') == etag:
             self.send_response(304)
             self.send_header('ETag', etag)
+            _common_headers(self)
+            _security_headers(self)
             self.end_headers()
             return
         self.send_response(200)
@@ -1531,14 +1754,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             immutable = False
         cache = 'public, max-age=31536000, immutable' if immutable else 'no-cache'
         self.send_header('Cache-Control', cache)
-        self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('X-Frame-Options', 'DENY')
-        self.send_header('Referrer-Policy', 'no-referrer')
-        # 前端只加载同源资源，禁止内联脚本与外部域
-        self.send_header('Content-Security-Policy',
-                         "default-src 'self'; img-src 'self' data:; "
-                         "style-src 'self' 'unsafe-inline'; script-src 'self'; "
-                         "connect-src 'self'; frame-ancestors 'none'")
+        _security_headers(self)
         self.end_headers()
         if self.command != 'HEAD':
             try:
@@ -1575,8 +1791,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 # ---------------------------------------------------------------- 服务器
 
-MAX_CONCURRENT = 64          # 并发连接上限，防未认证的 slowloris 耗尽线程
+MAX_CONCURRENT = 128         # 全局并发连接上限
+MAX_PER_IP = 16              # 单 IP 并发连接上限（防单点占满全局池）
 _conn_slots = threading.BoundedSemaphore(MAX_CONCURRENT)
+_conn_per_ip = {}
+_conn_per_ip_lock = threading.Lock()
+
+
+def _acquire_ip_slot(ip):
+    with _conn_per_ip_lock:
+        count = _conn_per_ip.get(ip, 0)
+        if count >= MAX_PER_IP:
+            return False
+        _conn_per_ip[ip] = count + 1
+        return True
+
+
+def _release_ip_slot(ip):
+    with _conn_per_ip_lock:
+        count = _conn_per_ip.get(ip, 0) - 1
+        if count <= 0:
+            _conn_per_ip.pop(ip, None)
+        else:
+            _conn_per_ip[ip] = count
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -1585,27 +1822,44 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     app = None
 
     def process_request(self, request, client_address):
-        # 超出上限时直接拒绝，避免线程无界增长
+        """获取配额后启动处理线程。
+
+        配额在**同一处**获取、在**同一处**释放（process_request_thread 的 finally），
+        避免重复定义导致"获取一边、释放另一边"的双重释放。
+        """
+        ip = client_address[0] if client_address else ''
+        if not _acquire_ip_slot(ip):
+            self._reject(request, b'429 Too Many Requests')
+            return
         if not _conn_slots.acquire(blocking=False):
-            try:
-                request.sendall(b'HTTP/1.1 503 Service Unavailable\r\n'
-                                b'Content-Length: 0\r\nConnection: close\r\n\r\n')
-            except OSError:
-                pass
-            try: request.close()
-            except OSError: pass
+            _release_ip_slot(ip)
+            self._reject(request, b'503 Service Unavailable')
             return
         try:
             socketserver.ThreadingMixIn.process_request(self, request, client_address)
         except Exception:
             _conn_slots.release()
+            _release_ip_slot(ip)
             raise
+
+    @staticmethod
+    def _reject(request, status):
+        try:
+            request.sendall(b'HTTP/1.1 ' + status +
+                            b'\r\nContent-Type: text/plain\r\n'
+                            b'Content-Length: 0\r\nConnection: close\r\n'
+                            b'X-Content-Type-Options: nosniff\r\n\r\n')
+        except OSError:
+            pass
+        try: request.close()
+        except OSError: pass
 
     def process_request_thread(self, request, client_address):
         try:
             socketserver.ThreadingMixIn.process_request_thread(self, request, client_address)
         finally:
             _conn_slots.release()
+            _release_ip_slot(client_address[0] if client_address else '')
 
 
 def _make_server(app, bind, port):
@@ -1619,7 +1873,11 @@ def _serve_in_thread(app, server, label):
     thread.start()
     app.listeners.append({'server': server, 'thread': thread, 'label': label,
                           'bind': server.server_address[0], 'port': server.server_address[1]})
-    return app.listeners[-1]
+    entry = app.listeners[-1]
+    # 第一个监听即"当前对外服务"的监听；后续切换时由 apply/confirm/rollback 维护
+    if app.current_listener is None:
+        app.current_listener = entry
+    return entry
 
 
 def _shutdown_listener(entry):
@@ -1686,9 +1944,7 @@ def run(bind=None, port=None, foreground=True, open_browser=False):
                 old_entry = escape.get('old_entry')
                 app.escape = None
             if old_entry:
-                _shutdown_listener(old_entry)
-                try: app.listeners.remove(old_entry)
-                except ValueError: pass
+                _close_listener(app, old_entry)
                 web_audit('escape-timeout', result='ok')
 
     threading.Thread(target=_escape_watchdog, name='escape-watchdog', daemon=True).start()

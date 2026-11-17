@@ -541,3 +541,57 @@ web/src/components/      StatusBadge / EmptyState / ErrorState / ConfirmDialog
 - 全量 **348 测试通过**（webui 50 条）
 - 端到端实测：新建服务端（自动激活）→ 新建两条映射 → 停用 → 备份 → 备份列表 → 诊断 → 重复端口被拒
 - 发布包 48 个文件，含 `lib/webui.py`、`web/dist/**`、三个服务模板、三个入口脚本
+
+---
+
+## 16. QA 轮次与修复（发布前）
+
+对 Web 管理端执行了 4 路独立 QA：**接口功能 QA**、**安全渗透 QA**、**浏览器 E2E QA**、**安装链路自测**。
+
+### 16.1 功能 QA（11 项）
+
+| 编号 | 级别 | 问题 | 修复 |
+|---|---|---|---|
+| QA-1 | **高** | 并发写映射丢失更新：10 个并发创建全返回 200，仅 1 个落盘（read-modify-write 在锁外） | 映射 CRUD 的「读-改-写」全部移入 `write_lock`；复测 10/10 落盘 |
+| QA-2 | 中 | 不存在的 profile 返回 500 `E_IO`（误导为磁盘故障） | 新增 `_require_profile()`：不存在 → 404 `E_NOT_FOUND`；损坏 → 500 `E_CONFIG_CORRUPT` |
+| QA-3 | 中 | `enabled:"false"` 被 `bool()` 强转成 `true`（本意禁用却启用并推到公网） | 新增 `_strict_bool()`，字符串按语义解析，非法值 400 |
+| QA-4 | 中 | `local_ip:"999.1.1.1"` 被当作域名接受 | 新增 `local_address()`：拒绝"像 IPv4 但非法"的输入 |
+| QA-5 | 中 | 配置损坏返回 400 + Python 解析器英文原文，不指出文件 | 新增 `ConfigCorruptError`；返回 500 `E_CONFIG_CORRUPT` + 文件名（不含绝对路径） |
+| QA-6 | 中 | `HEAD /api/logs/stream`、`/api/events` 返回 body 且启动无限流 | HEAD 只发头、不启动流、立即关连接 |
+| QA-7 | 低 | PATCH/OPTIONS/TRACE、414 返回 HTML 错误页 | 新增 `do_PATCH/do_OPTIONS/do_TRACE` 与 `send_error` 覆写，统一 JSON 信封 |
+| QA-8 | 低 | `first_run` 恒 false，首装/凭据丢失无提示 | 生成初始配置时置 `must_change_password`；`password_hash` 为空也算 first_run |
+| QA-9 | 低 | 端口字段 str/number 混用 | 新增 `_to_int()` 归一 |
+| QA-10 | 低 | Web 写操作把 CLI 结果框打进服务日志 | `non_interactive()` 内同时重定向 stdout |
+| QA-11 | 低 | 卸载/升级后台线程异常未捕获，失败无痕迹 | 捕获全部异常并写审计 |
+
+### 16.2 安全 QA（7 项，无严重漏洞）
+
+| 编号 | 级别 | 问题 | 修复 |
+|---|---|---|---|
+| SEC-1 | 中 | 64 个未认证空闲连接即可占满全局连接池（远程 DoS） | 全局池 64→128 + **单 IP 并发上限 16**；复测第 17 个连接起 429，释放后恢复 |
+| SEC-2 | 中 | 限流只认 socket IP；反代后任何人 5 次错密码可锁死管理员 | 新增 `trusted_proxies` 配置：仅可信代理的 `X-Forwarded-For` 才采信 |
+| SEC-3 | 低 | 重复/非法 `Content-Length` 被当 0 并复用连接（请求走私面） | 重复且不一致 → 400 + 关连接；非法值 → 400 + 关连接 |
+| SEC-4 | 低 | 304 响应缺安全头 | 抽出 `_security_headers()`，200/304 共用 |
+| SEC-5 | 低 | 错误响应回显服务器绝对路径 | 新增 `_sanitize()`：路径替换为 `<路径>`；日志/备份路径改为相对 |
+| SEC-6 | 低 | Cookie 无 Secure、无 HSTS | HTTPS 请求（含 `X-Forwarded-Proto`）时加 `Secure`；HTTPS 响应加 HSTS |
+| SEC-7 | 低 | 改密不吊销既有会话；"旧密码 5 分钟有效"名不副实 | 实现旧哈希宽限期校验；改密时吊销除当前外的全部会话；清理旧哈希 |
+
+### 16.3 浏览器 E2E（4 项）
+
+| 编号 | 级别 | 问题 | 修复 |
+|---|---|---|---|
+| E2E-5 | **高** | 编辑映射改名失败（PUT 用了新名字定位资源） | 记录 `originalName`，PUT 用编辑前的名字 |
+| E2E-10 | **高** | 概览/映射页 ErrorState「重试」点击无效（缺 `@retry`） | 补 `@retry="load"` |
+| E2E-3 | 中 | 侧栏会话剩余时间永不显示（`/api/session` 不返回 `expires_in`） | session 与 login 响应都返回 `expires_in` |
+| E2E-2 | 低 | 第 5 次密码错误要等第 6 次才提示锁定 | 触发锁定的那一次直接返回 429 + `retry_after` |
+
+### 16.4 测试期间发现并修复的自身回归
+
+- `process_request` 被我方补丁重复定义 → 每个请求抛 `Semaphore released too many times` 且限额失效（QA agent 预警）；已合并为单一定义，复测 0 异常。
+
+### 16.5 最终验证
+
+- 全量 **363 测试通过**（webui 65 条）
+- 实测复验：并发 10/10 落盘、404 语义、布尔严格、非法 IP 拒绝、HEAD SSE 0 字节、PATCH→405 JSON、`first_run` 正确、端口类型归一
+- 前端构建：主包 104.77KB（gzip 41.27KB）
+- 3.6 语法 / shell 语法 / ps1 ASCII 全部通过

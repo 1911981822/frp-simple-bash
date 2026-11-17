@@ -5553,6 +5553,15 @@ def run(argv=None):
             flags = {}
         ports_command(sub or ['status'], flags)
         return
+    if cmd == 'web':
+        if role != 'frpc':
+            err('E001', 'Web 管理端目前只支持客户端 frpc。')
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location('frp_webui', str(Path(__file__).resolve().parent / 'webui.py'))
+        webui = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(webui)
+        webui.main(argv)
+        return
     if cmd == 'configure': (configure_server if role == 'frps' else profile_wizard)(); return
     if cmd == 'import': import_external(role); return
     if cmd == 'menu':

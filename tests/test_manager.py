@@ -1225,7 +1225,7 @@ class ManagerTests(unittest.TestCase):
         self.assertIn('9) 管理', shown)
         self.assertIn('10) 显示所有映射', shown)
         self.assertNotIn('查看当前状态', shown)
-        self.assertIn('0 = 退出程序', shown)
+        self.assertIn('0) 退出', shown)
 
     # ---- 切换服务端 / pending 修复 ----
     def test_detached_restart_keeps_pending_until_process_restarts(self):

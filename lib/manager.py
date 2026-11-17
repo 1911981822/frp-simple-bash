@@ -30,7 +30,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.16'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.17'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -152,7 +152,8 @@ def transaction():
         for p, value in originals.items():
             try: atomic(p, value.decode('utf-8-sig'))
             except OSError as exc:
-                print('  [失败] 回滚写入失败：' + str(p) + ' — ' + str(exc), file=sys.stderr)
+                print('  ' + _tag('[失败]') + ' 回滚写入失败：' + str(p) + ' — ' + str(exc),
+                      file=sys.stderr)
         raise
 
 def _mini_toml(text):
@@ -432,7 +433,8 @@ def validate_mappings(items):
         name = item['name']
         if name in names: raise ValueError('映射名称重复：' + name)
         names[name] = True
-        if item['type'] in ('tcp', 'udp'):
+        # 停用的映射不会写入运行配置，因此不参与端口查重
+        if item['type'] in ('tcp', 'udp') and item.get('enabled', True):
             key = (int(item['remote_port']), item['type'])
             if key in remote_ports:
                 raise ValueError('远程端口重复：%d/%s（映射 %s 与 %s 冲突）'
@@ -1039,12 +1041,15 @@ def _dim(text):
     return '\033[2m' + str(text) + '\033[0m' if UI_COLOR else str(text)
 
 # 状态词 → 颜色：绿=正常/成功，红=异常/停止，黄=过渡/未知。
-_GOOD_WORDS = ('运行中', '已连接', '已启用', '启用', '成功', '可达', '正常', '在线',
-               '已设置', '已保存', '已生效', '通过', '当前')
-_BAD_WORDS = ('已停止', '未运行', '已断开', '未连接', '停用', '失败', '不可达',
-              '异常', '离线', '未设置', '错误', '不通过', '未启用', '拒绝', '无法访问')
-_WARN_WORDS = ('连接中', '启动中', '停止中', '待确认', '待重启', '未选择', '未就绪', '未配置',
-               '未安装', '连接超时', '尚未生成', '未知', '部分', '等待', '重启中')
+_GOOD_WORDS = ('已连接', '已启用', '已设置', '已保存', '已生效', '已放行', '已开启',
+               '已加入', '已添加', '已移除', '已撤销', '运行中', '启用', '成功',
+               '可达', '正常', '在线', '通过', '当前')
+_BAD_WORDS = ('无法访问', '未连接', '未启用', '未设置', '未放行', '未开启', '未加入',
+              '未运行', '已断开', '已停止', '不通过', '不可达', '离线', '停用',
+              '失败', '异常', '错误', '拒绝')
+_WARN_WORDS = ('连接超时', '尚未生成', '待确认', '待重启', '连接中', '启动中',
+               '停止中', '重启中', '未选择', '未就绪', '未安装', '未配置',
+               '手动', '未知', '部分', '等待')
 
 def color_state(text):
     """Colour a status word by meaning; returns text unchanged when colour is off.
@@ -1060,6 +1065,30 @@ def color_state(text):
         for w in sorted(words, key=len, reverse=True):
             if w in s: return '\033[1;' + code + 'm' + s + '\033[0m'
     return s
+
+_STATUS_RE = [None]
+
+def color_status_words(text):
+    """Colour every recognised status word inside a sentence.
+
+    与 color_state() 的区别：color_state 是「整行按语义染色」，本函数是
+    「句子内关键词上色」，用于结果框正文，让「已保存；下次重启后生效」
+    这类句子里的关键状态一眼可见。
+
+    单次正则替换 + 最长优先，避免「未启用」被「启用」二次包裹。
+    """
+    if not UI_COLOR or text is None: return text
+    s = str(text)
+    if '\033[' in s: return s
+    if _STATUS_RE[0] is None:
+        mapping = {}
+        for words, code in ((_BAD_WORDS, '31'), (_WARN_WORDS, '33'), (_GOOD_WORDS, '32')):
+            for word in words: mapping.setdefault(word, code)
+        ordered = sorted(mapping.items(), key=lambda kv: -len(kv[0]))
+        pattern = re.compile('|'.join(re.escape(w) for w, _ in ordered))
+        _STATUS_RE[0] = (pattern, dict(ordered))
+    pattern, table = _STATUS_RE[0]
+    return pattern.sub(lambda m: '\033[1;' + table[m.group(0)] + 'm' + m.group(0) + '\033[0m', s)
 
 def _display_width(text):
     """Approximate terminal width: CJK/fullwidth count as 2; ANSI escapes as 0."""
@@ -1100,7 +1129,11 @@ def _wrap_text(text, width):
             w = 2 if ord(ch) > 0x2E7F else 1
             if used + w > width and buf:
                 cut = last_break + 1 if last_break >= 0 else len(buf)
-                lines.append(buf[:cut])
+                chunk = buf[:cut]
+                # 换行处补 reset，否则颜色会溢出到框线和下一行
+                if '\033[' in chunk and not chunk.endswith('\033[0m'):
+                    chunk += '\033[0m'
+                lines.append(chunk)
                 buf = buf[cut:]
                 used = _display_width(buf)
                 last_break = -1
@@ -1124,12 +1157,12 @@ def _box(kind, message, detail=None):
     inner = _ui_width()
     print()
     print('┌' + '─' * inner + '┐')
-    wrapped = _wrap_text(kind + ' ' + message, inner - 2)
+    wrapped = _wrap_text(kind + ' ' + color_status_words(message), inner - 2)
     for pos, line in enumerate(wrapped):
         shown = _tag(kind) + line[len(kind):] if pos == 0 and line.startswith(kind) else line
         print('│' + _pad_line(' ' + shown, inner) + '│')
     if detail:
-        for line in _wrap_text(str(detail), inner - 4):
+        for line in _wrap_text(color_status_words(detail), inner - 4):
             print('│' + _pad_line('   ' + line, inner) + '│')
     print('└' + '─' * inner + '┘')
 
@@ -1204,16 +1237,21 @@ def _report(title, lines):
     for raw in lines:
         text = str(raw)
         low = text
-        if any(w in low for w in ('不可达', '失败', '异常', '未启用', '未通过', '错误')):
-            mark, code = '✗ ', '31'
-        elif any(w in low for w in ('可达', '成功', '通过', '已设置', '正常', '在线')):
-            mark, code = '✓ ', '32'
-        elif any(w in low for w in ('建议', '注意', '警告', '未检测', '未就绪', '未配置')):
-            mark, code = '! ', '33'
+        # 前缀符号沿用"整行判定"，正文关键词交给 color_status_words，
+        # 这样「已放行 3 个，未放行 1 个」里的两个词都能各自着色。
+        if any(w in low for w in _BAD_WORDS):
+            mark = '✗ '
+        elif any(w in low for w in _GOOD_WORDS):
+            mark = '✓ '
+        elif any(w in low for w in ('建议', '注意', '警告', '未检测')):
+            mark = '! '
         else:
-            mark, code = '', ''
-        text = mark + text
-        if UI_COLOR and code: text = '\033[1;' + code + 'm' + text + '\033[0m'
+            mark = ''
+        body = color_status_words(text)
+        if mark and UI_COLOR:
+            code = {'✗ ': '31', '✓ ': '32', '! ': '33'}[mark]
+            mark = '\033[1;' + code + 'm' + mark + '\033[0m'
+        text = mark + body
         for line in _wrap_text(text, inner - 2):
             print('│' + _pad_line(' ' + line, inner) + '│')
     print('└' + '─' * inner + '┘')
@@ -1242,55 +1280,44 @@ def result_error(message, hint=None, role=None):
     _box('[失败]', message, '\n'.join(lines) if lines else None)
 
 def choose(items, title='请选择', back_label='返回上一级', groups=None, prelude=None):
-    """Numbered menu with optional visual group headers (numbering stays continuous).
+    """Numbered menu.
 
-    统一交互规则（全程序唯一，无冗余）：
-      0    → 返回上一级；主菜单中需**连按两次 0** 才退出（防误触，无弹窗打断）
+    统一交互（全程序唯一规则，无冗余）：
       数字 → 执行对应操作
-      回车 → 只重印提示行，不重绘、不返回
-      b    → 等同于 0（子菜单内）
+      0    → 返回上一级（主菜单中即为退出程序）
+      其他 → 重新提示
+
+    只有一条"离开"语义：0 = 退一层。没有"连按两次""b 别名""回车也能返回"这些
+    额外规则，用户只需要记住一个键。
     """
     idx = len(items)
-    at_root = back_label in ('退出', '退出程序')
-    exit_armed = False   # 主菜单第一次按 0 只"上膛"，第二次才退出
+    width = len(str(idx))
 
     def _draw():
         section(title)
         if prelude is not None:
             prelude()
-        width = len(str(idx))
         for n, item in enumerate(items, 1):
             if groups and (n - 1) in groups:
                 print()
                 print('  ' + _dim(groups[n - 1]))
             print(f'  {n:>{width}}) {item}')
         print(f'  {0:>{width}}) {back_label}')
-        tail = '0 = 退出程序（连按两次）' if at_root else f'0 = {back_label}'
-        print('  ' + _dim(tail))
 
     _draw()
     while True:
         try:
-            v = input(f'\n  请选择 [0-{idx}]：')
+            v = input(f'\n  请选择 [0-{idx}]：').strip()
         except EOFError:
             raise QuitProgram()
-        v = v.strip()
-        if v == '0' or (v in BACK_KEYS and not at_root):
-            if at_root:
-                if not exit_armed:
-                    exit_armed = True
-                    print('  ' + _dim('再按一次 0 退出程序（按其他任意内容可取消）'))
-                    continue
-                return 0
+        if v == '0':
             return 0
-        if v == '':
-            exit_armed = False   # 回车是最常见的"取消"，必须一并解除退出待确认
-            print('  ' + _dim(f'可用键：1-{idx} 执行，0 = {back_label}'))
-            continue
-        exit_armed = False
         if v.isdecimal() and 0 <= int(v) <= idx:
             return int(v)
-        result_error('无效编号', f'请输入 0-{idx} 的数字；0 返回上一级，回车刷新提示。')
+        if not v:
+            print('  ' + _dim(f'请输入 1-{idx} 的数字，0 返回'))
+        else:
+            print('  ' + _dim(f'无效输入 "{v}"：请输入 0-{idx}'))
 
 def require_active():
     pid = active()
@@ -1673,9 +1700,14 @@ def save_mappings(pid, items, explicit=False):
         # apply() 的校验失败必须抛出，由 transaction() 回滚（不能吞）。
         if pid == active(): apply(pid)
         audit('mappings-saved', pid)
-    result_ok('端口映射配置已保存。',
-              detail=(f'映射数量：{before_count} → {len(items)}；'
-                      + ('当前 frpc 运行中，请按提示重启后生效。' if running('frpc') else '当前 frpc 未运行，下次启动时生效。')))
+    effective = not running('frpc')
+    message = '端口映射配置已保存。'
+    detail = '映射数量：%d → %d；%s' % (
+        before_count, len(items),
+        '当前 frpc 未运行，下次启动时生效。' if effective
+        else '当前 frpc 运行中，尚未生效——需要重启后才会加载新映射。')
+    if effective: result_ok(message, detail)
+    else: result_info(color_status_words(message) + '（待重启生效）', detail)
     if running('frpc') and confirm('配置已保存，重启 frpc 生效？'):
         if restart_safely('frpc') == 'restarted': wait_connection(pid)
 
@@ -2388,9 +2420,9 @@ def server_clients():
                 item.get('status', {}).get('proxyCount', '-')))
         if start + page_size < len(clients):
             print(RULE)
-            try: more = input('  回车看下一页，0 结束明细 … ')
+            try: more = input('  回车看下一页，输入任意其它内容结束 … ')
             except EOFError: break
-            if more.strip() == '0': break
+            if more.strip() != '': break
     if proxies:
         section('代理状态')
         phase_map = {'online': '在线', 'running': '在线', 'offline': '离线',
@@ -2557,7 +2589,12 @@ def _status_body(role, data):
     if role == 'frps':
         path = ROOT / 'frps.toml'
         if path.exists():
-            config = read_toml(path)
+            try:
+                config = read_toml(path)
+            except (ValueError, OSError) as exc:
+                print(_kv('状态说明', color_state('配置文件无法解析：' + str(exc)[:60])))
+                print(_kv('建议', '用「备份与恢复配置」还原，或「修改服务端配置」重建'))
+                return
             host = config.get('bindAddr', '0.0.0.0')
             if ':' in host: host = '[' + host + ']'
             print(_kv('监听', str(host) + ':' + str(config.get('bindPort', 7000))))
@@ -3225,6 +3262,9 @@ def firewall_detect():
     if TEST:
         info.update({'backend': 'ufw', 'active': True, 'available': ['ufw']})
         info['detail'] = {'ufw': 'active', 'simulated': 'test'}
+        info['panels'] = panel_detect()
+        info['managers'] = ['ufw']
+        info['conflict'] = bool(info['panels'])
         return info
     if family == 'windows':
         out = _cmd_out(['netsh', 'advfirewall', 'show', 'allprofiles', 'state'])
@@ -3377,6 +3417,13 @@ def firewall_open_ports():
 
 PANEL_TYPES = ('baota', 'aapanel')
 
+def _safe_int(value, default):
+    """int() 的容错版本：配置被手改成非数字时不应让菜单崩溃。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 def panel_config():
     """Read the [panel] section from auto-port.toml."""
     raw = read_toml(auto_port_config_path()) if auto_port_config_path().exists() else {}
@@ -3390,7 +3437,7 @@ def panel_config():
         'url': str(section.get('url', 'http://127.0.0.1:8888') or '').rstrip('/'),
         'api_key': str(section.get('api_key', '') or os.environ.get('FRP_PANEL_API_KEY', '')),
         'verify_tls': bool(section.get('verify_tls', False)),
-        'timeout': int(section.get('timeout', 10) or 10),
+        'timeout': _safe_int(section.get('timeout', 10), 10),
         'node': str(section.get('node', '') or ''),          # aaPanel 多节点时可填
         'list_action': str(section.get('list_action', 'GetRules')),
         'add_action': str(section.get('add_action', 'AddRule')),
@@ -3488,36 +3535,62 @@ def panel_rules(panel=None):
         result.append(row)
     return result
 
-def _panel_find_rule(port, proto, panel=None):
-    """Find the panel rule id for a port/proto pair."""
+PANEL_RULE_MARK = 'frp-simple-bash-auto'
+
+def _panel_find_rule(port, proto, panel=None, ours_only=True):
+    """Find the panel rule id for a port/proto pair.
+
+    ours_only=True 时只匹配本工具创建的规则（ps 带 PANEL_RULE_MARK），
+    避免误删用户手工放的 SSH/面板等规则。
+    """
     for row in panel_rules(panel):
         try:
             row_port = int(str(row.get('port', '')).split(',')[0].split('-')[0])
         except (TypeError, ValueError):
             continue
         row_types = str(row.get('types', 'tcp')).lower()
-        if row_port == int(port) and (proto in row_types or row_types in ('', ',')):
-            return row.get('id')
+        if row_port != int(port): continue
+        if not (proto in row_types or row_types in ('', ',')): continue
+        if ours_only and PANEL_RULE_MARK not in str(row.get('ps', '')):
+            continue
+        return row.get('id')
     return None
 
+def _panel_status_ok(payload):
+    """面板返回是否成功。缺 status 字段一律视为失败（避免静默假成功）。"""
+    status = str(payload.get('status', '')).lower()
+    if status in ('true', '1', 'ok'): return True
+    if status == '': return False
+    return False
+
 def panel_add_rule(port, proto, panel=None):
-    """Add an inbound allow rule through the panel (survives panel reload)."""
+    """Add an inbound allow rule through the panel. Idempotent.
+
+    已存在本工具的规则时直接返回成功，不重复 AddRule
+    （重复添加会让面板报"已存在"，进而被当成失败）。
+    """
     panel = panel or panel_config()
+    if _panel_find_rule(port, proto, panel) is not None:
+        return {'status': True, 'msg': 'already exists'}
     payload = panel_request(panel['add_action'],
                             {'port': int(port), 'types': proto,
-                             'ps': 'frp-simple-bash-auto', 'address': ''}, panel)
-    if str(payload.get('status', '')).lower() not in ('true', '1', 'ok', ''):
+                             'ps': PANEL_RULE_MARK, 'address': ''}, panel)
+    if not _panel_status_ok(payload):
         raise ValueError('面板添加规则失败：' + str(payload.get('msg') or payload)[:200])
     ports_audit('panel-port-open', port=port, proto=proto, result='ok')
     return payload
 
 def panel_del_rule(port, proto, panel=None):
-    """Remove the panel rule for a port/proto pair (only ours, by marker/port)."""
+    """Remove OUR panel rule for a port/proto pair.
+
+    只删 ps 标记为 frp-simple-bash-auto 的规则；用户自己加的规则不碰。
+    返回 True=已删除 / False=没有本工具的规则可删。
+    """
     panel = panel or panel_config()
     rule_id = _panel_find_rule(port, proto, panel)
     if rule_id is None: return False
     payload = panel_request(panel['del_action'], {'id': rule_id}, panel)
-    if str(payload.get('status', '')).lower() not in ('true', '1', 'ok', ''):
+    if not _panel_status_ok(payload):
         raise ValueError('面板删除规则失败：' + str(payload.get('msg') or payload)[:200])
     ports_audit('panel-port-close', port=port, proto=proto, result='ok')
     return True
@@ -3617,34 +3690,40 @@ def firewall_add_port(port, proto):
         raise ValueError('防火墙放行失败：' + (out.stderr or out.stdout or '').strip())
 
 def firewall_del_port(port, proto):
-    """Remove one port rule added by this tool."""
+    """Remove one port rule added by this tool. Returns True/False (real result)."""
     info = firewall_detect()
     backend, active = info['backend'], info['active']
-    if not backend or not active: return
+    if not backend or not active: return False
     needle = '%d/%s' % (port, proto)
     try:
         if backend == 'ufw':
-            run_cmd(['ufw', 'delete', 'allow', needle], capture_output=True, text=True, timeout=20)
-        elif backend == 'firewalld':
+            out = run_cmd(['ufw', 'delete', 'allow', needle],
+                          capture_output=True, text=True, timeout=20)
+            return out.returncode == 0
+        if backend == 'firewalld':
             out = run_cmd(['firewall-cmd', '--permanent', '--remove-port=' + needle],
                           capture_output=True, text=True, timeout=20)
-            if out.returncode == 0:
-                run_cmd(['firewall-cmd', '--reload'], capture_output=True, text=True, timeout=30)
-        elif backend == 'windows':
-            run_cmd(['netsh', 'advfirewall', 'firewall', 'delete', 'rule',
-                     'name=' + _win_rule_name(port, proto)],
-                    capture_output=True, text=True, timeout=20)
-        elif backend == 'iptables':
-            run_cmd(['iptables', '-D', 'INPUT', '-p', proto, '--dport', str(port),
-                     '-j', 'ACCEPT', '-m', 'comment', '--comment', 'frp-simple-bash:auto'],
-                    capture_output=True, text=True, timeout=20)
+            if out.returncode != 0: return False
+            run_cmd(['firewall-cmd', '--reload'], capture_output=True, text=True, timeout=30)
+            return True
+        if backend == 'windows':
+            out = run_cmd(['netsh', 'advfirewall', 'firewall', 'delete', 'rule',
+                           'name=' + _win_rule_name(port, proto)],
+                          capture_output=True, text=True, timeout=20)
+            return out.returncode == 0
+        if backend == 'iptables':
+            out = run_cmd(['iptables', '-D', 'INPUT', '-p', proto, '--dport', str(port),
+                           '-j', 'ACCEPT', '-m', 'comment', '--comment', 'frp-simple-bash:auto'],
+                          capture_output=True, text=True, timeout=20)
+            if out.returncode != 0: return False
             _persist_iptables()
-        else:
-            run_cmd(['nft', 'delete', 'rule', 'inet', 'filter', 'input',
-                     proto, 'dport', str(port), 'accept'],
-                    capture_output=True, text=True, timeout=20)
+            return True
+        out = run_cmd(['nft', 'delete', 'rule', 'inet', 'filter', 'input',
+                       proto, 'dport', str(port), 'accept'],
+                      capture_output=True, text=True, timeout=20)
+        return out.returncode == 0
     except (OSError, ValueError, subprocess.SubprocessError):
-        pass
+        return False
 
 # ---------------------------------------------------------------- 防火墙启用引导
 
@@ -3727,6 +3806,14 @@ def firewall_enable_plan():
     installed = target in info['available']
     if not installed and target not in ('ufw', 'firewalld', 'nftables'):
         raise ValueError('当前系统（%s）没有可自动启用的防火墙管理器，请手动配置。' % family)
+    if target == 'nftables':
+        raise ValueError(
+            '当前系统推荐 nftables，但它没有"一键启用"的概念，规则还需写入 '
+            '/etc/nftables.conf 才能持久化。\n'
+            '为避免"只加了规则却不生效"，本工具拒绝自动启用 nftables。\n'
+            '请任选其一：\n'
+            '  1) 安装并启用 ufw 或 firewalld（推荐，之后本工具可自动管理）；\n'
+            '  2) 手动在 /etc/nftables.conf 中放行所需端口。')
     ssh_ports = ssh_listen_ports(strict=True)
     keep = frps_keep_ports()
     install_cmds, allow_cmds, notes = [], [], []
@@ -3861,7 +3948,7 @@ def firewall_enable(yes=False, force=False):
             '原因：启用 ufw/firewalld 会重建规则链，覆盖面板已放行的端口，'
             '可能导致现有服务（含 frps 7000、SSH）立即失联。\n'
             '建议做法：在面板「安全 → 防火墙」中手工放行所需端口，'
-            '或改用「13) 面板 API 配置」让本工具通过面板 API 放行。\n'
+            '或改用「端口自动开通 → 4) 宝塔 API」让本工具通过面板 API 放行。\n'
             '若你确实要接管系统防火墙（风险自负），请用：'
             'frps ports firewall enable --force' % names)
 
@@ -4024,108 +4111,165 @@ def ports_desired(cfg=None):
 
 # ---------------------------------------------------------------- 同步
 
-def ports_sync(apply_changes=True):
-    """同步一次：读实际在线映射 → 有宝塔 API 就调用放行，否则只记录并返回清单。
+def ports_sync(apply_changes=True, force=False):
+    """同步一次：读实际在线映射 → 按模式放行/回收。
 
-    返回 {mode, added, removed, pending, skipped}：
-      mode='panel-api' 时 added/removed 是真实通过 API 增删的端口；
-      mode='manual'    时 pending 是需要在面板手工添加的端口。
+    模式由 firewall_mode() 决定（受 auto-port.toml 的 panel_mode 覆盖）：
+      panel-api → 调宝塔 API（规则进面板数据库）
+      manual（=readonly）→ 只列清单，不写任何地方
+      direct    → 直写系统防火墙（裸机）
+
+    状态语义：opened 只记录**真实放行成功**的端口；manual 模式绝不写入。
+    回收有宽限期（prune_after_seconds），避免 frpc 抖动导致规则反复增删。
     """
     cfg = auto_port_config()
     panel = panel_config()
-    api_ready = panel_api_ready(panel)
-    has_panel = bool(panel_detect())
-    if api_ready:
-        mode = 'panel-api'
-    elif has_panel:
-        mode = 'manual'          # 有面板没配 API → 只列清单，绝不碰系统防火墙
-    else:
-        mode = 'direct'          # 裸机无面板 → 直写系统防火墙
-    report = {'enabled': cfg['enabled'], 'mode': mode,
-              'added': [], 'removed': [], 'pending': [], 'skipped': []}
-    if not cfg['enabled']:
+    mode = firewall_mode()
+    if mode == 'readonly': mode = 'manual'
+    report = {'enabled': cfg['enabled'], 'mode': mode, 'added': [], 'removed': [],
+              'pending': [], 'skipped': [], 'opened': [], 'busy': False}
+    if not cfg['enabled'] and not force:
         return report
+    try:
+        with lock():
+            return _ports_sync_locked(cfg, panel, mode, apply_changes, report)
+    except ValueError as exc:
+        if '锁' in str(exc) or '另一个终端' in str(exc):
+            report['busy'] = True
+            return report
+        raise
+
+def _ports_sync_locked(cfg, panel, mode, apply_changes, report):
     desired, skipped = ports_desired(cfg)
     report['skipped'] = skipped
     st = auto_port_state()
-    known = {(int(r['port']), str(r['proto'])): r for r in (st.get('opened') or [])}
+    known = {}
+    for rec in st.get('opened') or []:
+        try: known[(int(rec['port']), str(rec['proto']))] = rec
+        except (KeyError, TypeError, ValueError): continue
+    report['opened'] = [{'port': k[0], 'proto': k[1], 'proxy': known[k].get('proxy', '')}
+                        for k in sorted(known)]
 
     if mode == 'manual':
         report['pending'] = [{'port': k[0], 'proto': k[1], 'proxy': v.get('proxy', '')}
                              for k, v in sorted(desired.items()) if k not in known]
-        if apply_changes:
-            st['opened'] = [{'port': k[0], 'proto': k[1], 'client_id': v['client_id'],
-                             'proxy': v['proxy'],
-                             'opened_at': dt.datetime.now().isoformat(timespec='seconds')}
-                            for k, v in sorted(desired.items())]
-            save_auto_port_state(st)
         return report
 
+    opening = [k for k in sorted(desired) if k not in known]
     if not apply_changes:
-        report['added'] = [{'port': k[0], 'proto': k[1]} for k in sorted(desired)
-                           if k not in known]
+        report['added'] = [{'port': k[0], 'proto': k[1]} for k in opening]
         return report
 
-    opener = (lambda p, pr: panel_add_rule(p, pr, panel)) if mode == 'panel-api' \
-        else (lambda p, pr: firewall_add_port(p, pr))
-    closer = (lambda p, pr: panel_del_rule(p, pr, panel)) if mode == 'panel-api' \
-        else (lambda p, pr: firewall_del_port(p, pr))
-    for key, rec in sorted(desired.items()):
-        if key in known: continue
+    opener = (lambda pr, pt: panel_add_rule(pr, pt, panel)) if mode == 'panel-api' \
+        else (lambda pr, pt: firewall_add_port(pr, pt))
+    closer = (lambda pr, pt: panel_del_rule(pr, pt, panel)) if mode == 'panel-api' \
+        else (lambda pr, pt: firewall_del_port(pr, pt))
+    opened = dict(known)
+    now = dt.datetime.now()
+    for key in opening:
+        rec = desired[key]
         try:
             opener(key[0], key[1])
+            opened[key] = {'port': key[0], 'proto': key[1], 'client_id': rec['client_id'],
+                           'proxy': rec['proxy'],
+                           'opened_at': now.isoformat(timespec='seconds')}
             report['added'].append({'port': key[0], 'proto': key[1]})
         except (ValueError, OSError) as exc:
-            ports_audit('port-open', port=key[0], proto=key[1], result='failed',
-                        detail=str(exc))
+            ports_audit('port-open', port=key[0], proto=key[1], result='failed', detail=str(exc))
             report['skipped'].append(dict(rec, reason='apply_failed', detail=str(exc)))
-    for key in list(known):
-        if key in desired: continue
+    grace = max(10, int(cfg.get('prune_after_seconds', 120)))
+    for key in sorted(list(opened)):
+        if key in desired:
+            opened[key].pop('missing_since', None)
+            continue
+        rec = opened[key]
+        stamp = rec.get('missing_since')
+        if not stamp:
+            rec['missing_since'] = now.isoformat(timespec='seconds')
+            continue
+        try:
+            since = dt.datetime.fromisoformat(stamp)
+        except (ValueError, TypeError):
+            since = now
+        if (now - since).total_seconds() < grace:
+            continue
         try:
             if closer(key[0], key[1]) is not False:
+                opened.pop(key, None)
                 report['removed'].append({'port': key[0], 'proto': key[1]})
-        except (ValueError, OSError):
-            pass
-    st['opened'] = [{'port': k[0], 'proto': k[1], 'client_id': v['client_id'],
-                     'proxy': v['proxy'],
-                     'opened_at': dt.datetime.now().isoformat(timespec='seconds')}
-                    for k, v in sorted(desired.items())]
+            else:
+                opened.pop(key, None)     # 已经不存在了，直接清记录
+                report['removed'].append({'port': key[0], 'proto': key[1]})
+        except (ValueError, OSError) as exc:
+            ports_audit('port-close', port=key[0], proto=key[1], result='failed', detail=str(exc))
+            rec['last_error'] = str(exc)[:120]
+    st['opened'] = [opened[k] for k in sorted(opened)]
     save_auto_port_state(st)
     return report
 
 def ports_revert():
-    """删除本工具放行的全部端口（有 API 走 API，否则清记录）。"""
+    """撤销本工具放行的端口，并关闭自动同步。
+
+    返回 {'removed': [...], 'failed': [...], 'manual': [...]}：
+      removed 真的删掉了；failed 删除失败；manual 面板机器上没有 API，只能在面板手工删。
+    """
     panel = panel_config()
     api_ready = panel_api_ready(panel)
     has_panel = bool(panel_detect())
     st = auto_port_state()
-    removed, failed = [], []
+    result = {'removed': [], 'failed': [], 'manual': []}
     for rec in st.get('opened') or []:
         try:
             port, proto = int(rec['port']), str(rec['proto'])
         except (KeyError, TypeError, ValueError):
             continue
+        label = '%d/%s' % (port, proto)
         if api_ready:
             try:
-                if panel_del_rule(port, proto, panel): removed.append('%d/%s' % (port, proto))
+                (result['removed'] if panel_del_rule(port, proto, panel)
+                 else result['manual']).append(label)
             except (ValueError, OSError):
-                failed.append('%d/%s' % (port, proto))
-        elif not has_panel:
-            try:
-                firewall_del_port(port, proto); removed.append('%d/%s' % (port, proto))
-            except (ValueError, OSError):
-                failed.append('%d/%s' % (port, proto))
+                result['failed'].append(label)
+        elif has_panel:
+            result['manual'].append(label)      # 面板接管但没有 API：删不了，只能提示
         else:
-            removed.append('%d/%s' % (port, proto))   # 面板机器：只清记录
+            try:
+                (result['removed'] if firewall_del_port(port, proto)
+                 else result['failed']).append(label)
+            except (ValueError, OSError):
+                result['failed'].append(label)
     cfg = auto_port_config()
     if cfg.get('enabled'):
         cfg['enabled'] = False; save_auto_port_config(cfg)
     ports_timer_remove()
-    st['opened'] = []
+    # 只有真正删掉/可交给用户删的才从状态里移除；失败项保留以便下次重试
+    keep = set(result['failed'])
+    st['opened'] = [r for r in (st.get('opened') or [])
+                    if '%s/%s' % (r.get('port'), r.get('proto')) in keep]
     save_auto_port_state(st)
-    ports_audit('revert', result='ok',
-                detail='removed=%d failed=%d' % (len(removed), len(failed)))
-    return removed
+    ports_audit('revert', result='ok' if not result['failed'] else 'partial',
+                detail='removed=%d failed=%d manual=%d'
+                       % (len(result['removed']), len(result['failed']), len(result['manual'])))
+    return result
+
+def _report_revert(outcome):
+    """如实渲染撤销结果：删掉的、失败的、需要在面板手工删的分开说。"""
+    removed = outcome.get('removed') or []
+    failed = outcome.get('failed') or []
+    manual = outcome.get('manual') or []
+    lines = []
+    if removed: lines.append('已删除 %d 个：%s' % (len(removed), '、'.join(removed[:20])))
+    if manual: lines.append('需在面板手工删除 %d 个：%s' % (len(manual), '、'.join(manual[:20])))
+    if failed: lines.append('删除失败 %d 个：%s' % (len(failed), '、'.join(failed[:20])))
+    if lines: _report('撤销结果', lines)
+    if failed:
+        result_error('有 %d 个端口删除失败，已保留记录，可稍后重试。' % len(failed))
+    elif manual:
+        result_info('已关闭自动同步；有 %d 个端口需要在宝塔面板手工删除。' % len(manual))
+    elif removed:
+        result_ok('已撤销 %d 个端口，并关闭自动同步。' % len(removed))
+    else:
+        result_info('没有需要撤销的端口。')
 
 def ports_enable(cfg, yes=False):
     """Validate prerequisites and enable auto-port.
@@ -4164,6 +4308,11 @@ def ports_enable(cfg, yes=False):
     timer_ok = ports_timer_install(cfg)
     ports_audit('enable', result='ok',
                 detail='api=%s panel=%s timer=%s' % (api_ready, has_panel, timer_ok))
+    if not timer_ok:
+        # 非 systemd 平台没有定时器：退化为"进菜单时同步一次"
+        result_info('已启用，但本平台没有可用的定时器（非 systemd）。',
+                    detail='将改为每次进入「端口自动开通」时同步一次；'
+                           '也可用 `frps ports apply` 手动触发。')
     return True
 
 # ---------------------------------------------------------------- 定时同步
@@ -4251,381 +4400,322 @@ def ports_timer_status():
     except (OSError, subprocess.SubprocessError):
         return '未知'
 def auto_port_report_lines(report, plan_only=False):
-    """Format a sync report as readable lines."""
-    lines = []
+    """把 ports_sync 的 report 渲染成人能看懂的若干行（CLI 用）。"""
     mode = report.get('mode', 'direct')
-    if mode == 'readonly':
-        lines.append('模式：只读（检测到面板接管，不会修改系统防火墙）')
-        if report.get('panels'):
-            lines.append('面板：' + '、'.join(report['panels']))
-    else:
-        lines.append('模式：直写系统防火墙')
-    backend = report.get('backend') or '未检测到'
-    lines.append('防火墙后端：' + str(backend))
-    if report.get('conflict'):
-        lines.append('⚠ 冲突：面板与系统防火墙同时在管理，规则可能被互相覆盖')
-    for item in (report.get('manual') or [])[:30]:
-        lines.append('待手动放行：%d/%s%s' % (item['port'], item['proto'],
-                                       ('（' + item.get('proxy', '') + '）') if item.get('proxy') else ''))
-    if report.get('manual'):
-        lines.append('请到面板「安全 → 防火墙」中添加上述端口，或在 frps 中配置面板 API 模式。')
-    for item in report.get('lost') or []:
-        lines.append('⚠ 规则已丢失：%d/%s（可能被面板重载覆盖，建议改用面板 API 或手动重加）'
-                     % (item['port'], item['proto']))
+    mode_text = {'panel-api': '宝塔 API（规则写入面板数据库）',
+                 'manual': '手动（只列清单，不改任何防火墙）',
+                 'direct': '直写系统防火墙'}.get(mode, mode)
+    lines = ['模式：' + mode_text]
+    if report.get('busy'):
+        lines.append('另一个进程正在同步，本次跳过。')
+        return lines
+    pending = report.get('pending') or []
+    opened = report.get('opened') or []
     added = report.get('added') or []
     removed = report.get('removed') or []
-    kept = report.get('kept') or []
-    lines.append('已放行：%d 个（本次新增 %d，回收 %d）' % (len(kept) + len(added), len(added), len(removed)))
+    skipped = report.get('skipped') or []
+    if pending:
+        lines.append('待手工放行 %d 个：%s' % (len(pending),
+                     '、'.join('%s/%s' % (x['port'], x['proto']) for x in pending[:20])))
     if added:
-        lines.append(('将放行：' if plan_only else '本次放行：')
-                     + '、'.join('%d/%s' % (x['port'], x['proto']) for x in added))
+        lines.append(('将放行 %d 个：' if plan_only else '已放行 %d 个：') % len(added)
+                     + '、'.join('%s/%s' % (x['port'], x['proto']) for x in added[:20]))
     if removed:
-        lines.append(('将回收：' if plan_only else '本次回收：')
-                     + '、'.join('%d/%s' % (x['port'], x['proto']) for x in removed))
-    for item in (report.get('skipped') or [])[:20]:
-        reason = {'client_not_allowed': '客户端不在白名单',
-                  'denied_port': '命中敏感端口黑名单',
-                  'quota_exceeded': '超出单客户端配额',
-                  'port_in_use': '端口已被其它进程占用',
-                  'apply_failed': '防火墙执行失败'}.get(item.get('reason'), item.get('reason'))
-        lines.append('跳过 %s/%s（%s）' % (item.get('port'), item.get('proto'), reason))
-    extra = len(report.get('skipped') or []) - 20
-    if extra > 0: lines.append('… 另有 %d 条跳过项，详见审计日志' % extra)
+        lines.append(('将回收 %d 个：' if plan_only else '已回收 %d 个：') % len(removed)
+                     + '、'.join('%s/%s' % (x['port'], x['proto']) for x in removed[:20]))
+    if opened:
+        lines.append('累计已放行 %d 个' % len(opened))
+    lines.extend(_skip_lines(skipped))
     return lines
 
 def auto_port_menu():
-    """端口自动开通：4 项主菜单。
+    """端口自动开通：一屏 6 项，无子菜单。
 
     核心逻辑：读 frps 实际在线映射 → 有宝塔 API 就调 API 放行，没 API 就列清单手动加。
+    进入菜单时若已启用且没有定时器（非 systemd），先静默同步一次作为兜底。
     """
     clear_screen()
+    synced = False
     while True:
         cfg = auto_port_config()
         panel = panel_config()
         api_ready = panel_api_ready(panel)
         enabled = cfg['enabled']
+        count = len(cfg['allow_clients'])
+        if enabled and not synced and not ports_timer_installed():
+            synced = True
+            try: ports_sync(apply_changes=True)
+            except MENU_ERRORS: pass
 
         def _prelude():
-            if api_ready:
-                print('  ' + _kv('放行方式', color_state('宝塔 API 自动')))
+            print('  ' + _kv('放行方式', color_state('宝塔 API 自动') if api_ready
+                             else color_state('手动（未配 API）')))
+            print('  ' + _kv('白名单', (str(count) + ' 个客户端') if count
+                             else color_state('空（不会放行任何端口）')))
+            timer = ports_timer_status()
+            if enabled and timer in ('运行中', '不适用（非 systemd 平台）'):
+                auto_text = color_state('开')
+            elif enabled:
+                auto_text = color_state('开（定时器未运行！）')
             else:
-                print('  ' + _kv('放行方式', color_state('手动（未配宝塔 API）')))
-            wl = len(cfg['allow_clients'])
-            auto = color_state('自动同步开') if enabled else color_state('自动同步关')
-            print('  ' + _kv('白名单', ('%d 个客户端' % wl) if wl else color_state('空')) + '    ' + auto)
+                auto_text = color_state('关')
+            print('  ' + _kv('自动同步', auto_text + '  ' + _dim(timer)))
 
         items = [
             '查看待放行端口',
             '同步并放行',
-            '白名单管理',
-            '宝塔 API 设置',
-        ]
-        n = choose(items, '端口自动开通', '返回上一级', prelude=_prelude)
-        if not n: return
-        try:
-            if n == 1:
-                _show_pending_ports(cfg, panel)
-                pause()
-            elif n == 2:
-                _apply_ports(cfg, panel)
-                pause()
-            elif n == 3:
-                whitelist_menu(cfg); pause()
-            elif n == 4:
-                panel_config_menu(); needs_pause = False
-        except MENU_ERRORS as exc:
-            result_error(str(exc)); pause()
-
-def whitelist_menu(cfg):
-    """白名单管理：加/减客户端 + 开关自动同步 + 查看已放行 + 撤销。"""
-    while True:
-        clear_screen()
-        cfg = auto_port_config()
-        enabled = cfg['enabled']
-        opened = auto_port_state().get('opened') or []
-        print('  ' + _kv('白名单', ', '.join(cfg['allow_clients']) if cfg['allow_clients']
-                         else color_state('空（不会放行任何端口）')))
-        print('  ' + _kv('已放行', '%d 个端口' % len(opened)))
-        print('  ' + _kv('自动同步', color_state(ports_timer_status())))
-        print(RULE)
-        items = [
-            '添加客户端',
-            '移除客户端',
-            '查看已放行端口',
+            '白名单',
+            '宝塔 API',
             '关闭自动同步' if enabled else '开启自动同步',
-            '撤销全部自动放行',
+            '撤销全部放行',
         ]
-        groups = {0: '── 白名单 ──', 2: '── 已放行 ──', 3: '── 自动同步 ──', 4: '── 危险操作 ──'}
-        n = choose(items, '白名单与同步', '返回', groups=groups)
+        groups = {0: '── 使用 ──', 2: '── 设置 ──', 5: '── 危险操作 ──'}
+        n = choose(items, '端口自动开通', '返回上一级', groups=groups, prelude=_prelude)
         if not n: return
         try:
             if n == 1:
-                auto_port_add_client(cfg); pause()
+                _show_pending_ports(cfg, panel); pause()
             elif n == 2:
-                if not cfg['allow_clients']:
-                    result_info('白名单为空。'); pause(); continue
-                index = choose(cfg['allow_clients'], '选择要移除的客户端')
-                if not index: continue
-                removed = cfg['allow_clients'].pop(index - 1)
-                save_auto_port_config(cfg)
-                result_ok('已移除：' + removed); pause()
+                _apply_ports(cfg, panel); pause()
             elif n == 3:
-                _show_opened_ports(); pause()
+                _whitelist_action(cfg); pause()
             elif n == 4:
+                _panel_setup(panel); pause()
+            elif n == 5:
                 if enabled:
                     cfg['enabled'] = False; save_auto_port_config(cfg)
                     ports_timer_remove(); ports_audit('disable', result='ok')
-                    result_info('已关闭自动同步。已放行的端口保持不变。')
+                    result_ok('已关闭自动同步。', detail='已放行的端口保持不变。')
                 else:
-                    if not cfg['allow_clients']:
-                        result_error('白名单为空，先添加客户端。'); pause(); continue
-                    if not confirm('开启后每 15 秒自动同步一次，把新映射端口放行。确认？',
+                    if not count:
+                        result_error('白名单为空，先到「3) 白名单」添加客户端。',
+                                     hint='只有白名单内的客户端，其映射端口才会被放行。')
+                        pause(); continue
+                    if not confirm('开启后每 15 秒自动同步一次，把新映射的端口放行。确认？',
                                    danger=True):
                         result_info('已取消。'); pause(); continue
                     if ports_enable(cfg, yes=True):
                         result_ok('已开启自动同步。')
                 pause()
-            elif n == 5:
-                if not confirm('将删除本工具放行的全部端口并关闭自动同步。确认？', danger=True):
+            elif n == 6:
+                opened = auto_port_state().get('opened') or []
+                if not opened:
+                    result_info('当前没有由本工具放行的端口。'); pause(); continue
+                if not confirm('将删除本工具放行的 %d 个端口，并关闭自动同步。确认？'
+                               % len(opened), danger=True):
                     result_info('已取消。'); pause(); continue
-                removed = ports_revert()
-                result_ok('已撤销 %d 个端口，并关闭自动同步。' % len(removed)); pause()
+                outcome = ports_revert()
+                _report_revert(outcome); pause()
         except MENU_ERRORS as exc:
             result_error(str(exc)); pause()
+
+def _whitelist_action(cfg):
+    """白名单：单次动作（添加或移除），不循环、不套子菜单。"""
+    section('白名单')
+    print('  当前：' + (', '.join(cfg['allow_clients'])
+                       if cfg['allow_clients'] else color_state('空（不会放行任何端口）')))
+    online = _online_client_ids()
+    if online:
+        print('  在线：' + ', '.join(
+            cid + ('' if cid in cfg['allow_clients'] else color_state('（未加入）'))
+            for cid in sorted(online)))
+    print(RULE)
+    n = choose(['添加客户端', '移除客户端'], '白名单操作', '返回上一级')
+    if not n: return
+    if n == 1:
+        if online:
+            options = sorted(online) + ['手动输入 clientID']
+            index = choose(options, '选择要加入的客户端')
+            if not index: return
+            value = options[index - 1] if index <= len(online) else ask(
+                'clientID（留空取消）', allow_empty=True)
+        else:
+            value = ask('clientID（留空取消）', allow_empty=True)
+        if not value: return
+        if value in cfg['allow_clients']:
+            result_info('该客户端已在白名单中。'); return
+        cfg['allow_clients'].append(value)
+        save_auto_port_config(cfg)
+        result_ok('已加入白名单：' + value)
+    else:
+        if not cfg['allow_clients']:
+            result_info('白名单为空。'); return
+        index = choose(cfg['allow_clients'], '选择要移除的客户端')
+        if not index: return
+        removed = cfg['allow_clients'].pop(index - 1)
+        save_auto_port_config(cfg)
+        result_ok('已移除：' + removed)
+
+def _online_client_ids():
+    """当前在线客户端的 clientID 集合（读不到时返回空）。"""
+    try:
+        rows = frps_online_proxies()
+    except (ValueError, OSError):
+        return set()
+    ids = set()
+    for item in rows:
+        cid = str(item.get('clientID') or item.get('clientId') or '')
+        if cid: ids.add(cid)
+    return ids
+
+def _panel_setup(panel):
+    """宝塔 API：一次性配置（地址 → 密钥 → 测试），不套子菜单。"""
+    section('宝塔 API 配置')
+    print('  ' + _kv('地址', panel['url'] or color_state('未配置')))
+    print('  ' + _kv('密钥', color_state('已配置') if panel['api_key']
+                     else color_state('未配置')))
+    print(RULE)
+    result_info('在宝塔面板操作：设置 → API 接口 → 开启，复制「接口密钥」。',
+                detail='建议把 API 白名单限制为 127.0.0.1，仅供本机调用。')
+    url = ask('API 地址（回车保留当前）', panel['url'] or 'http://127.0.0.1:8888',
+              allow_empty=True)
+    if url is None: return
+    if url:
+        if not url.lower().startswith(('http://', 'https://')):
+            result_error('地址必须以 http:// 或 https:// 开头。'); return
+        panel['url'] = url.rstrip('/')
+    key = ask('API 密钥（输入不回显，回车保留当前）', secret=True, allow_empty=True)
+    if key is None: return
+    if key: panel['api_key'] = key.strip()
+    save_panel_config(panel)
+    if not panel_api_ready(panel):
+        result_error('配置不完整：需要同时有 API 地址和密钥。'); return
+    if not confirm('配置已保存，立即测试连接？'):
+        result_ok('已保存。'); return
+    try:
+        info = panel_probe(panel)
+        result_ok('连接成功：面板当前有 %d 条防火墙规则。' % info['rules'],
+                  detail='之后新映射的端口会自动写入宝塔。')
+    except MENU_ERRORS as exc:
+        result_error('连接失败：' + str(exc),
+                     hint='检查密钥是否正确、面板 API 是否开启、调用 IP 是否在白名单内。')
 
 def _desired_ports(cfg):
     """实际在线且通过白名单/黑名单/配额过滤后的端口。"""
     try:
         desired, skipped = ports_desired(cfg)
     except (ValueError, OSError) as exc:
-        raise ValueError('读取 frps Dashboard 失败：' + str(exc)
-                         + '\n请先在 5) 修改服务端配置 里开启 Dashboard/API。')
+        raise ValueError('读取 frps Dashboard 失败（需要先在「修改服务端配置」里开启 Dashboard/API）：'
+                         + str(exc))
     return desired, skipped
 
+_SKIP_REASONS = {
+    'client_not_allowed': '客户端不在白名单',
+    'denied_port': '命中敏感端口黑名单',
+    'quota_exceeded': '超出单客户端配额',
+    'port_in_use': '端口已被其它进程占用',
+    'apply_failed': '放行失败',
+}
+
+def _skip_lines(skipped, limit=6):
+    """把跳过项转成人能看懂的行。"""
+    counts = {}
+    for item in skipped:
+        reason = item.get('reason', '')
+        counts.setdefault(reason, []).append(item)
+    lines = []
+    for reason, items in counts.items():
+        ports = '、'.join('%s/%s' % (i.get('port'), i.get('proto')) for i in items[:limit])
+        more = ' 等 %d 个' % len(items) if len(items) > limit else ''
+        lines.append('跳过 %s：%s%s' % (_SKIP_REASONS.get(reason, reason), ports, more))
+    return lines
+
 def _show_pending_ports(cfg, panel):
-    """只读：列出需要放行但还没放行的端口。"""
-    desired, _skipped = _desired_ports(cfg)
-    opened = {(int(r['port']), str(r['proto']))
-              for r in (auto_port_state().get('opened') or [])}
-    pending = {k: v for k, v in desired.items() if k not in opened}
-    if not pending:
-        result_ok('没有待放行的端口，已是同步状态。'); return
-    api_ready = panel_api_ready(panel)
-    lines = ['%d/%s  ← %s%s' % (k[0], k[1], v.get('proxy') or '-',
-                                 ('（client ' + v['client_id'] + '）') if v.get('client_id') else '')
-             for k, v in sorted(pending.items())]
-    _report('待放行端口（%d 个）' % len(pending), lines)
-    if api_ready:
-        result_info('已配置宝塔 API，按 2) 立即同步并放行 即可自动添加。')
-    else:
-        result_info('未配置宝塔 API，请到宝塔面板「安全 → 防火墙」手工添加上述端口。',
-                    detail='配好 7) 宝塔 API 设置后本工具可自动完成。')
+    """只读：分别显示「未放行」和「已放行」两段，每行带 ✓/✗ 标记。"""
+    report = ports_sync(apply_changes=False)
+    pending = report.get('pending') or []
+    opened = report.get('opened') or []
+    skipped = report.get('skipped') or []
+    mode = report.get('mode')
+    if mode == 'manual':
+        # 手工模式没有 opened 概念，先把 known 算成"已登记放行"
+        known = {(int(r['port']), str(r['proto'])) for r in opened}
+        desired, _ = _desired_ports(cfg)
+        pending = [{'port': k[0], 'proto': k[1], 'proxy': v.get('proxy', '')}
+                   for k, v in sorted(desired.items()) if k not in known]
+    if not pending and not opened:
+        if skipped:
+            _report('没有可放行的端口',
+                    ['在线映射里有 %d 个端口被规则拦下：' % len(skipped)] + _skip_lines(skipped))
+            result_info('请检查白名单（3) 白名单）、敏感端口黑名单或配额设置。')
+        else:
+            result_info('当前没有在线映射，无需放行。')
+        return
+    lines = []
+    if pending:
+        lines.append('未放行 %d 个：' % len(pending))
+        for item in pending[:20]:
+            lines.append('   ✗ %s/%s  ← %s' % (item['port'], item['proto'],
+                                               item.get('proxy') or '-'))
+        if len(pending) > 20: lines.append('   … 另有 %d 个' % (len(pending) - 20))
+    if opened:
+        lines.append('已放行 %d 个：' % len(opened))
+        for item in opened[:20]:
+            lines.append('   ✓ %s/%s  ← %s' % (item['port'], item['proto'],
+                                               item.get('proxy') or '-'))
+        if len(opened) > 20: lines.append('   … 另有 %d 个' % (len(opened) - 20))
+    if skipped:
+        lines.append('')
+        lines.extend(_skip_lines(skipped))
+    _report('放行状态', lines)
+    if pending:
+        if mode == 'manual':
+            result_info('以上 %d 个端口需要到宝塔面板「安全 → 防火墙」手工添加。' % len(pending),
+                        detail='配好「4) 宝塔 API」后本工具可自动完成。')
+        else:
+            result_info('以上 %d 个端口尚未放行，按 2) 同步并放行 执行。' % len(pending))
 
 def _apply_ports(cfg, panel):
-    """同步一次：有宝塔 API 走 API，否则只更新记录并给出清单。"""
-    desired, skipped = _desired_ports(cfg)
-    if panel_api_ready(panel):
-        added, failed = [], []
-        for key, rec in sorted(desired.items()):
-            try:
-                panel_add_rule(key[0], key[1], panel)
-                added.append('%d/%s' % (key[0], key[1]))
-            except (ValueError, OSError) as exc:
-                failed.append('%d/%s（%s）' % (key[0], key[1], str(exc)[:60]))
-        # 清掉已消失映射对应的面板规则
-        removed = []
-        live = {(int(r['port']), str(r['proto'])) for r in _panel_rule_pairs()}
-        for key in list(live):
-            if key not in desired:
-                try:
-                    if panel_del_rule(key[0], key[1], panel):
-                        removed.append('%d/%s' % (key[0], key[1]))
-                except (ValueError, OSError):
-                    pass
-        st = auto_port_state()
-        st['opened'] = [{'port': k[0], 'proto': k[1], 'client_id': v['client_id'],
-                         'proxy': v['proxy'],
-                         'opened_at': dt.datetime.now().isoformat(timespec='seconds')}
-                        for k, v in sorted(desired.items())]
-        save_auto_port_state(st)
-        lines = []
-        if added: lines.append('已通过宝塔 API 放行：' + '、'.join(added))
-        if removed: lines.append('已回收：' + '、'.join(removed))
-        if failed: lines.append('失败：' + '、'.join(failed))
-        if lines: _report('同步结果', lines)
-        if failed:
-            result_error('有 %d 个端口放行失败。' % len(failed),
-                         hint='可在 7) 宝塔 API 设置 里测试连接，确认密钥与白名单。')
-        else:
-            result_ok('同步完成：' + (added[0] if added else '无新增端口'))
+    """执行一次同步，并按真实结果给出结论（失败/全跳过不得报成功）。"""
+    report = ports_sync(apply_changes=True, force=True)
+    if not report.get('enabled'):
+        result_info('自动同步当前是关闭的，本次为手动执行一次。',
+                    detail='如需持续自动放行，用 5) 开启自动同步。')
+    mode = report.get('mode')
+    added = report.get('added') or []
+    removed = report.get('removed') or []
+    pending = report.get('pending') or []
+    skipped = report.get('skipped') or []
+    failed = [s for s in skipped if s.get('reason') == 'apply_failed']
+    lines = []
+    if added:
+        lines.append('已放行 %d 个：%s' % (len(added),
+                     '、'.join('%s/%s' % (x['port'], x['proto']) for x in added[:20])))
+    if removed:
+        lines.append('已回收 %d 个：%s' % (len(removed),
+                     '、'.join('%s/%s' % (x['port'], x['proto']) for x in removed[:20])))
+    if pending:
+        lines.append('待手工放行 %d 个：%s' % (len(pending),
+                     '、'.join('%s/%s' % (x['port'], x['proto']) for x in pending[:20])))
+    if skipped:
+        lines.extend(_skip_lines(skipped))
+    if lines:
+        _report('同步结果', lines)
+
+    if mode == 'manual':
+        if not pending:
+            if skipped:
+                result_info('没有端口被放行：全部被规则拦下。',
+                            detail='检查「3) 白名单」、敏感端口黑名单与配额设置。')
+            else:
+                result_info('没有需要放行的新端口。')
+            return
+        result_info('已列出 %d 个端口，请在宝塔面板「安全 → 防火墙」手工添加。'
+                    % len(pending),
+                    detail='配好「4) 宝塔 API」后可自动完成，无需手工。')
         return
-    # 无 API：只记录并给出手工清单
-    st = auto_port_state()
-    known = {(int(r['port']), str(r['proto'])) for r in (st.get('opened') or [])}
-    pending = {k: v for k, v in desired.items() if k not in known}
-    st['opened'] = [{'port': k[0], 'proto': k[1], 'client_id': v['client_id'],
-                     'proxy': v['proxy'],
-                     'opened_at': dt.datetime.now().isoformat(timespec='seconds')}
-                    for k, v in sorted(desired.items())]
-    save_auto_port_state(st)
-    if not pending:
-        result_ok('同步完成：没有新增端口。'); return
-    _report('需要你在宝塔面板手工放行的端口',
-            ['%d/%s  ← %s' % (k[0], k[1], v.get('proxy') or '-')
-             for k, v in sorted(pending.items())])
-    result_info('请到宝塔面板「安全 → 防火墙」添加上述 %d 个端口。' % len(pending),
-                detail='配好 7) 宝塔 API 设置后可自动完成。')
-
-def _panel_rule_pairs():
-    """(port, proto) pairs currently present in the panel."""
-    pairs = []
-    try:
-        for row in panel_rules():
-            try:
-                port = int(str(row.get('port', '')).split(',')[0].split('-')[0])
-            except (TypeError, ValueError):
-                continue
-            types = str(row.get('types', 'tcp')).lower()
-            for proto in ('tcp', 'udp'):
-                if not types or proto in types:
-                    pairs.append({'port': port, 'proto': proto})
-    except (ValueError, OSError):
-        pass
-    return pairs
-
-def _show_opened_ports():
-    opened = auto_port_state().get('opened') or []
-    if not opened:
-        result_info('当前没有由本工具放行的端口。'); return
-    _report('已放行端口（%d 个）' % len(opened),
-            ['%d/%s  ← %s' % (r.get('port'), r.get('proto'), r.get('proxy') or '-')
-             for r in opened])
-
-def _show_online_clients(cfg):
-    try:
-        rows = frps_online_proxies()
-    except (ValueError, OSError) as exc:
-        result_error(str(exc),
-                     hint='请确认 frps 正在运行，且 5) 修改服务端配置 里已开启 Dashboard/API。')
+    if failed:
+        result_error('%d 个端口放行失败。' % len(failed),
+                     hint='用「4) 宝塔 API」里的测试连接确认密钥与白名单配置。')
         return
-    seen = {}
-    for item in rows:
-        cid = str(item.get('clientID') or item.get('clientId') or '')
-        if cid: seen[cid] = seen.get(cid, 0) + 1
-    if not seen:
-        result_info('当前没有在线客户端。'); return
-    _report('在线客户端',
-            ['%s（%d 条映射）%s' % (cid, count,
-                                   '  [已在白名单]' if cid in cfg['allow_clients'] else '')
-             for cid, count in sorted(seen.items())])
-
-def _manage_whitelist(cfg):
-    while True:
-        print('  当前白名单：' + (', '.join(cfg['allow_clients']) if cfg['allow_clients']
-                                else color_state('空')))
-        print(RULE)
-        n = choose(['添加客户端 ID', '移除客户端 ID'], '白名单管理', '返回')
-        if not n: return
-        if n == 1:
-            auto_port_add_client(cfg)
-        else:
-            if not cfg['allow_clients']:
-                result_info('白名单为空。'); continue
-            index = choose(cfg['allow_clients'], '选择要移除的客户端')
-            if not index: continue
-            removed = cfg['allow_clients'].pop(index - 1)
-            save_auto_port_config(cfg)
-            result_ok('已移除：' + removed)
-
-def panel_config_menu():
-    """宝塔/aaPanel API 配置与连通性测试。"""
-    clear_screen()
-    while True:
-        panel = panel_config()
-        ready = panel_api_ready(panel)
-        print('  ' + _kv('面板类型', panel['type']))
-        print('  ' + _kv('API 地址', panel['url'] or color_state('未配置')))
-        print('  ' + _kv('API 密钥', color_state('已配置') if panel['api_key']
-                         else color_state('未配置')))
-        print('  ' + _kv('TLS 校验', '开启' if panel['verify_tls'] else '关闭（自签证书可容忍）'))
-        print('  ' + _kv('当前模式', firewall_mode()))
-        print(RULE)
-        result_info('宝塔面板：设置 → API 接口 → 开启并复制「接口密钥」；'
-                    '建议同时把调用来源限制为 127.0.0.1。')
-        items = ['测试 API 连接（probe）', '设置 API 地址', '设置 API 密钥',
-                 '切换面板类型（宝塔/aaPanel）', '切换 TLS 校验',
-                 '清空面板配置']
-        n = choose(items, '面板 API 配置', '返回上一级')
-        if not n: return
-        try:
-            if n == 1:
-                if not ready:
-                    result_error('面板配置不完整：需要同时配置 API 地址与密钥。'); pause(); continue
-                info = panel_probe(panel)
-                result_ok('API 连接正常：当前有 %d 条防火墙规则。' % info['rules'])
-                pause()
-            elif n == 2:
-                value = ask('面板 API 地址（例 http://127.0.0.1:8888）', panel['url'], allow_empty=True)
-                if value is None: continue
-                if not value.lower().startswith(('http://', 'https://')):
-                    result_error('地址必须以 http:// 或 https:// 开头'); pause(); continue
-                panel['url'] = value.rstrip('/'); save_panel_config(panel)
-                result_ok('已保存 API 地址。'); pause()
-            elif n == 3:
-                import getpass
-                try:
-                    value = getpass.getpass('\n  面板 API 密钥（输入不回显，直接回车取消）：')
-                except EOFError:
-                    continue
-                if not value: result_info('已取消。'); pause(); continue
-                panel['api_key'] = value.strip(); save_panel_config(panel)
-                result_ok('已保存 API 密钥（写入 auto-port.toml，权限 0600）。')
-                result_info('可用第 1 项测试连接。'); pause()
-            elif n == 4:
-                index = choose(['baota（宝塔 Linux）', 'aapanel（宝塔国际版）'], '选择面板类型')
-                if not index: continue
-                panel['type'] = 'baota' if index == 1 else 'aapanel'
-                save_panel_config(panel); result_ok('已切换为 ' + panel['type']); pause()
-            elif n == 5:
-                panel['verify_tls'] = not panel['verify_tls']
-                save_panel_config(panel)
-                result_ok('TLS 校验已' + ('开启' if panel['verify_tls'] else '关闭')); pause()
-            elif n == 6:
-                if not confirm('将清空面板 API 配置（不影响面板本身）。确认？', danger=True):
-                    result_info('已取消。'); pause(); continue
-                panel['url'] = ''; panel['api_key'] = ''
-                save_panel_config(panel)
-                result_ok('已清空面板配置；模式将回落到只读或直写。'); pause()
-        except MENU_ERRORS as exc:
-            result_error(str(exc), hint='可在面板「设置 → API 接口」确认密钥与 IP 白名单。'); pause()
-def auto_port_add_client(cfg):
-    """Add a clientID to the whitelist: pick from discovered clients or type it."""
-    discovered = []
-    try:
-        seen = {}
-        for item in frps_online_proxies():
-            cid = str(item.get('clientID') or item.get('clientId') or '')
-            if cid: seen[cid] = seen.get(cid, 0) + 1
-        discovered = ['%s（%d 条映射）' % (cid, count) for cid, count in sorted(seen.items())
-                      if cid not in cfg['allow_clients']]
-    except (ValueError, OSError):
-        discovered = []
-    options = discovered + ['手动输入 clientID']
-    if len(options) == 1:
-        value = ask('clientID（留空取消）', allow_empty=True)
-    else:
-        index = choose(options, '选择要加入白名单的客户端')
-        if not index: return
-        if index <= len(discovered):
-            value = discovered[index - 1].split('（')[0]
-        else:
-            value = ask('clientID（留空取消）', allow_empty=True)
-    if not value: return
-    if value in cfg['allow_clients']:
-        result_info('该 clientID 已在白名单中。'); return
-    cfg['allow_clients'].append(value)
-    save_auto_port_config(cfg)
-    result_ok('已加入白名单：' + value)
+    if added or removed:
+        result_ok('同步完成：放行 %d 个，回收 %d 个。' % (len(added), len(removed)))
+        return
+    if skipped:
+        result_info('没有端口被放行：全部被规则拦下。',
+                    detail='检查白名单、敏感端口黑名单与配额设置。')
+        return
+    result_info('没有需要放行的新端口。')
 
 def ports_command(argv, flags=None):
     """CLI: ports status|plan|apply|enable|disable|clients|rules|revert."""
@@ -4654,7 +4744,7 @@ def ports_command(argv, flags=None):
         if as_json: print(json.dumps(report, ensure_ascii=False, indent=2)); return
         _report('变更计划（未执行）', auto_port_report_lines(report, plan_only=True)); return
     if action == 'apply':
-        report = ports_sync(apply_changes=True)
+        report = ports_sync(apply_changes=True, force=True)
         if as_json: print(json.dumps(report, ensure_ascii=False, indent=2)); return
         _report('同步结果', auto_port_report_lines(report)); result_ok('同步完成。'); return
     if action == 'enable':
@@ -4761,11 +4851,26 @@ def ports_command(argv, flags=None):
             print(_kv('工作模式', payload['mode']))
             print(RULE); return
         if sub == 'set':
-            if len(argv) < 3: raise ValueError('用法：ports panel set <url> [api_key]')
-            panel['url'] = argv[2].rstrip('/')
-            if len(argv) > 3: panel['api_key'] = argv[3]
+            if len(argv) < 3: raise ValueError('用法：ports panel set <url>（密钥请用交互输入或环境变量）')
+            url = argv[2].rstrip('/')
+            if not url.lower().startswith(('http://', 'https://')):
+                raise ValueError('API 地址必须以 http:// 或 https:// 开头')
+            if len(argv) > 3:
+                # 密钥不进 argv（会留在 shell history / ps 输出里）
+                raise ValueError('请勿在命令行传 API 密钥：'
+                                 '改用交互输入（frps ports panel set-key）'
+                                 '或环境变量 FRP_PANEL_API_KEY')
+            panel['url'] = url
             save_panel_config(panel)
-            result_ok('面板配置已保存。'); return
+            result_ok('已保存 API 地址：' + url); return
+        if sub == 'set-key':
+            import getpass
+            try: key = getpass.getpass('面板 API 密钥（输入不回显）：').strip()
+            except EOFError: raise ValueError('已取消')
+            if not key: raise ValueError('密钥不能为空')
+            panel['api_key'] = key
+            save_panel_config(panel)
+            result_ok('已保存 API 密钥（写入 auto-port.toml，权限 0600）。'); return
         if sub == 'probe':
             info = panel_probe(panel)
             if as_json: print(json.dumps({'ok': info['ok'], 'rules': info['rules']},
@@ -4784,8 +4889,8 @@ def ports_command(argv, flags=None):
                                                     r.get('client_id', '-'), r.get('proxy', '-'))
                                for r in opened]); return
     if action == 'revert':
-        removed = ports_revert()
-        result_ok('已撤销 %d 条自动放行规则。' % len(removed)); return
+        outcome = ports_revert()
+        _report_revert(outcome); return
     raise ValueError('支持 ports status|plan|apply|enable|disable|clients|rules|revert')
 def install(role, yes=False, no_start=False, non_interactive=False):
     script = Path(__file__).resolve().parent.parent / ('install-' + role + ('.ps1' if os.name == 'nt' else '.sh'))
@@ -5194,7 +5299,7 @@ def upgrade(role, target=None, yes=False):
     return True
 
 
-CLI_FLAGS = ('--json', '--yes', '--purge', '--follow', '--no-start', '--non-interactive')
+CLI_FLAGS = ('--json', '--yes', '--purge', '--follow', '--no-start', '--non-interactive', '--force')
 
 def _parse_flags(argv):
     """Split argv into positional args and recognised long flags (详细设计 §16)."""

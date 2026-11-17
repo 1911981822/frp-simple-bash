@@ -2,7 +2,7 @@
 param([ValidateSet('v0.72.0')][string]$Version='v0.72.0', [string]$WinSWSha256='', [switch]$NoStart)
 $ErrorActionPreference='Stop'
 [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
-$ManagerVersion='v1.0.0-rc.16'
+$ManagerVersion='v1.0.0-rc.17'
 # Follow redirects explicitly so HTTPS can never downgrade to HTTP.
 function Get-HttpsFile([string]$Url, [string]$Destination) {
     $uri = [Uri]$Url
@@ -12,7 +12,7 @@ function Get-HttpsFile([string]$Url, [string]$Destination) {
         $request.AllowAutoRedirect = $false
         $request.Timeout = 120000
         $request.ReadWriteTimeout = 120000
-        $request.UserAgent = 'frp-simple-bash/v1.0.0-rc.16'
+        $request.UserAgent = 'frp-simple-bash/v1.0.0-rc.17'
         $response = $request.GetResponse()
         try {
             $status = [int]$response.StatusCode

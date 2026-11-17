@@ -453,15 +453,32 @@ class AutoPortTests(unittest.TestCase):
         panel = {'type': 'baota', 'url': 'http://127.0.0.1:8888', 'api_key': 'k',
                  'verify_tls': False, 'timeout': 5, 'node': '', 'mode': 'auto',
                  'list_action': 'GetRules', 'add_action': 'AddRule', 'del_action': 'DelRule'}
-        with patch.object(m, 'panel_request', side_effect=[
-                {'status': True},                                                  # AddRule
-                {'status': True, 'data': [{'id': '7', 'port': '6000', 'types': 'tcp'}]},  # GetRules
-                {'status': True}]) as request:                                     # DelRule
+        rows = [{'id': '7', 'port': '6000', 'types': 'tcp', 'ps': m.PANEL_RULE_MARK}]
+        with patch.object(m, 'panel_rules', return_value=rows), \
+             patch.object(m, 'panel_request', return_value={'status': True}) as request:
+            # 已存在本工具规则 → 不再重复 AddRule（幂等）
             m.panel_add_rule(6000, 'tcp', panel)
-            self.assertEqual(request.call_args_list[0][0][0], 'AddRule')
-            self.assertEqual(request.call_args_list[0][0][1]['ps'], 'frp-simple-bash-auto')
+            request.assert_not_called()
+            # 删除走 GetRules 找到的 id
             self.assertTrue(m.panel_del_rule(6000, 'tcp', panel))
-            self.assertEqual(request.call_args_list[2][0][1], {'id': '7'})
+            self.assertEqual(request.call_args[0][1], {'id': '7'})
+
+    def test_panel_del_rule_never_touches_user_rules(self):
+        panel = {'type': 'baota', 'url': 'http://127.0.0.1:8888', 'api_key': 'k',
+                 'verify_tls': False, 'timeout': 5, 'node': '', 'mode': 'auto',
+                 'list_action': 'GetRules', 'add_action': 'AddRule', 'del_action': 'DelRule'}
+        rows = [{'id': '1', 'port': '22', 'types': 'tcp', 'ps': '用户自己加的'},
+                {'id': '2', 'port': '8888', 'types': 'tcp', 'ps': '面板端口'}]
+        with patch.object(m, 'panel_rules', return_value=rows), \
+             patch.object(m, 'panel_request') as request:
+            self.assertFalse(m.panel_del_rule(22, 'tcp', panel))
+            self.assertFalse(m.panel_del_rule(8888, 'tcp', panel))
+        request.assert_not_called()
+
+    def test_panel_status_missing_is_failure(self):
+        self.assertFalse(m._panel_status_ok({'data': [], 'msg': 'boom'}))
+        self.assertTrue(m._panel_status_ok({'status': True}))
+        self.assertTrue(m._panel_status_ok({'status': 'ok'}))
 
     def test_mode_is_panel_api_when_configured(self):
         panel = m.panel_config()
@@ -577,7 +594,8 @@ class AutoPortTests(unittest.TestCase):
         api.assert_not_called()
         self.assertEqual(report['mode'], 'manual')
         self.assertEqual([x['port'] for x in report['pending']], [6000])
-        self.assertEqual([r['port'] for r in m.auto_port_state()['opened']], [6000])
+        # 手工模式没有真正放行，绝不能记录成 opened（否则就是假成功）
+        self.assertEqual(m.auto_port_state()['opened'], [])
 
     def test_sync_with_api_calls_panel_add(self):
         cfg = self.cfg(enabled=True, allow_clients=['clientA'])
@@ -597,7 +615,8 @@ class AutoPortTests(unittest.TestCase):
         cfg = self.cfg(enabled=True, allow_clients=['clientA'])
         m.save_auto_port_config(cfg)
         m.save_auto_port_state({'schema_version': 1, 'opened': [
-            {'port': 6000, 'proto': 'tcp', 'proxy': 'old'}]})
+            {'port': 6000, 'proto': 'tcp', 'proxy': 'old',
+             'missing_since': '2000-01-01T00:00:00'}]})
         with patch.object(m, 'panel_api_ready', return_value=True), \
              patch.object(m, 'panel_add_rule'), \
              patch.object(m, 'panel_del_rule', return_value=True) as delete, \
@@ -608,31 +627,121 @@ class AutoPortTests(unittest.TestCase):
         delete.assert_called_once_with(6000, 'tcp', m.panel_config())
         self.assertEqual(report['removed'], [{'port': 6000, 'proto': 'tcp'}])
 
-    def test_menu_has_core_items_only(self):
-        """主菜单只保留 4 项核心功能。"""
+    def test_menu_is_flat_six_items(self):
+        """端口自动开通：一屏 6 项，无子菜单。"""
         out = io.StringIO()
         with patch('builtins.input', side_effect=['0']), \
              contextlib.redirect_stdout(out):
             m.auto_port_menu()
         shown = out.getvalue()
-        for label in ('查看待放行端口', '同步并放行', '白名单管理', '宝塔 API 设置'):
+        for label in ('查看待放行端口', '同步并放行', '白名单', '宝塔 API',
+                      '开启自动同步', '撤销全部放行'):
             self.assertIn(label, shown, label)
-        # 状态块只显示两行（放行方式 + 白名单/自动同步合并）
-        self.assertIn('放行方式', shown)
-        self.assertIn('白名单', shown)
-        self.assertNotIn('定时同步', shown)
+        # 状态块 3 行
+        for key in ('放行方式', '白名单', '自动同步'):
+            self.assertIn(key, shown)
+        # 不得出现子菜单标题
+        self.assertNotIn('白名单与同步', shown)
 
-    def test_whitelist_menu_covers_auto_sync_and_revert(self):
-        """白名单子菜单承载：已放行查看、自动同步开关、撤销。"""
+    def test_whitelist_action_is_single_shot(self):
+        """白名单只做一次动作，不循环。"""
         cfg = m.auto_port_config()
+        out = io.StringIO()
+        with patch.object(m, 'frps_online_proxies', return_value=[]), \
+             patch('builtins.input', side_effect=['0']), \
+             contextlib.redirect_stdout(out):
+            m._whitelist_action(cfg)
+        self.assertIn('白名单操作', out.getvalue())
+
+    def test_choose_zero_is_single_back(self):
+        """统一交互：0 就是返回，不需要连按两次。"""
+        with patch('builtins.input', side_effect=['0']):
+            self.assertEqual(m.choose(['a']), 0)
+        with patch('builtins.input', side_effect=['0']):
+            self.assertEqual(m.choose(['a'], 't', '退出'), 0)
+
+    def test_choose_blank_reprompts_without_exit(self):
+        with patch('builtins.input', side_effect=['', '1']):
+            self.assertEqual(m.choose(['a']), 1)
+
+    def test_choose_b_is_not_a_return_alias(self):
+        """b 不再等价于 0（去掉多余规则）。"""
+        with patch('builtins.input', side_effect=['b', '0']), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(m.choose(['a']), 0)
+
+    # ---- 审查修复回归（rc.17）----
+
+    def test_manual_mode_never_records_fake_opened(self):
+        """手工模式没有真正放行，绝不能写 opened（防假成功）。"""
+        cfg = self.cfg(enabled=True, allow_clients=['clientA'])
+        m.save_auto_port_config(cfg)
+        with patch.object(m, 'firewall_mode', return_value='manual'), \
+             patch.object(m, 'panel_api_ready', return_value=False), \
+             patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]), \
+             patch.object(m, 'port_conflict', return_value=False), \
+             patch.object(m, '_service_pid', return_value=1):
+            report = m.ports_sync(apply_changes=True)
+        self.assertEqual(report['mode'], 'manual')
+        self.assertEqual(len(report['pending']), 1)
+        self.assertEqual(m.auto_port_state()['opened'], [])
+
+    def test_api_failure_does_not_record_opened(self):
+        cfg = self.cfg(enabled=True, allow_clients=['clientA'])
+        m.save_auto_port_config(cfg)
+        with patch.object(m, 'firewall_mode', return_value='panel-api'), \
+             patch.object(m, 'panel_api_ready', return_value=True), \
+             patch.object(m, 'panel_add_rule', side_effect=ValueError('boom')), \
+             patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]), \
+             patch.object(m, 'port_conflict', return_value=False), \
+             patch.object(m, '_service_pid', return_value=1):
+            report = m.ports_sync(apply_changes=True)
+        self.assertEqual(m.auto_port_state()['opened'], [])
+        self.assertTrue(any(s['reason'] == 'apply_failed' for s in report['skipped']))
+
+    def test_sync_has_prune_grace_period(self):
+        """映射消失不是立刻删规则，先打 missing_since 标记。"""
+        cfg = self.cfg(enabled=True, allow_clients=['clientA'], prune_after_seconds=3600)
+        m.save_auto_port_config(cfg)
+        m.save_auto_port_state({'schema_version': 1, 'opened': [
+            {'port': 6000, 'proto': 'tcp', 'proxy': 'old'}]})
+        with patch.object(m, 'firewall_mode', return_value='panel-api'), \
+             patch.object(m, 'panel_api_ready', return_value=True), \
+             patch.object(m, 'panel_add_rule'), \
+             patch.object(m, 'panel_del_rule') as delete, \
+             patch.object(m, 'frps_online_proxies', return_value=[]), \
+             patch.object(m, 'port_conflict', return_value=False), \
+             patch.object(m, '_service_pid', return_value=1):
+            m.ports_sync(apply_changes=True)
+        delete.assert_not_called()
+        self.assertIn('missing_since', m.auto_port_state()['opened'][0])
+
+    def test_corrupt_frps_toml_does_not_crash_menu(self):
+        m.atomic(m.ROOT / 'frps.toml', 'this is not toml [[[')
         out = io.StringIO()
         with patch('builtins.input', side_effect=['0']), \
              contextlib.redirect_stdout(out):
-            m.whitelist_menu(cfg)
-        shown = out.getvalue()
-        for label in ('添加客户端', '移除客户端', '查看已放行端口',
-                      '开启自动同步', '撤销全部自动放行'):
-            self.assertIn(label, shown, label)
+            m.main_menu('frps')      # 不得抛异常
+        self.assertIn('无法解析', out.getvalue())
+
+    def test_panel_timeout_not_a_number_does_not_crash(self):
+        m.atomic(m.ROOT / 'auto-port.toml', 'panel_mode = "auto"\n[panel]\ntimeout = "10s"\n')
+        self.assertEqual(m.panel_config()['timeout'], 10)
+
+    def test_force_is_a_known_cli_flag(self):
+        self.assertIn('--force', m.CLI_FLAGS)
+
+    def test_panel_set_rejects_key_in_argv(self):
+        with self.assertRaises(ValueError) as ctx:
+            m.ports_command(['panel', 'set', 'http://127.0.0.1:8888', 'secret'],
+                            {})
+        self.assertIn('密钥', str(ctx.exception))
+
+    def test_validate_mappings_ignores_disabled_duplicates(self):
+        a = {'name': 'a', 'type': 'tcp', 'local_ip': '127.0.0.1', 'local_port': 1,
+             'remote_port': 6000, 'enabled': True}
+        b = dict(a, name='b', enabled=False)
+        m.validate_mappings([a, b])      # 停用项不参与查重，不应抛错
 
 if __name__ == '__main__':
     unittest.main()

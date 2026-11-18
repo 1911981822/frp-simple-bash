@@ -32,7 +32,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.23'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.24'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -3132,8 +3132,16 @@ def web_manager_menu():
                         raise ValueError('端口 %d 已被占用，请换一个' % new_port)
                     cfg['bind'], cfg['port'] = new_bind, new_port
                     webui.save_web_config(cfg)
-                    result_ok('已保存监听地址：%s:%d' % (new_bind, new_port),
-                              detail='需重启 Web 服务生效（本菜单第 2 项停止，再启动）。')
+                    result_ok('已保存监听地址：%s:%d' % (new_bind, new_port))
+                    if installed and confirm('立即重启 Web 服务使其生效？'):
+                        ok, message = web_service_restart()
+                        if ok:
+                            result_ok('已重启：http://%s:%d/' % (new_bind, new_port))
+                        else:
+                            result_error('重启失败：' + (message or '未知原因'),
+                                         hint='可稍后执行 frpc web --restart')
+                    else:
+                        result_info('稍后可用 frpc web --restart 或本菜单第 2 项重启。')
                 else:
                     result_info('监听地址未变化。')
                 pause()
@@ -5545,6 +5553,34 @@ def web_service_enable():
             out = run_cmd(['launchctl', 'bootstrap', 'system', str(path)],
                           capture_output=True, text=True, timeout=60)
         return out.returncode == 0, (out.stderr or '').strip()[:200]
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+
+
+def web_service_restart():
+    """重启 Web 服务（让改过的端口/绑定/密码生效）。
+
+    比让用户自己记 systemctl/rc-service/launchctl 更可靠：不同平台命令不同，
+    文档里写 `systemctl restart ...` 在 OpenRC/macOS 上就是错的。
+    """
+    path, kind = _web_unit_paths()
+    if kind == 'windows':
+        return False, 'Windows 请手动重启服务'
+    if path is None:
+        return False, '当前平台不支持服务管理'
+    if not path.exists():
+        return False, 'Web 服务尚未安装（可先运行 frpc web --install-service）'
+    try:
+        if kind == 'systemd':
+            out = run_cmd(['systemctl', 'restart', WEB_SERVICE],
+                          capture_output=True, text=True, timeout=60)
+        elif kind == 'openrc':
+            out = run_cmd(['rc-service', WEB_SERVICE, 'restart'],
+                          capture_output=True, text=True, timeout=60)
+        else:
+            out = run_cmd(['launchctl', 'kickstart', '-k', 'system/' + WEB_SERVICE],
+                          capture_output=True, text=True, timeout=60)
+        return out.returncode == 0, (out.stderr or out.stdout or '').strip()[:200]
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return False, str(exc)
 

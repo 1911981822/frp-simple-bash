@@ -902,5 +902,69 @@ class HttpApiTests(unittest.TestCase):
         self.assertIn('GENPASS12345', buf.getvalue())
         self.assertTrue(flushes, '启动信息打印后必须 flush')
 
+    # ---- CLI 参数完整性（对应文档里列出的全部操作）----
+
+    def test_help_lists_every_documented_operation(self):
+        """文档里出现的每个操作都必须能在 frpc web 里找到。"""
+        import io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            w.main(['--help'])
+        text = buf.getvalue()
+        expected = [
+            '--bind', '--port',                      # 临时启动
+            '--install-service', '--uninstall-service',
+            '--restart',                             # 配置生效
+            '--disable', '--enable', '--status',
+            '--set-bind', '--set-port', '--set-password',
+            '--reset-password',                      # 非交互重置
+            '--show-password',                        # 找回首次密码
+        ]
+        for flag in expected:
+            self.assertIn(flag, text, flag)
+
+    def test_reset_password_generates_and_persists(self):
+        import io as _io, re as _re
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            w.main(['--reset-password'])
+        output = buf.getvalue()
+        match = _re.search(r'密码[\s\u3000]*[：:]\s*(\S+)', output)
+        self.assertIsNotNone(match, output)
+        password = match.group(1)
+        cfg = w.load_web_config()
+        self.assertTrue(w.verify_password(password, cfg['password_hash']))
+        self.assertTrue(cfg.get('must_change_password'))
+
+    def test_restart_reports_not_installed_clearly(self):
+        import io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            w.main(['--restart'])
+        self.assertIn('未安装', buf.getvalue())
+
+    def test_show_password_without_journalctl_gives_fallback(self):
+        import io as _io
+        buf = _io.StringIO()
+        with patch.object(w.manager, 'run_cmd'), \
+             patch('shutil.which', return_value=None), \
+             contextlib.redirect_stdout(buf):
+            w.main(['--show-password'])
+        self.assertIn('--reset-password', buf.getvalue())
+
+    def test_initial_password_parsing(self):
+        """能从日志行里提取首次密码（全角/半角冒号都要认）。"""
+        import io as _io
+        fake = ('frpc Web 管理端已启动\n'
+                '    用户名：admin\n'
+                '    密码　：AbC-d_12345\n')
+        buf = _io.StringIO()
+        with patch.object(w.manager, 'run_cmd',
+                          return_value=type('R', (), {'stdout': fake, 'returncode': 0})()), \
+             patch('shutil.which', return_value='/usr/bin/journalctl'), \
+             contextlib.redirect_stdout(buf):
+            w.main(['--show-password'])
+        self.assertIn('AbC-d_12345', buf.getvalue())
+
 if __name__ == '__main__':
     unittest.main()

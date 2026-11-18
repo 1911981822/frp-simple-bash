@@ -72,16 +72,31 @@ frpc              # 菜单 → 12) Web 管理端
 
 或直接用命令：
 
+全部操作都能在 `frpc web` 里完成，不需要记 systemctl：
+
 ```bash
+# 临时启动（不写配置）
+sudo frpc web                    # 前台启动，Ctrl-C 结束
+sudo frpc web --port 7600        # 临时换端口
+sudo frpc web --bind 0.0.0.0     # 临时对外（注意风险）
+
+# 服务管理
 sudo frpc web --status           # 看状态与访问地址
-sudo frpc web                    # 前台启动
 sudo frpc web --install-service  # 装成常驻服务（安装 frpc 时通常已自动完成）
-sudo frpc web --set-port 7600    # 改端口
-sudo frpc web --set-password     # 重置密码
-sudo frpc web --disable          # 临时停用（--enable 恢复）
+sudo frpc web --restart          # 重启（改完配置生效用这个）
+sudo frpc web --disable          # 临时停用（保留单元文件）
+sudo frpc web --enable           # 重新启用
+sudo frpc web --uninstall-service # 停止并移除
+
+# 配置与密码
+sudo frpc web --set-port 7600    # 改端口（持久化，带占用检测）
+sudo frpc web --set-bind 127.0.0.1
+sudo frpc web --set-password     # 交互输入新密码
+sudo frpc web --reset-password   # 生成随机密码并打印（非交互）
+sudo frpc web --show-password    # 从服务日志找回首次密码
 ```
 
-首次密码：`sudo journalctl -u frp-simple-bash-web | grep 密码`。
+整个清单也可以用 `sudo frpc web --help` 查看。
 远程服务器建议用 SSH 隧道访问：`ssh -L 7501:127.0.0.1:7501 用户名@服务器`。
 
 ### 端口自动开通（frps 侧）

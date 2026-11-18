@@ -2238,6 +2238,41 @@ def run(bind=None, port=None, foreground=True, open_browser=False):
             _shutdown_listener(entry)
 
 
+def _print_initial_password():
+    """从服务日志里找回首次启动时打印的随机密码。
+
+    密码不落盘（只存 PBKDF2 哈希），首次启动时打印到 stdout；
+    常驻服务下 stdout 进 journal，所以这里有唯一可行的找回路径。
+    """
+    import shutil as _shutil
+    if not _shutil.which('journalctl'):
+        print('当前平台没有 journalctl，无法从日志找回首次密码。')
+        print('  可直接重置一个新密码：frpc web --reset-password')
+        return
+    try:
+        proc = manager.run_cmd(
+            ['journalctl', '-u', manager.WEB_SERVICE, '--no-pager', '-o', 'cat'],
+            capture_output=True, text=True, timeout=30)
+        output = proc.stdout or ''
+    except (OSError, ValueError) as exc:
+        print('读取服务日志失败：' + str(exc))
+        print('  可直接重置一个新密码：frpc web --reset-password')
+        return
+    found = None
+    for line in output.splitlines():
+        match = re.search(r'密码[\s\u3000]*[：:]\s*(\S+)', line)
+        if match:
+            found = match.group(1)
+    if not found:
+        print('日志里没有找到首次密码（可能在首次登录后已改过，或日志已被轮转）。')
+        print('  可重置一个新密码：frpc web --reset-password')
+        return
+    cfg = load_web_config()
+    print('首次启动时的面板密码：' + found)
+    print('  用户名：%s' % cfg.get('username'))
+    print('  若已修改过密码，请用新密码；忘记则执行 frpc web --reset-password')
+
+
 def main(argv=None):
     """CLI 入口：frpc web [--bind A] [--port N] [--set-password] [--set-bind A] [--set-port N]"""
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -2250,6 +2285,7 @@ def main(argv=None):
             if item == '--set-bind':
                 cfg = load_web_config(); cfg['bind'] = argv[i + 1]; save_web_config(cfg)
                 print('已保存绑定地址：%s' % argv[i + 1])
+                print('  生效：frpc web --restart')
             else:
                 bind = argv[i + 1]
             i += 2; continue
@@ -2264,7 +2300,8 @@ def main(argv=None):
                     raise ValueError('端口 %d 已被占用，请换一个' % new_port)
                 cfg['port'] = new_port
                 save_web_config(cfg)
-                print('已保存端口：%d（重启 Web 服务后生效）' % new_port)
+                print('已保存端口：%d' % new_port)
+                print('  生效：frpc web --restart')
             else:
                 port = int(argv[i + 1])
             i += 2; continue
@@ -2282,6 +2319,30 @@ def main(argv=None):
             if ok:
                 cfg = load_web_config()
                 print('  访问地址：http://%s:%s/' % (cfg.get('bind'), cfg.get('port')))
+            return
+        if item == '--restart':
+            ok, message = manager.web_service_restart()
+            if ok:
+                cfg = load_web_config()
+                print('已重启 Web 服务：http://%s:%s/' % (cfg.get('bind'), cfg.get('port')))
+            else:
+                print('重启失败：' + (message or '未知原因'))
+            return
+        if item == '--reset-password':
+            # 非交互重置：生成随机密码并打印，适合脚本/批量运维
+            password = secrets.token_urlsafe(12)
+            cfg = load_web_config()
+            cfg['password_hash'] = hash_password(password)
+            cfg['must_change_password'] = True
+            save_web_config(cfg)
+            web_audit('password-reset', result='ok', detail='via --reset-password')
+            print('面板密码已重置（请立即记录）：')
+            print('  用户名：%s' % cfg.get('username'))
+            print('  密码　：%s' % password)
+            print('  重启后生效：frpc web --restart')
+            return
+        if item == '--show-password':
+            _print_initial_password()
             return
         if item == '--install-service':
             ok, message = manager.web_service_install()
@@ -2301,9 +2362,26 @@ def main(argv=None):
             print('  配置路径：' + str(web_config_path()))
             return
         if item in ('-h', '--help'):
-            print('用法：frpc web [--bind 地址] [--port 端口] [--set-bind 地址] '
-                  '[--set-port 端口] [--set-password] [--install-service] '
-                  '[--uninstall-service] [--disable] [--enable] [--status]')
+            print('用法：frpc web [选项]')
+            print()
+            print('  临时启动（不写配置）：')
+            print('    frpc web                     前台启动，默认 127.0.0.1:7501')
+            print('    --bind 地址 --port 端口      临时指定监听地址/端口')
+            print()
+            print('  服务管理：')
+            print('    --install-service            安装并启动常驻服务（开机自启）')
+            print('    --uninstall-service          停止并移除常驻服务')
+            print('    --restart                    重启服务（让改过的配置生效）')
+            print('    --disable                    停止并禁用（保留单元文件）')
+            print('    --enable                     重新启用并启动')
+            print('    --status                     查看服务状态与访问地址')
+            print()
+            print('  配置与密码：')
+            print('    --set-bind 地址              修改绑定地址（持久化）')
+            print('    --set-port 端口              修改端口（持久化，带占用检测）')
+            print('    --set-password               交互输入新密码')
+            print('    --reset-password             生成随机密码并打印（非交互）')
+            print('    --show-password              从服务日志找回首次密码')
             return
         raise ValueError('未知参数：' + item)
     if set_password:
@@ -2320,7 +2398,8 @@ def main(argv=None):
         cfg = load_web_config()
         cfg['password_hash'] = hash_password(first)
         save_web_config(cfg)
-        print('密码已更新（请重启 Web 服务生效）')
+        print('密码已更新')
+        print('  生效：frpc web --restart')
         return
     run(bind=bind, port=port)
 

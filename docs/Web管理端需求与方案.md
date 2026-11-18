@@ -688,3 +688,39 @@ web/src/components/      StatusBadge / EmptyState / ErrorState / ConfirmDialog
 - 子菜单实测：查看地址（含 SSH 隧道提示）、重置密码（getpass）、安装/停止动态项
 - 新增 3 条测试：菜单编号与位置、子菜单地址与 SSH 提示、菜单内重置密码
 - 全量 **382 测试通过**
+
+
+---
+
+## 19. CLI 参数补全（rc.24）
+
+目标：文档里列出的每个 Web 操作，都必须在 `frpc web` 里能找到，不需要用户记
+`systemctl`（不同平台命令还不同）。
+
+### 19.1 核对结果
+
+| 文档里的操作 | 原先 | 处理 |
+|---|---|---|
+| `--status` / `--install-service` / `--uninstall-service` | 已有 | 跳过 |
+| `--disable` / `--enable` | 已有（rc.22 补） | 跳过 |
+| `--bind` / `--port`（临时启动） | 已有 | 跳过 |
+| `--set-bind` / `--set-port` / `--set-password` | 已有 | 跳过 |
+| **改完配置后重启** | ❌ 文档让用户执行 `systemctl restart`，而 OpenRC/macOS 上这条命令是错的 | **新增 `--restart`** |
+| **查看首次密码** | ❌ 文档让用户 `journalctl \| grep 密码` | **新增 `--show-password`**（从 journal 提取，非 systemd 时给替代方案） |
+| **忘记密码想非交互重置** | ❌ 只有交互版 `--set-password` | **新增 `--reset-password`**（生成随机密码并打印） |
+
+### 19.2 顺带改进
+
+- `--set-port` / `--set-bind` / `--set-password` 成功后，提示「生效：frpc web --restart」，
+  不再让用户自己猜要重启什么。
+- 菜单「12) Web 管理端 → 修改监听地址」保存后直接问「立即重启使其生效？」，内部调
+  `web_service_restart()`，不用退出去手动执行两条命令。
+- `--help` 从一行挤在一起的用法，改成分组说明（临时启动 / 服务管理 / 配置与密码）。
+
+### 19.3 验证
+
+- 实测：`--help` 列出全部 13 个参数；`--reset-password` 生成的密码能通过 `verify_password`；
+  `--restart` 未安装时给出准确提示；`--show-password` 在无 journalctl 时引导用 `--reset-password`；
+  日志密码解析对全角/半角冒号都成立
+- 新增 5 条测试（help 覆盖全部文档操作、重置密码可验证、未安装提示、无 journal 兜底、密码解析）
+- 全量 **387 测试通过**

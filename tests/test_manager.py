@@ -1381,4 +1381,48 @@ class ManagerTests(unittest.TestCase):
             m.save_mappings(pid, [a, b])
         self.assertEqual(len(m.mappings(pid)), 2)
 
+    # ---- frpc 菜单新增「Web 管理端」（方案 A：运维分组，后续项顺延）----
+
+    def test_frpc_menu_has_web_entry_at_12(self):
+        """菜单第 12 项必须是 Web 管理端，且后续项顺延。"""
+        import io as _io
+        out = _io.StringIO()
+        with patch('builtins.input', side_effect=['0']), \
+             contextlib.redirect_stdout(out):
+            m.main_menu('frpc')
+        shown = out.getvalue()
+        self.assertIn('12) Web 管理端', shown)
+        self.assertIn('13) 备份与恢复配置', shown)
+        self.assertIn('14) 设置/取消开机自启动', shown)
+        self.assertIn('15) 卸载 frpc', shown)
+        self.assertIn('16) 升级 frpc', shown)
+        # 旧编号不能再出现
+        self.assertNotIn('12) 备份与恢复配置', shown)
+        self.assertNotIn('13) 设置/取消开机自启动', shown)
+
+    def test_web_manager_menu_shows_url_and_ssh_hint(self):
+        """Web 子菜单要给出访问地址与 SSH 隧道提示。"""
+        import io as _io, sys as _sys
+        _sys.modules.setdefault('manager_under_test', m)
+        out = _io.StringIO()
+        with patch('builtins.input', side_effect=['1', '', '0']), \
+             contextlib.redirect_stdout(out):
+            m.web_manager_menu()
+        shown = out.getvalue()
+        self.assertIn('http://127.0.0.1', shown)
+        self.assertIn('ssh -L', shown)
+
+    def test_web_manager_menu_reset_password(self):
+        """菜单里能重置面板密码（无需知道旧密码，因为是 root 操作）。"""
+        import io as _io, sys as _sys
+        _sys.modules.setdefault('manager_under_test', m)
+        out = _io.StringIO()
+        # 选 4 → 新密码 → 再输一次 → 回车暂停 → 0 返回
+        # 注意：密码走 getpass（不读 stdin），必须单独 patch
+        with patch('builtins.input', side_effect=['4', '', '0']), \
+             patch('getpass.getpass', side_effect=['newpass123', 'newpass123']), \
+             contextlib.redirect_stdout(out):
+            m.web_manager_menu()
+        self.assertIn('面板密码已更新', out.getvalue())
+
 if __name__ == '__main__': unittest.main()

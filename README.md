@@ -58,8 +58,31 @@ irm https://download.sueiyuan.top/frp-simple-bash/install-frpc.ps1 | iex   # 客
 | 服务控制 | 启动 / 停止 / 重启 |
 | 服务端管理 | 新建 / 查看 / 切换 / 修改 / 删除服务端 |
 | 端口映射管理 | 添加 / 查看 / 修改 / 删除 TCP、UDP、HTTP 映射 |
-| 运维 | 日志查看、连接诊断、备份恢复、开机自启动 |
+| 运维 | 日志查看、连接诊断、**Web 管理端**、备份恢复、开机自启动 |
 | 危险操作 | 卸载、升级 |
+
+### Web 管理端（frpc 侧）
+
+除了终端菜单，还有一个浏览器管理端（默认只监听 `127.0.0.1:7501`），
+能完成菜单里的全部操作，并额外提供实时日志、一键复制外部地址等。
+
+```bash
+frpc              # 菜单 → 12) Web 管理端
+```
+
+或直接用命令：
+
+```bash
+sudo frpc web --status           # 看状态与访问地址
+sudo frpc web                    # 前台启动
+sudo frpc web --install-service  # 装成常驻服务（安装 frpc 时通常已自动完成）
+sudo frpc web --set-port 7600    # 改端口
+sudo frpc web --set-password     # 重置密码
+sudo frpc web --disable          # 临时停用（--enable 恢复）
+```
+
+首次密码：`sudo journalctl -u frp-simple-bash-web | grep 密码`。
+远程服务器建议用 SSH 隧道访问：`ssh -L 7501:127.0.0.1:7501 用户名@服务器`。
 
 ### 端口自动开通（frps 侧）
 

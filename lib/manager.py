@@ -32,7 +32,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.22'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.23'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -1239,14 +1239,14 @@ def _box(kind, message, detail=None):
     print('└' + '─' * inner + '┘')
 
 def ask(prompt, default=None, secret=False, example=None, allow_back=False, allow_empty=False):
-    if _quiet():
-        raise ValueError('该操作目前需要在终端完成（Web 端暂未实现此交互）')
     """Prompt once. 'q' cancels the operation; 'b' (when allowed) goes one step back.
 
     allow_empty=True returns '' for a blank line (used for "leave empty to clear
     / disable / close"). A required field (no default, allow_empty=False) still
     refuses blank input. 'q' always yields None, which callers must not persist.
     """
+    if _quiet():
+        raise ValueError('该操作目前需要在终端完成（Web 端暂未实现此交互）')
     hint = ''
     if example: hint += f'（例：{example}）'
     if default:
@@ -2929,11 +2929,11 @@ def main_menu(role):
                 '删除服务端/数据',
                 f'管理（{short}）端口映射',
                 '显示所有映射',
-                '查看日志与连接诊断', '备份与恢复配置', '设置/取消开机自启动',
-                '卸载 frpc', '升级 frpc',
+                '查看日志与连接诊断', 'Web 管理端', '备份与恢复配置',
+                '设置/取消开机自启动', '卸载 frpc', '升级 frpc',
             ]
             groups = {0: '── 服务控制 ──', 3: '── 服务端管理（FRPS） ──',
-                      8: '── 端口映射管理 ──', 10: '── 运维 ──', 13: '── 危险操作 ──'}
+                      8: '── 端口映射管理 ──', 10: '── 运维 ──', 14: '── 危险操作 ──'}
         else:
             items = [
                 '启动', '停止', '重启',
@@ -2976,11 +2976,12 @@ def main_menu(role):
                 elif n == 9: mapping_menu(); needs_pause = False
                 elif n == 10: show_all_mappings()
                 elif n == 11: logs_and_diagnostics_menu(role); needs_pause = False
-                elif n == 12: backup_menu(); needs_pause = False
-                elif n == 13:
+                elif n == 12: web_manager_menu(); needs_pause = False
+                elif n == 13: backup_menu(); needs_pause = False
+                elif n == 14:
                     if not autostart(role): needs_pause = False
-                elif n == 14: terminal = uninstall_menu(role)
-                elif n == 15: terminal = upgrade(role)
+                elif n == 15: terminal = uninstall_menu(role)
+                elif n == 16: terminal = upgrade(role)
             else:
                 if n == 1: service_feedback(role, 'start')
                 elif n == 2:
@@ -3002,6 +3003,193 @@ def main_menu(role):
             return
         if needs_pause:
             pause()
+
+
+class _ManagerProxy(object):
+    """把"当前 manager 模块的全局命名空间"活着代理出去。
+
+    webui 里的 import manager 会再执行一份 manager.py（模块级缓存、异常类、
+    ROOT 全都双份），所以这里注入一个代理：属性访问实时走本模块的 globals()。
+    用代理而不是 `sys.modules[__name__]` 的好处是——即使 manager 被 importlib
+    直接执行、没注册进 sys.modules（测试场景），也能正确注入。
+    """
+
+    __slots__ = ('_namespace',)
+
+    def __init__(self, namespace):
+        object.__setattr__(self, '_namespace', namespace)
+
+    def __getattr__(self, name):
+        try:
+            return self._namespace[name]
+        except KeyError:
+            raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        self._namespace[name] = value
+
+
+def _webui_module():
+    """按需加载 webui 模块（manager 不能静态 import 它，否则循环依赖）。"""
+    import importlib.util as _ilu
+    path = Path(__file__).resolve().parent / 'webui.py'
+    if not path.exists():
+        raise ValueError('Web 管理端后端缺失：' + str(path) + '（请重新安装）')
+    spec = _ilu.spec_from_file_location('frp_webui', str(path))
+    module = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.bind_manager(_ManagerProxy(globals()))
+    return module
+
+
+def _web_access_url(webui):
+    cfg = webui.load_web_config()
+    bind = str(cfg.get('bind') or '127.0.0.1')
+    port = int(cfg.get('port') or 7501)
+    host = '[%s]' % bind if ':' in bind else bind
+    if bind in ('0.0.0.0', '::'):
+        host = '127.0.0.1'
+        note = '（已绑定所有网卡，本机访问用 127.0.0.1，其它机器用本机内网 IP）'
+    else:
+        note = ''
+    return 'http://%s:%d/' % (host, port), bind, port, note
+
+
+def web_manager_menu():
+    """Web 管理端子菜单：查看地址、启停服务、改监听、重置密码。"""
+    while True:
+        clear_screen()
+        try:
+            webui = _webui_module()
+            url, bind, port, note = _web_access_url(webui)
+        except (ValueError, OSError) as exc:
+            result_error(str(exc), hint='重新运行安装脚本可补回 Web 端文件。')
+            pause(); return
+        status = web_service_status()
+        installed = web_service_installed()
+
+        def _prelude():
+            print('  ' + _kv('服务状态', color_state(status)))
+            print('  ' + _kv('访问地址', url + ('  ' + _dim(note) if note else '')))
+            print('  ' + _kv('配置文件', str(Path(ROOT) / 'web.json')))
+            if status in ('运行中', 'active', 'started'):
+                print('  ' + _dim('浏览器打开即可；远程服务器可用 SSH 隧道：'))
+                print('  ' + _dim('  ssh -L %d:127.0.0.1:%d 用户名@服务器' % (port, port)))
+
+        items = [
+            '查看访问地址',
+            '停止并禁用服务' if installed and status not in ('已停止', '未安装') else '安装并启动服务',
+            '修改监听地址（端口/绑定）',
+            '重置面板密码',
+            '移除常驻服务' if installed else '查看安装说明',
+        ]
+        n = choose(items, 'Web 管理端', '返回上一级', prelude=_prelude)
+        if not n: return
+        try:
+            if n == 1:
+                section('访问地址')
+                print('  ' + url)
+                print()
+                print('  ' + _dim('本机直接打开；远程服务器建议用 SSH 隧道：'))
+                print('  ' + _dim('  ssh -L %d:127.0.0.1:%d 用户名@服务器' % (port, port)))
+                print('  ' + _dim('  然后在本地浏览器打开 http://127.0.0.1:%d/' % port))
+                pause()
+            elif n == 2:
+                if installed and status not in ('已停止', '未安装'):
+                    ok, message = web_service_disable()
+                    if ok: result_ok('已停止并禁用 Web 服务。', detail='恢复：再次进入本菜单选择「安装并启动服务」')
+                    else: result_error('停用失败：' + (message or '未知原因'))
+                else:
+                    if not installed:
+                        ok, message = web_service_install()
+                        if ok: result_ok('已安装并启动 Web 服务。', detail='访问地址：' + url)
+                        else: result_error('安装失败：' + (message or '未知原因'),
+                                           hint='可手动执行 frpc web --install-service 查看详细原因')
+                    else:
+                        ok, message = web_service_enable()
+                        if ok: result_ok('已启用并启动 Web 服务。', detail='访问地址：' + url)
+                        else: result_error('启动失败：' + (message or '未知原因'))
+                pause()
+            elif n == 3:
+                section('修改监听地址')
+                print('  ' + _dim('当前：%s:%d' % (bind, port)))
+                new_bind = ask('绑定地址（回车保持不变；0.0.0.0 表示所有网卡）',
+                               bind, allow_empty=True)
+                if new_bind is None or new_bind == '': new_bind = bind
+                new_port_raw = ask('端口（回车保持不变）', str(port), allow_empty=True)
+                if new_port_raw is None: new_port_raw = str(port)
+                try:
+                    new_port = int(new_port_raw or port)
+                except ValueError:
+                    raise ValueError('端口必须是数字')
+                if not 1 <= new_port <= 65535: raise ValueError('端口必须在 1-65535 之间')
+                cfg = webui.load_web_config()
+                # 非回环地址 = 把 root 控制面暴露到网络，必须已设密码
+                if new_bind not in ('127.0.0.1', '::1') and not cfg.get('password_hash'):
+                    raise ValueError('绑定非回环地址前必须先设置面板密码（本菜单第 4 项）')
+                if (new_bind, new_port) != (bind, port):
+                    if not _web_port_free(new_bind, new_port):
+                        raise ValueError('端口 %d 已被占用，请换一个' % new_port)
+                    cfg['bind'], cfg['port'] = new_bind, new_port
+                    webui.save_web_config(cfg)
+                    result_ok('已保存监听地址：%s:%d' % (new_bind, new_port),
+                              detail='需重启 Web 服务生效（本菜单第 2 项停止，再启动）。')
+                else:
+                    result_info('监听地址未变化。')
+                pause()
+            elif n == 4:
+                section('重置面板密码')
+                print('  ' + _dim('至少 8 位；输入不回显。忘记旧密码也可以直接重置（需要 root）。'))
+                first = ask('新密码', secret=True, allow_empty=True)
+                if first is None or first == '': result_info('已取消。'); pause(); continue
+                if len(first) < 8: result_error('密码至少 8 位。'); pause(); continue
+                second = ask('再输入一次', secret=True, allow_empty=True)
+                if second != first: result_error('两次输入不一致。'); pause(); continue
+                cfg = webui.load_web_config()
+                cfg['password_hash'] = webui.hash_password(first)
+                cfg['must_change_password'] = False
+                webui.save_web_config(cfg)
+                web_audit_via(webui, 'password-reset')
+                result_ok('面板密码已更新。', detail='若使用常驻服务，重启后生效。')
+                pause()
+            elif n == 5:
+                if installed:
+                    if not confirm('移除 Web 管理端常驻服务？面板将无法访问，frpc 本体不受影响。', danger=True):
+                        result_info('已取消。'); pause(); continue
+                    ok = web_service_uninstall()
+                    if ok: result_ok('已移除 Web 管理端常驻服务。')
+                    else: result_error('移除失败，请检查权限或手动删除服务单元。')
+                else:
+                    section('安装说明')
+                    print('  安装 frpc 时会自动安装 Web 管理端；若当时跳过了，可执行：')
+                    print('  ' + _dim('  sudo frpc web --install-service'))
+                    print('  ' + _dim('  或在本菜单第 2 项选择「安装并启动服务」'))
+                pause()
+        except (ValueError, OSError) as exc:
+            result_error(str(exc)); pause()
+
+
+def _web_port_free(bind, port):
+    """端口能否绑定（仅探测，不占用）。"""
+    import socket
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind((str(bind), int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        try: probe.close()
+        except OSError: pass
+
+
+def web_audit_via(webui, action):
+    """透过 webui 的审计通道记录一次操作（保持日志格式统一）。"""
+    try:
+        webui.web_audit(action, result='ok', detail='via menu')
+    except (AttributeError, OSError):
+        pass
 
 
 def delete_server_menu():
@@ -5980,14 +6168,7 @@ def run(argv=None):
     if cmd == 'web':
         if role != 'frpc':
             err('E001', 'Web 管理端目前只支持客户端 frpc。')
-        import importlib.util as _ilu
-        _spec = _ilu.spec_from_file_location('frp_webui', str(Path(__file__).resolve().parent / 'webui.py'))
-        webui = _ilu.module_from_spec(_spec)
-        _spec.loader.exec_module(webui)
-        # 把"当前正在运行的 manager 模块"注入给 webui：
-        # 否则 webui 里的 import manager 会再加载一份，导致缓存/异常类/全局状态双份
-        webui.bind_manager(sys.modules[__name__])
-        webui.main(argv)
+        _webui_module().main(argv)
         return
     if cmd == 'configure': (configure_server if role == 'frps' else profile_wizard)(); return
     if cmd == 'import': import_external(role); return

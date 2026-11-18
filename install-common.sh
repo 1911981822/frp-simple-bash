@@ -282,18 +282,14 @@ rollback_install() {
   local exit_code=$?
   trap - EXIT
   if ((install_ok == 0)); then
-    # 停止 Web 服务（若已注册），否则回滚后会留下一个指向旧文件的运行中服务
+    # 先停 Web 服务（若已注册），否则回滚后会留下一个指向旧文件的运行中服务。
+    # 注意：这里只停不删——是否删除取决于快照里原本有没有它（见下方恢复段）。
     if [[ "$manager" == systemd ]]; then
       systemctl disable --now frp-simple-bash-web >/dev/null 2>&1 || true
-      rm -f -- /etc/systemd/system/frp-simple-bash-web.service || true
-      systemctl daemon-reload >/dev/null 2>&1 || true
     elif [[ "$manager" == openrc ]]; then
       rc-service frp-simple-bash-web stop >/dev/null 2>&1 || true
-      rc-update del frp-simple-bash-web default >/dev/null 2>&1 || true
-      rm -f -- /etc/init.d/frp-simple-bash-web || true
     elif [[ "$manager" == launchd ]]; then
       launchctl bootout "system/frp-simple-bash.web" >/dev/null 2>&1 || true
-      rm -f -- /Library/LaunchDaemons/frp-simple-bash.web.plist || true
     fi
     for rel in native/$component bin/frps bin/frpc bin/frpc-web bin/frpc-web.ps1 bin/frpc-web.cmd \
                lib/manager.py lib/webui.py lib/download.sh \
@@ -321,6 +317,29 @@ rollback_install() {
       else
         rm -f -- "/Library/LaunchDaemons/frp-simple-bash.$component.plist" || true
       fi
+    fi
+    # 恢复 Web 单元：快照里有就还原（用户原本可用），没有才删掉
+    if [[ -f "$rollback_dir/unit/frp-simple-bash-web.service" ]]; then
+      mkdir -p /etc/systemd/system || true
+      cp -a -- "$rollback_dir/unit/frp-simple-bash-web.service" \
+            /etc/systemd/system/frp-simple-bash-web.service || true
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl enable --now frp-simple-bash-web >/dev/null 2>&1 || true
+    elif [[ -f "$rollback_dir/unit/frp-simple-bash-web.openrc" ]]; then
+      mkdir -p /etc/init.d || true
+      cp -a -- "$rollback_dir/unit/frp-simple-bash-web.openrc" /etc/init.d/frp-simple-bash-web || true
+      chmod 755 /etc/init.d/frp-simple-bash-web || true
+      rc-update add frp-simple-bash-web default >/dev/null 2>&1 || true
+      rc-service frp-simple-bash-web start >/dev/null 2>&1 || true
+    elif [[ -f "$rollback_dir/unit/frp-simple-bash-web.plist" ]]; then
+      cp -a -- "$rollback_dir/unit/frp-simple-bash-web.plist" \
+            /Library/LaunchDaemons/frp-simple-bash.web.plist || true
+      launchctl bootstrap system /Library/LaunchDaemons/frp-simple-bash.web.plist >/dev/null 2>&1 || true
+    else
+      rm -f -- /etc/systemd/system/frp-simple-bash-web.service \
+               /etc/init.d/frp-simple-bash-web \
+               /Library/LaunchDaemons/frp-simple-bash.web.plist || true
+      if [[ "$manager" == systemd ]]; then systemctl daemon-reload >/dev/null 2>&1 || true; fi
     fi
     if ((was_running == 1)); then
       if [[ "$manager" == systemd ]]; then systemctl start "$component" || true

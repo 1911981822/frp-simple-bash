@@ -208,7 +208,7 @@ class SessionStore(object):
         self._items = {}
         self._idle = max(1, int(idle_minutes)) * 60
 
-    def create(self, username):
+    def create(self, username, restricted=False):
         token = secrets.token_urlsafe(32)
         csrf = secrets.token_urlsafe(24)
         now = time.time()
@@ -217,7 +217,8 @@ class SessionStore(object):
             for key in [k for k, v in self._items.items()
                         if now - v['seen'] > self._idle]:
                 self._items.pop(key, None)
-            self._items[token] = {'user': username, 'csrf': csrf, 'seen': now}
+            self._items[token] = {'user': username, 'csrf': csrf, 'seen': now,
+                                  'restricted': bool(restricted)}
         return token, csrf
 
     def get(self, token):
@@ -408,10 +409,22 @@ class WebApp(object):
             return {'old': self.escape.get('old'), 'new': self.escape.get('new'),
                     'seconds_left': remaining}
 
+    # 受限会话（用旧密码在宽限期内登录）只允许自救动作
+    RESTRICTED_ALLOWED = (
+        ('GET', '/api/session'),
+        ('POST', '/api/settings/password'),
+        ('POST', '/api/logout'),
+    )
+
     def require_auth(self, ctx):
         session = self.current_session(ctx)
         if not session:
             raise HttpError(401, '未登录或会话已过期', 'E401')
+        if session.get('restricted'):
+            if (ctx.method, ctx.path) not in self.RESTRICTED_ALLOWED:
+                raise HttpError(403, '你正在使用旧密码登录，只能修改密码',
+                                'E_PASSWORD_EXPIRED',
+                                hint='请先修改面板密码（设置 → 账号安全），改完即可正常使用')
         if ctx.method not in ('GET', 'HEAD'):
             token = ctx.headers.get(CSRF_HEADER, '')
             try:
@@ -558,6 +571,10 @@ def _is_https(ctx):
         return False
 
 
+# 锁定期间允许"正确密码放行"后，用信号量限制并发 PBKDF2，防 CPU 耗尽。
+_PBKDF2_SLOTS = threading.BoundedSemaphore(2)
+
+
 def api_login(ctx):
     data = ctx.json_body()
     username = str(data.get('username', ''))
@@ -565,9 +582,19 @@ def api_login(ctx):
     app = ctx.app
     locked = app.limiter.locked(ctx.client_ip)
     if locked:
-        raise HttpError(429, '登录失败次数过多，已临时锁定',
-                        'E_AUTH_LOCKED', hint='等待倒计时结束，或重启 Web 服务立即解除',
-                        retry_after=locked)
+        # 面板经 frp 自映射暴露后，外部用户在服务端看来都是 127.0.0.1：
+        # 硬锁定会让任何人用 5 次错密码把管理员锁在门外。锁定期间仍校验一次
+        # 密码——正确就放行（攻击者并不知道密码，不削弱防爆破），并用信号量
+        # 限制并发 PBKDF2，避免被用来打 CPU。
+        with _PBKDF2_SLOTS:
+            correct = (username == app.config.get('username')
+                       and verify_password(password, app.config.get('password_hash')))
+        if not correct:
+            raise HttpError(429, '登录失败次数过多，已临时锁定',
+                            'E_AUTH_LOCKED',
+                            hint='等待倒计时结束，或重启 Web 服务立即解除',
+                            retry_after=locked)
+        web_audit('login', ctx.client_ip, username, 'ok', 'locked-but-correct-password')
     if not username or not password:
         raise HttpError(400, '用户名和密码不能为空', 'E_INVALID',
                         details=[{'field': 'username' if not username else 'password',
@@ -576,12 +603,16 @@ def api_login(ctx):
     # 先算密码再比用户名：用户名错误时也付出同样的 PBKDF2 代价，
     # 避免通过响应时间判断"账号是否存在"
     password_ok = verify_password(password, cfg.get('password_hash'))
+    used_old_password = False
     if not password_ok:
-        # 改密后的宽限期：旧密码在 5 分钟内仍可用（防止记错新密码被锁死）
+        # 改密后的宽限期：旧密码在 5 分钟内仍可用（防止记错新密码被锁死）。
+        # 但它只能换取"受限会话"（仅可改密码），否则攻击者用旧密码重新登录
+        # 就让"改密+踢下线"完全失效。
         old_hash = cfg.get('password_hash_old') or ''
         expires = cfg.get('password_expires_at') or 0
         if old_hash and time.time() < float(expires or 0):
             password_ok = verify_password(password, old_hash)
+            used_old_password = password_ok
     username_ok = (username == cfg.get('username'))
     if not (username_ok and password_ok):
         app.limiter.fail(ctx.client_ip)
@@ -597,7 +628,7 @@ def api_login(ctx):
                              % (cfg.get('login_max_failures', 5),
                                 cfg.get('login_lock_minutes', 15)))
     app.limiter.reset(ctx.client_ip)
-    token, csrf = app.sessions.create(username)
+    token, csrf = app.sessions.create(username, restricted=used_old_password)
     web_audit('login', ctx.client_ip, username, 'ok')
     ctx.handler.send_response(200)
     ctx.handler.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -607,7 +638,10 @@ def api_login(ctx):
     ctx.handler.send_header('Set-Cookie', cookie)
     body = json.dumps({'ok': True, 'code': 0, 'error': None,
                        'username': username, 'csrf': csrf,
-                       'expires_in': app.sessions.remaining(token)}).encode('utf-8')
+                       'expires_in': app.sessions.remaining(token),
+                       'restricted': used_old_password,
+                       'notice': ('你使用的是旧密码，只能修改密码' if used_old_password else '')}
+                      ).encode('utf-8')
     ctx.handler.send_header('Content-Length', str(len(body)))
     _common_headers(ctx.handler)
     ctx.handler.end_headers()
@@ -634,6 +668,9 @@ def api_logout(ctx):
 
 def api_status(ctx):
     session = ctx.app.require_auth(ctx)
+    # 纯 Web 部署下 CLI 入口不会运行；不在这里刷新，pending 会永久显示"待重启"
+    try: manager.refresh_pending('frpc')
+    except (ValueError, OSError): pass
     data = manager.status('frpc')
     conn_raw = (data.get('connection') or {}).get('state')
     return {
@@ -718,6 +755,8 @@ def api_service_restart(ctx): return api_service(ctx, 'restart')
 
 def api_overview(ctx):
     ctx.app.require_auth(ctx)
+    try: manager.refresh_pending('frpc')
+    except (ValueError, OSError): pass
     data = manager.status('frpc')
     profile = data.get('active_profile')
     mappings, mappings_error = [], None
@@ -1033,9 +1072,15 @@ def api_mappings(ctx):
 
 
 def _save_mappings_quiet(pid, items):
-    """Web 端保存映射：静默（不往 journal 打结果框、不读 stdin）+ 返回是否待重启。"""
+    """Web 端保存映射：静默 + **不重启** + 返回是否待重启。
+
+    restart=False 是关键：非交互上下文下 confirm() 恒为 True，会在保存后
+    自动重启 frpc（断掉用户所有隧道，包括把面板暴露出去的自映射）；
+    前台 TTY 下还会因 choose() 抛错导致"已落盘却返回 400"。
+    重启交给用户显式点「重启」按钮。
+    """
     with manager.non_interactive():
-        manager.save_mappings(pid, items)
+        manager.save_mappings(pid, items, restart=False)
     return bool(manager.state().get('pending'))
 
 
@@ -1538,10 +1583,17 @@ def api_settings_password(ctx):
 
 def _settings_password_locked(ctx, body, session):
     cfg = load_web_config()
-    # 已登录不等于有权改密：必须提供当前密码，否则会话被盗即可改密锁死管理员
+    # 已登录不等于有权改密：必须提供当前密码，否则会话被盗即可改密锁死管理员。
+    # 例外：用旧密码登录的受限会话——它刚刚已用旧密码验证过身份，
+    # 此时再要求"当前密码"（等于它不知道的新密码）会把自救通道彻底堵死。
+    restricted = bool((ctx.session or {}).get('restricted'))
     current = str(body.get('current_password', ''))
-    if not current or not verify_password(current, cfg.get('password_hash')):
-        if cfg.get('password_hash'):
+    if not restricted:
+        ok_current = bool(current) and (
+            verify_password(current, cfg.get('password_hash'))
+            or (cfg.get('password_hash_old')
+                and verify_password(current, cfg.get('password_hash_old'))))
+        if not ok_current and cfg.get('password_hash'):
             raise HttpError(403, '当前密码不正确', 'E_CURRENT_PASSWORD',
                             hint='请输入当前密码后再修改')
     new_user = str(body.get('username', cfg.get('username'))).strip()
@@ -1654,17 +1706,16 @@ def _panel_port():
         return 7501
 
 
-def _is_ours_expose(item, panel_port):
+EXPOSE_MARK = 'webui-expose'      # 写进映射的归属标记，避免误删用户同名映射
+
+
+def _is_ours_expose(item, panel_port=None):
     """判断某条映射是不是本工具创建的自映射。
 
-    判据：名字是保留名 + 本地地址是 127.0.0.1 + 本地端口是面板端口。
-    改过面板端口后旧自映射的 local_port 是历史端口，用 `_looks_expose` 兜底识别。
+    只看**归属标记**：用户手工建的 `_webui-tcp`（哪怕也指向 127.0.0.1）
+    没有这个标记，就绝不会被"取消暴露"删掉。
     """
-    if str(item.get('name')) not in (EXPOSE_TCP_NAME, EXPOSE_HTTP_NAME):
-        return False
-    if str(item.get('local_ip') or '') != '127.0.0.1':
-        return False
-    return True
+    return str(item.get('managed_by') or '') == EXPOSE_MARK
 
 
 def api_expose_create(ctx):
@@ -1685,19 +1736,27 @@ def api_expose_create(ctx):
             raise HttpError(400, '请填写公网端口', 'E_INVALID')
         item = {'name': EXPOSE_TCP_NAME, 'type': 'tcp', 'local_ip': '127.0.0.1',
                 'local_port': panel_port, 'remote_port': _to_int(remote, '公网端口'),
-                'enabled': True}
+                'enabled': True, 'managed_by': EXPOSE_MARK}
     elif kind == 'http':
         domain = str(body.get('domain', '')).strip()
         if not domain:
             raise HttpError(400, '请填写域名', 'E_INVALID')
         item = {'name': EXPOSE_HTTP_NAME, 'type': 'http', 'local_ip': '127.0.0.1',
-                'local_port': panel_port, 'domain': domain, 'enabled': True}
+                'local_port': panel_port, 'domain': domain, 'enabled': True,
+                'managed_by': EXPOSE_MARK}
     else:
         raise HttpError(400, '仅支持 tcp 或 http', 'E_INVALID')
 
     # 读-改-写必须在同一把锁内，否则并发会丢掉用户刚建的映射
     with ctx.app.write_lock:
         items = manager.mappings(pid)
+        # 同名映射若不是本工具创建的，明确报冲突（不静默删用户的映射）
+        clash = [m for m in items
+                 if str(m.get('name')) == item['name'] and not _is_ours_expose(m)]
+        if clash:
+            raise HttpError(409, '已存在同名映射「%s」，且不是本工具创建的' % item['name'],
+                            'E_NAME_TAKEN',
+                            hint='请先在映射页改名或删除它，再回来创建公网访问')
         others = [m for m in items if not _is_ours_expose(m, panel_port)]
         # 旧自映射（可能指向改过的旧端口）原位替换，避免"名称重复"卡死
         same_kind = [m for m in items if _is_ours_expose(m, panel_port)
@@ -1709,9 +1768,9 @@ def api_expose_create(ctx):
                      if str(m.get('name')) != item['name']]
         items.append(item)
         manager.validate_mappings(items)
-        manager.save_mappings(pid, items)
+        pending = _save_mappings_quiet(pid, items)
     web_audit('expose-create', ctx.client_ip, ctx.session['user'], 'ok', kind)
-    return {'item': item, 'pending': bool(manager.state().get('pending'))}
+    return {'item': item, 'pending': pending}
 
 
 def api_expose_delete(ctx):
@@ -1724,10 +1783,9 @@ def api_expose_delete(ctx):
         if not ours:
             return {'deleted': False}
         kept = [m for m in items if not _is_ours_expose(m, panel_port)]
-        manager.save_mappings(pid, kept)
+        pending = _save_mappings_quiet(pid, kept)
     web_audit('expose-delete', ctx.client_ip, ctx.session['user'], 'ok')
-    return {'deleted': True, 'removed': len(ours),
-            'pending': bool(manager.state().get('pending'))}
+    return {'deleted': True, 'removed': len(ours), 'pending': pending}
 
 
 # ---------------------------------------------------------------- 危险操作

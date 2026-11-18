@@ -42,6 +42,7 @@
           <option value="online">在线</option>
           <option value="offline">离线</option>
           <option value="disabled">已停用</option>
+          <option value="unknown">状态未知</option>
         </select>
       </div>
 
@@ -69,7 +70,7 @@
               <strong>{{ m.name }}</strong>
               <span class="type-tag">{{ m.type.toUpperCase() }}</span>
               <StatusBadge v-if="isExpose(m)" label="管理端自映射" tone="warn" />
-              <StatusBadge v-if="!m.enabled" label="已停用" tone="err" />
+              <StatusBadge v-if="!m.enabled" label="已停用" tone="warn" />
               <StatusBadge v-else-if="m.online === true" label="在线" tone="ok" />
               <StatusBadge v-else-if="m.online === false" label="离线" tone="err" />
               <StatusBadge v-else-if="m.enabled" label="状态未知" tone="muted" />
@@ -207,6 +208,7 @@ const filtered = computed(() => {
     if (filter.value === 'online' && m.online !== true) return false
     if (filter.value === 'offline' && m.online !== false) return false
     if (filter.value === 'disabled' && m.enabled) return false
+    if (filter.value === 'unknown' && m.online !== null && m.online !== undefined) return false
     if (!kw) return true
     const hay = [m.name, m.local_port, m.remote_port, m.domain, extAddr(m)]
       .filter(Boolean).join(' ').toLowerCase()

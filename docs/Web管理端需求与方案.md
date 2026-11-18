@@ -724,3 +724,45 @@ web/src/components/      StatusBadge / EmptyState / ErrorState / ConfirmDialog
   日志密码解析对全角/半角冒号都成立
 - 新增 5 条测试（help 覆盖全部文档操作、重置密码可验证、未安装提示、无 journal 兜底、密码解析）
 - 全量 **387 测试通过**
+
+---
+
+## 20. 第三轮审查整改（rc.25）
+
+对 Web 管理端做了代码 / 安全 / 人因三路审查，以下为修复记录。
+
+### 20.1 高危
+
+| 问题 | 后果 | 修复 |
+|---|---|---|
+| **Web 保存映射会静默重启 frpc** | `non_interactive()` 下 `confirm()` 恒为 True → 每次增删改映射都触发 `restart_safely`，断掉所有隧道（含把面板暴露出去的自映射）；前台 TTY 下还会因 `choose()` 抛错变成"已落盘却返回 400" | `save_mappings(..., restart=False)`；Web 端不替用户重启，重启交给「重启」按钮 |
+| **`frpc restore` CLI 必崩** | `UnboundLocalError: flags`，文档宣传的命令一执行就失败 | `restore` 分支补 `_parse_flags()` |
+
+### 20.2 中危
+
+| 问题 | 修复 |
+|---|---|
+| 纯 Web 部署下 `pending` 永不清 → 「待重启」永久假告警 | `api_status` / `api_overview` 调 `refresh_pending('frpc')` |
+| 自映射创建/删除未进静默上下文（前台运行时阻塞在 stdin） | 改用 `_save_mappings_quiet()` |
+| `web_service_status()` 返回英文 `active/inactive`，菜单拿中文元组比较 → **服务停了就再也起不回来** | 归一为 中文（运行中/已停止/启动中/停止中） |
+| 撤销/回收失败却清状态冒充"已回收" | `closer()` 返回 False 时保留记录并写审计 |
+| 定时器安装不做结果校验 | 校验 returncode + `is-active` |
+| `admin_port` 无范围校验 | `validate_profile` 校验 1-65535 |
+| 自映射按"名字+端口"判定归属，会误删用户同名映射 | 引入不可伪造的 `managed_by = 'webui-expose'` 标记；同名冲突返回 409 `E_NAME_TAKEN` 而不是静默覆盖 |
+| 暴露到公网后所有外部用户在服务端看来都是 127.0.0.1 → 任何人 5 次错密码锁死管理员 | 锁定期间仍校验密码：正确则放行（攻击者不知道密码，不削弱防爆破），并用信号量限制并发 PBKDF2 |
+| 改密后的旧密码宽限期可"复活"被吊销的会话 | 旧密码只能换**受限会话**：仅允许 改密码/登出/看会话，其它一律 403 `E_PASSWORD_EXPIRED` |
+
+### 20.3 人因与交互
+
+- 概览「已启用」补语义色（与「在线」统一）；「已停用」由红改黄（红留给故障）
+- 映射筛选补「状态未知」选项（原来该状态两种筛选都筛不出）
+- `NoticeBar` 失败时展示 `request_id`（便于报障）
+- 删除 `App.vue` 死代码 `const timer = null || null`
+- 列表/详情页长文本统一 `overflow-wrap`，避免长地址撑破卡片
+
+### 20.4 验证
+
+- 全量 **399 测试通过**（新增 5 条：Web 保存不重启、pending 刷新、受限会话权限、
+  自映射归属标记、同名冲突拒绝）
+- 端到端：建服务端 → 建映射 → 自映射（带标记）→ 取消自映射（只删自己的）→ 用户映射保留
+- 前端构建 105.75KB（gzip 41.69KB）

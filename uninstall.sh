@@ -93,6 +93,10 @@ if ((purge == 1)); then
   #    and must never be blocked by the other component still being installed.
   if [[ "$role" == frpc ]]; then
     rm -rf -- "$config_root/frpc.toml" "$config_root/profiles" "$config_root/index.json"
+    # Web 管理端属于 frpc：面板配置（含口令哈希）与日志只在彻底清理 frpc 时删除。
+    # 放在 frps 分支会误删另一组件仍在使用中的面板凭据。
+    rm -f -- "$config_root/web.json" "$config_root/web.json.bak" \
+             "$config_root/logs/web.log"
     # state.json holds both components' runtime markers; drop the frpc-specific
     # keys but keep frps keys intact.
     if [[ -f "$config_root/state.json" ]]; then
@@ -118,8 +122,7 @@ PY
       systemctl daemon-reload >/dev/null 2>&1 || true
     fi
     rm -f -- "$config_root/auto-port.toml" "$config_root/ports-state.json" \
-             "$config_root/logs/ports-audit.jsonl" "$config_root/web.json" \
-             "$config_root/web.json.bak" "$config_root/logs/web.log"
+             "$config_root/logs/ports-audit.jsonl"
     if [[ -f "$config_root/state.json" ]]; then
       python3 - "$config_root/state.json" <<'PY'
 import json, sys

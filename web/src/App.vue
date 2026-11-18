@@ -36,7 +36,6 @@ const nav = [
 const who = computed(() => session().username)
 const left = ref(0)
 const globalState = ref('')
-const timer = null || null
 let tick = null
 const globalTone = computed(() => {
   const state = String(globalState.value || '').toLowerCase()

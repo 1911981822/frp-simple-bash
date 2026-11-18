@@ -56,8 +56,10 @@
           </div>
           <div class="stat-label">映射总数</div>
         </div>
-        <div class="stat"><div class="stat-num">{{ data.counts.enabled }}</div>
-          <div class="stat-label">已启用</div></div>
+        <div class="stat">
+          <div class="stat-num" :class="enabledTone">{{ data.counts.enabled }}</div>
+          <div class="stat-label">已启用</div>
+        </div>
         <div class="stat">
           <div class="stat-num" :class="onlineTone">{{ onlineText }}</div>
           <div class="stat-label">在线</div>
@@ -161,6 +163,13 @@ const onlineText = computed(() => {
   const c = data.value?.counts
   if (!c || c.online === null || c.online === undefined) return '—'
   return c.online
+})
+const enabledTone = computed(() => {
+  const c = data.value?.counts
+  if (!c) return ''
+  if (c.enabled === 0) return 'muted'
+  if (c.enabled === c.total) return 'ok'
+  return 'warn'
 })
 const onlineTone = computed(() => {
   const c = data.value?.counts

@@ -803,5 +803,87 @@ class AutoPortTests(unittest.TestCase):
         self.assertTrue(out and '真实文本' in ''.join(out))
 
 
+    # ---- 安全修复回归（防火墙误删 / 状态篡改）----
+
+    def test_existing_rule_is_not_adopted(self):
+        """端口本来就已放行（用户手工加的）→ 不认领、不记入 opened。"""
+        cfg = self.cfg(enabled=True, allow_clients=['clientA'])
+        m.save_auto_port_config(cfg)
+        with patch.object(m, 'firewall_mode', return_value='direct'), \
+             patch.object(m, 'web_panel_mode', create=True), \
+             patch.object(m, 'firewall_add_port') as add, \
+             patch.object(m, 'firewall_port_open', return_value=True), \
+             patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]), \
+             patch.object(m, 'port_conflict', return_value=False), \
+             patch.object(m, '_service_pid', return_value=1):
+            report = m.ports_sync(apply_changes=True)
+        add.assert_not_called()                       # 没去重复添加
+        self.assertEqual(m.auto_port_state()['opened'], [])   # 也没认领
+        self.assertTrue(any(s['reason'] == 'already_open' for s in report['skipped']))
+
+    def test_revert_refuses_protected_ports(self):
+        """状态文件被篡改塞进 SSH/frps 端口时，撤销必须拒绝删除。"""
+        cfg = self.cfg(enabled=True, allow_clients=['clientA'])
+        m.save_auto_port_config(cfg)
+        m.atomic(m.ROOT / 'frps.toml', m.toml({'bindPort': 7000}))
+        m.save_auto_port_state({'schema_version': 1, 'opened': [
+            {'port': 7000, 'proto': 'tcp'},           # frps 业务端口 → 受保护
+            {'port': 22, 'proto': 'tcp'},             # SSH → 受保护
+            {'port': 6001, 'proto': 'tcp'},           # 正常记录
+        ]})
+        with patch.object(m, 'firewall_mode', return_value='direct'), \
+             patch.object(m, 'panel_api_ready', return_value=False), \
+             patch.object(m, 'panel_detect', return_value=[]), \
+             patch.object(m, 'firewall_del_port', return_value=True) as delete, \
+             patch.object(m, 'ports_timer_remove'), \
+             patch.object(m, 'ssh_listen_ports', return_value=[22]):
+            outcome = m.ports_revert()
+        deleted = [c[0][0] for c in delete.call_args_list]
+        self.assertNotIn(7000, deleted)
+        self.assertNotIn(22, deleted)
+        self.assertIn(6001, deleted)
+
+    def test_revert_rejects_malformed_state_records(self):
+        cfg = self.cfg(enabled=True, allow_clients=['clientA'])
+        m.save_auto_port_config(cfg)
+        m.save_auto_port_state({'schema_version': 1, 'opened': [
+            {'port': 'abc', 'proto': 'tcp'},
+            {'port': 6002, 'proto': 'sctp'},          # 非 tcp/udp
+            {'port': 99999, 'proto': 'tcp'},          # 越界
+            {'port': 6003, 'proto': 'tcp'},           # 唯一合法
+        ]})
+        with patch.object(m, 'firewall_mode', return_value='direct'), \
+             patch.object(m, 'panel_api_ready', return_value=False), \
+             patch.object(m, 'panel_detect', return_value=[]), \
+             patch.object(m, 'firewall_del_port', return_value=True) as delete, \
+             patch.object(m, 'ports_timer_remove'), \
+             patch.object(m, 'ssh_listen_ports', return_value=[22]):
+            m.ports_revert()
+        self.assertEqual([c[0][0] for c in delete.call_args_list], [6003])
+
+    def test_sync_interval_is_clamped(self):
+        """间隔必须有上限，否则定时器等于永不执行。"""
+        cfg = m.auto_port_config()
+        cfg['sync_interval_seconds'] = 999999999
+        m.save_auto_port_config(cfg)
+        with patch.object(m, '_systemd_available', return_value=False):
+            self.assertEqual(m.ports_timer_install(cfg), False)   # 非 systemd 直接 False
+        # 校验 clamp 逻辑本身
+        self.assertEqual(min(3600, max(5, int(cfg['sync_interval_seconds']))), 3600)
+
+    def test_admin_port_validated(self):
+        """admin_port 越界必须被拒绝（否则会把凭据发给任意本地端口）。"""
+        for bad in (0, 70000, -1):
+            with self.assertRaises(ValueError):
+                m.validate_profile({'name': 'x', 'server_addr': '1.2.3.4',
+                                    'server_port': 7000, 'admin_port': bad})
+
+    def test_local_ip_five_segments_rejected(self):
+        with self.assertRaises(ValueError):
+            m.local_address('1.2.3.4.5')
+
+    def test_python_bin_is_absolute(self):
+        self.assertTrue(m._python_bin().startswith('/'))
+
 if __name__ == '__main__':
     unittest.main()

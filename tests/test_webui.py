@@ -201,14 +201,19 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(status, 401)
 
     def test_login_rate_limited(self):
-        cfg = self.fx.app.config
-        cfg['login_max_failures'] = 3
+        """锁定期间：错误密码 429；正确密码放行（否则暴露到公网时任何人可锁死管理员）。"""
         self.fx.app.limiter = w.LoginLimiter(3, 1)
         for _ in range(3):
             self.fx.json('POST', '/api/login', body={'username': 'admin', 'password': 'x'})
+        # 错误密码 → 仍然锁定
+        status, payload, _ = self.fx.json('POST', '/api/login',
+                                          body={'username': 'admin', 'password': 'still-wrong'})
+        self.assertEqual(status, 429)
+        self.assertEqual(payload.get('code'), 'E_AUTH_LOCKED')
+        # 正确密码 → 放行（攻击者不知道密码，不削弱防爆破）
         status, payload, _ = self.fx.json('POST', '/api/login',
                                           body={'username': 'admin', 'password': 'testpass123'})
-        self.assertEqual(status, 429)
+        self.assertEqual(status, 200)
 
     def test_csrf_required_for_writes(self):
         _, _, cookie = self.fx.login()
@@ -567,7 +572,7 @@ class HttpApiTests(unittest.TestCase):
              patch.object(w.manager, 'load_profile', return_value={'id': 'a' * 24}):
             store = {'items': []}
             def fake_mappings(pid): return list(store['items'])
-            def fake_save(pid, items): store['items'] = list(items)
+            def fake_save(pid, items, **kwargs): store['items'] = list(items)
             with patch.object(w.manager, 'mappings', side_effect=fake_mappings), \
                  patch.object(w.manager, 'save_mappings', side_effect=fake_save), \
                  patch.object(w.manager, 'validate_mappings'):
@@ -775,13 +780,14 @@ class HttpApiTests(unittest.TestCase):
         """面板改过端口后，旧自映射必须能被新配置覆盖（不能报名称重复）。"""
         cookie, csrf = self._login_csrf()
         stale = {'name': w.EXPOSE_TCP_NAME, 'type': 'tcp', 'local_ip': '127.0.0.1',
-                 'local_port': 7000, 'remote_port': 6000, 'enabled': True}
+                 'local_port': 7000, 'remote_port': 6000, 'enabled': True,
+                 'managed_by': w.EXPOSE_MARK}
         store = {'items': [stale]}
         with patch.object(w.manager, 'active', return_value='a' * 24), \
              patch.object(w.manager, 'load_profile', return_value={'id': 'a' * 24}), \
              patch.object(w.manager, 'mappings', side_effect=lambda pid: list(store['items'])), \
              patch.object(w.manager, 'save_mappings',
-                          side_effect=lambda pid, items: store.__setitem__('items', list(items))), \
+                          side_effect=lambda pid, items, **kw: store.__setitem__('items', list(items))), \
              patch.object(w.manager, 'validate_mappings'), \
              patch.object(w, 'load_web_config',
                           return_value=dict(w.DEFAULT_CONFIG, port=7501,
@@ -799,13 +805,14 @@ class HttpApiTests(unittest.TestCase):
         user = {'name': 'ssh', 'type': 'tcp', 'local_ip': '127.0.0.1',
                 'local_port': 22, 'remote_port': 6000, 'enabled': True}
         ours = {'name': w.EXPOSE_TCP_NAME, 'type': 'tcp', 'local_ip': '127.0.0.1',
-                'local_port': 7501, 'remote_port': 6001, 'enabled': True}
+                'local_port': 7501, 'remote_port': 6001, 'enabled': True,
+                'managed_by': w.EXPOSE_MARK}
         store = {'items': [user, ours]}
         with patch.object(w.manager, 'active', return_value='a' * 24), \
              patch.object(w.manager, 'load_profile', return_value={'id': 'a' * 24}), \
              patch.object(w.manager, 'mappings', side_effect=lambda pid: list(store['items'])), \
              patch.object(w.manager, 'save_mappings',
-                          side_effect=lambda pid, items: store.__setitem__('items', list(items))):
+                          side_effect=lambda pid, items, **kw: store.__setitem__('items', list(items))):
             status, payload, _ = self.fx.json('DELETE', '/api/expose', cookie=cookie,
                                               csrf=csrf)
         self.assertEqual(status, 200)
@@ -965,6 +972,90 @@ class HttpApiTests(unittest.TestCase):
              contextlib.redirect_stdout(buf):
             w.main(['--show-password'])
         self.assertIn('AbC-d_12345', buf.getvalue())
+
+    # ---- 代码审查修复回归 ----
+
+    def test_web_save_mappings_does_not_restart_frpc(self):
+        """Web 保存映射不得触发 frpc 重启（会切断用户所有隧道）。"""
+        cookie, csrf = self._login_csrf()
+        with patch.object(w.manager, 'active', return_value='a' * 24), \
+             patch.object(w.manager, 'load_profile', return_value={'id': 'a' * 24}), \
+             patch.object(w.manager, 'mappings', return_value=[]), \
+             patch.object(w.manager, 'validate_mappings'), \
+             patch.object(w.manager, 'save_mappings') as save, \
+             patch.object(w.manager, 'state', return_value={'pending': False}):
+            status, _, _ = self.fx.json('POST', '/api/mappings', cookie=cookie,
+                                        csrf=csrf,
+                                        body={'name': 'x', 'type': 'tcp',
+                                              'local_port': 8080, 'remote_port': 20050})
+        self.assertEqual(status, 200)
+        self.assertFalse(save.call_args.kwargs.get('restart', True),
+                         'Web 保存必须传 restart=False')
+
+    def test_web_refreshes_pending(self):
+        """纯 Web 部署下 pending 要能被清掉，否则「待重启」永久假告警。"""
+        cookie, _ = self._login_csrf()
+        with patch.object(w.manager, 'refresh_pending') as refresh, \
+             patch.object(w.manager, 'status', return_value={'service_state': 'running'}), \
+             patch.object(w.manager, 'mappings', return_value=[]):
+            self.fx.json('GET', '/api/overview', cookie=cookie)
+        refresh.assert_called_once_with('frpc')
+
+    def test_stale_old_password_gets_restricted_session(self):
+        """旧密码宽限期只能换受限会话（仅可改密码），否则改密吊销形同虚设。"""
+        cookie, csrf = self._login_csrf()
+        self.fx.json('POST', '/api/settings/password', cookie=cookie, csrf=csrf,
+                     body={'current_password': 'testpass123', 'password': 'newpass456'})
+        # 用旧密码登录 → 拿到受限会话
+        status, payload, headers = self.fx.json('POST', '/api/login',
+                                                body={'username': 'admin',
+                                                      'password': 'testpass123'})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload['restricted'])
+        cookie2 = [h.split(';')[0] for h in headers.get_all('Set-Cookie') or []][0]
+        # 受限会话不能访问业务接口
+        status, payload, _ = self.fx.json('GET', '/api/mappings', cookie=cookie2)
+        self.assertEqual(status, 403)
+        self.assertEqual(payload['code'], 'E_PASSWORD_EXPIRED')
+        # 但可以改密码自救
+        _, sess, _ = self.fx.json('GET', '/api/session', cookie=cookie2)
+        status, _, _ = self.fx.json('POST', '/api/settings/password', cookie=cookie2,
+                                    csrf=sess['csrf'],
+                                    body={'current_password': 'testpass123',
+                                          'password': 'recovered123'})
+        self.assertEqual(status, 200)
+
+    def test_expose_marks_ownership(self):
+        """自映射必须带归属标记，删除才不会误删用户同名映射。"""
+        cookie, csrf = self._login_csrf()
+        store = {'items': []}
+        with patch.object(w.manager, 'active', return_value='a' * 24), \
+             patch.object(w.manager, 'load_profile', return_value={'id': 'a' * 24}), \
+             patch.object(w.manager, 'mappings',
+                          side_effect=lambda pid: list(store['items'])), \
+             patch.object(w.manager, 'save_mappings',
+                          side_effect=lambda pid, items, **kw: store.__setitem__('items', list(items))), \
+             patch.object(w.manager, 'validate_mappings'), \
+             patch.object(w.manager, 'state', return_value={'pending': False}):
+            self.fx.json('POST', '/api/expose', cookie=cookie, csrf=csrf,
+                         body={'type': 'tcp', 'remote_port': 6001})
+        self.assertEqual(store['items'][0].get('managed_by'), w.EXPOSE_MARK)
+
+    def test_expose_refuses_to_overwrite_user_mapping(self):
+        """用户手工建的同名映射必须报冲突，不能被静默覆盖/删除。"""
+        cookie, csrf = self._login_csrf()
+        user = {'name': w.EXPOSE_TCP_NAME, 'type': 'tcp', 'local_ip': '127.0.0.1',
+                'local_port': 22, 'remote_port': 22222, 'enabled': True}
+        with patch.object(w.manager, 'active', return_value='a' * 24), \
+             patch.object(w.manager, 'load_profile', return_value={'id': 'a' * 24}), \
+             patch.object(w.manager, 'mappings', return_value=[user]), \
+             patch.object(w.manager, 'save_mappings') as save:
+            status, payload, _ = self.fx.json('POST', '/api/expose', cookie=cookie,
+                                              csrf=csrf,
+                                              body={'type': 'tcp', 'remote_port': 6001})
+        self.assertEqual(status, 409)
+        self.assertEqual(payload['code'], 'E_NAME_TAKEN')
+        save.assert_not_called()
 
 if __name__ == '__main__':
     unittest.main()

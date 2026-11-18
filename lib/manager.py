@@ -32,7 +32,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.21'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.22'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -5301,6 +5301,65 @@ def web_service_restart_detached():
     if kind == 'launchd':
         return run_detached(['launchctl', 'kickstart', '-k', 'system/' + WEB_SERVICE])
     return False, '当前平台不支持自动重启'
+
+def web_service_disable():
+    """停止并禁用 Web 服务，但保留单元文件（便于 --enable 恢复）。
+
+    这是"忘记密码 / 改坏配置"时的终端逃生口：服务停掉后不影响 frpc 本体，
+    用 --enable 或 --install-service 可以再起回来。
+    """
+    path, kind = _web_unit_paths()
+    if kind == 'windows':
+        return False, 'Windows 请用任务管理器或 net stop 停止服务'
+    if path is None:
+        return False, '当前平台不支持服务管理'
+    if not path.exists():
+        return False, 'Web 服务尚未安装（可先运行 frpc web --install-service）'
+    try:
+        if kind == 'systemd':
+            out = run_cmd(['systemctl', 'disable', '--now', WEB_SERVICE],
+                          capture_output=True, text=True, timeout=60)
+        elif kind == 'openrc':
+            run_cmd(['rc-service', WEB_SERVICE, 'stop'], capture_output=True, text=True, timeout=60)
+            out = run_cmd(['rc-update', 'del', WEB_SERVICE, 'default'],
+                          capture_output=True, text=True, timeout=30)
+        else:
+            run_cmd(['launchctl', 'bootout', 'system/' + WEB_SERVICE],
+                    capture_output=True, text=True, timeout=60)
+            out = run_cmd(['launchctl', 'disable', 'system/' + WEB_SERVICE],
+                          capture_output=True, text=True, timeout=30)
+        return out.returncode == 0, (out.stderr or '').strip()[:200]
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+
+
+def web_service_enable():
+    """重新启用并启动已注册的 Web 服务（--disable 的逆操作）。"""
+    path, kind = _web_unit_paths()
+    if kind == 'windows':
+        return False, 'Windows 请手动启动服务'
+    if path is None:
+        return False, '当前平台不支持服务管理'
+    if not path.exists():
+        return False, 'Web 服务尚未安装（可先运行 frpc web --install-service）'
+    try:
+        if kind == 'systemd':
+            out = run_cmd(['systemctl', 'enable', '--now', WEB_SERVICE],
+                          capture_output=True, text=True, timeout=60)
+        elif kind == 'openrc':
+            run_cmd(['rc-update', 'add', WEB_SERVICE, 'default'],
+                    capture_output=True, text=True, timeout=30)
+            out = run_cmd(['rc-service', WEB_SERVICE, 'start'],
+                          capture_output=True, text=True, timeout=60)
+        else:
+            run_cmd(['launchctl', 'enable', 'system/' + WEB_SERVICE],
+                    capture_output=True, text=True, timeout=30)
+            out = run_cmd(['launchctl', 'bootstrap', 'system', str(path)],
+                          capture_output=True, text=True, timeout=60)
+        return out.returncode == 0, (out.stderr or '').strip()[:200]
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+
 
 def web_service_status():
     """返回 Web 服务状态文本（未安装时返回 '未安装'）。"""

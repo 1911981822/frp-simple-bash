@@ -111,7 +111,8 @@
 ```bash
 sudo frpc web --set-port 7501 --set-bind 127.0.0.1
 sudo frpc web --set-password
-sudo frpc web --disable
+sudo frpc web --disable          # 临时停用（保留单元文件）
+sudo frpc web --enable           # 重新启用
 ```
 
 ### 3.10 危险操作区
@@ -183,7 +184,9 @@ frp-simple-bash/
 - 配置文件：`/etc/frp/web.json`（0600）
 - 密码存储：`PBKDF2-HMAC-SHA256`，随机 salt，迭代 20 万次（stdlib 实现）
 - 首次启动：生成随机 16 位密码，打印到终端/日志一次，并要求首次登录后修改
-- 会话：HMAC 签名 Cookie（`HttpOnly`、`SameSite=Strict`、`Secure` 仅在 HTTPS 时）
+- 会话：服务端内存 `session` 表 + **不透明随机 token**（256 bit）放在 Cookie 里（`HttpOnly`、`SameSite=Strict`、`Secure` 仅在 HTTPS 时）。
+  不用 HMAC 签名 Cookie 的原因：签名 Cookie 无法即时吊销，而内存表可以在改密时立刻让
+  其它会话失效（`clear_except`）。代价是进程重启后需要重新登录，对管理端可接受。
 
 ### 5.2 防护
 
@@ -261,7 +264,6 @@ GET    /api/tasks/{id}
   "port": 7501,
   "username": "admin",
   "password_hash": "pbkdf2_sha256$200000$<salt>$<hash>",
-  "session_secret": "<random 32 bytes hex>",
   "idle_timeout_minutes": 30,
   "login_max_failures": 5,
   "login_lock_minutes": 15
@@ -269,7 +271,8 @@ GET    /api/tasks/{id}
 ```
 
 - 首次启动自动生成该文件（随机密码打印一次）
-- 端口/绑定/认证**仅终端可改**：`frpc web --set-port/--set-bind/--set-password`
+- 端口/绑定/认证：**Web 与终端都可改**。Web 改走 5 分钟逃生窗口（§9），
+  终端用 `frpc web --set-port/--set-bind/--set-password`（改错或忘密码时的兜底）
 
 ---
 
@@ -347,15 +350,18 @@ Web 端允许修改**端口 / 绑定地址 / 用户名 / 密码**，但必须保
 
 ```bash
 sudo frpc web --set-port 7501        # 改回默认端口
-sudo frpc web --set-password          # 重置密码（打印新密码）
-sudo frpc web --disable               # 临时停用 Web 服务
+sudo frpc web --set-password          # 交互输入新密码（不回显，需输两次）
+sudo frpc web --disable               # 临时停用 Web 服务（保留单元文件）
+sudo frpc web --enable                # 重新启用
 ```
 
 ### 9.5 实现约束
 
 - 双监听在同一进程内：主 `ThreadingHTTPServer` + 备 `ThreadingHTTPServer`，共享同一 App 状态
 - 会话 Cookie 的 `Domain` 不限定 host，切换端口后仍然有效
-- 逃生窗口状态存内存 + 每分钟落盘一次（防进程崩溃后无法判断），进程重启后以磁盘配置为准
+- 逃生窗口状态**纯内存**：新配置在启动第二监听之前就已落盘，进程若崩溃，旧监听本就随之消失，
+  重启后直接以磁盘上的新配置为准，不存在“无法判断哪个生效”的问题。
+  反过来把它落盘会造成“磁盘写旧端口、实际新端口在监听”的不一致，因此刻意不持久化。
 
 ## 10. 多平台
 
@@ -430,7 +436,7 @@ sudo frpc web --disable               # 临时停用 Web 服务
 - **非法 URL 未捕获** → `urlsplit` 包 try，返回 400
 - **错误信封缺 hint** → `{ok, code(字符串), error, hint, retry_after, details, request_id}` + `X-Request-Id` 头
 - **OSError 被当 400 且泄露路径** → ValueError→400，OSError→500「磁盘/权限问题」，500 统一泛化，细节只进审计
-- **`.bak` 与审计日志 0644** → 均 0600（原来泄漏 password_hash/session_secret/登录 IP）
+- **`.bak` 与审计日志 0644** → 均 0600（原来泄漏 password_hash 与会话材料、登录 IP）
 - **`verify_password` 无迭代边界** → 1000~2,000,000 之外直接 False
 - **非 ASCII CSRF 头抛 TypeError** → 先 `isascii()` 校验，返回 403 并记审计
 - **未知配置键被丢弃** → 读写保留全部键（`must_change_password` 等扩展字段不再失效）
@@ -595,3 +601,33 @@ web/src/components/      StatusBadge / EmptyState / ErrorState / ConfirmDialog
 - 实测复验：并发 10/10 落盘、404 语义、布尔严格、非法 IP 拒绝、HEAD SSE 0 字节、PATCH→405 JSON、`first_run` 正确、端口类型归一
 - 前端构建：主包 104.77KB（gzip 41.27KB）
 - 3.6 语法 / shell 语法 / ps1 ASCII 全部通过
+
+---
+
+## 17. 文档与实现一致性整改（rc.22）
+
+发布前对"文档承诺但代码未兑现"的项做了一次专项核对。**先取证再改**：
+
+| 文档位置 | 原表述 | 实测结果 | 处理 |
+|---|---|---|---|
+| §5.1（:186） | "会话：HMAC 签名 Cookie" | `session_secret` 只在生成/断言/文档出现，**从未参与任何签名**；会话是内存表 + 不透明随机 token | 删除 `session_secret` 死字段；文档改写为实际设计并说明为何比签名 Cookie 更合适（可即时吊销） |
+| §7 配置结构（:264） | 列出 `session_secret` 字段 | 同上 | 从示例删除 |
+| §3.9（:114）/ §9.4（:353） | `sudo frpc web --disable` | 实测 `错误：未知参数：--disable` | **补实现** `--disable`，并新增对称的 `--enable` |
+| §9.4（:350） | `--set-password # 重置密码（打印新密码）` | 实际是 `getpass` 交互输入两次，不打印 | 改文档（交互输入更安全：不进 history/ps） |
+| §9.5（:358） | "逃生窗口存内存 + 每分钟落盘一次" | 纯内存，无任何持久化 | 改文档：说明**为何刻意不落盘**（新配置已先落盘；进程崩溃时旧监听本就消失，落盘反而制造磁盘与实际监听的不一致） |
+| §7（:274） | "端口/绑定/认证**仅终端可改**" | 与 §3.9/§9（Web 也能改 + 5 分钟逃生窗口）自相矛盾，是 v1.0 早期遗留 | 改为"Web 与终端都可改" |
+
+### 17.1 顺带发现并修复的可用性问题
+
+核对"首次密码如何告知用户"时发现：`print` 到管道（systemd 下 stdout 不是 TTY）是**块缓冲**，
+进程运行期间 `journalctl -u frp-simple-bash-web | grep 密码` **看不到任何内容**，只有进程退出才落盘。
+而文档恰恰让用户用这条命令取密码。
+
+→ 抽出 `announce_startup()`，打印后立即 `flush` stdout+stderr；补测试断言"打印后必须 flush"。
+
+### 17.2 验证
+
+- 取证方式：全仓 `grep` 引用点 + 实际执行 CLI + 读代码路径，确认 4 项均真实存在后才修改
+- 新增 5 条一致性测试：死字段已移除、遗留字段读取时清除、`--disable/--enable` 可用、
+  `--help` 列出全部文档承诺的参数、启动信息必须 flush
+- 全量 **379 测试通过**

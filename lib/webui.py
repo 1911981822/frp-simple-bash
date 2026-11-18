@@ -57,7 +57,6 @@ DEFAULT_CONFIG = {
     'port': 7501,
     'username': 'admin',
     'password_hash': '',
-    'session_secret': '',
     'idle_timeout_minutes': 30,
     'login_max_failures': 5,
     'login_lock_minutes': 15,
@@ -105,8 +104,9 @@ def load_web_config():
             cfg[key] = int(cfg[key])
         except (TypeError, ValueError):
             cfg[key] = DEFAULT_CONFIG[key]
-    if not cfg.get('session_secret'):
-        cfg['session_secret'] = secrets.token_hex(32)
+    # 历史版本写入的 session_secret 从未参与任何签名（会话是服务端内存表 +
+    # 不透明随机 token），保留只会误导审计，这里顺手清掉
+    cfg.pop('session_secret', None)
     if corrupt:
         cfg['_corrupt'] = True
     return cfg
@@ -122,7 +122,9 @@ def save_web_config(cfg):
             os.chmod(str(bak), 0o600)
         except (OSError, ValueError):
             pass
-    payload = {k: v for k, v in cfg.items() if not str(k).startswith('_')}
+    # 不写内部键（_ 前缀）与已废弃的死字段，避免旧数据被反复写回磁盘
+    payload = {k: v for k, v in cfg.items()
+               if not str(k).startswith('_') and k != 'session_secret'}
     manager.atomic(path, json.dumps(payload, ensure_ascii=False, indent=2) + '\n')
     try:
         os.chmod(str(path), 0o600)
@@ -165,7 +167,6 @@ def ensure_web_config():
         repaired = dict(DEFAULT_CONFIG)
         repaired['password_hash'] = hash_password(password)
         repaired['must_change_password'] = True
-        repaired['session_secret'] = secrets.token_hex(32)
         repaired.pop('_corrupt', None)
         save_web_config(repaired)
         web_audit('config-repaired', result='warn',
@@ -2152,6 +2153,28 @@ def _port_available(bind, port):
         except OSError: pass
 
 
+def announce_startup(bind, port, cfg, generated_password):
+    """打印启动信息并**立即 flush**。
+
+    常驻服务下 stdout 是管道（块缓冲）：不 flush 的话，用户按文档执行
+    `journalctl -u frp-simple-bash-web | grep 密码` 会一直看不到首次密码，
+    直到进程退出或缓冲区写满。
+    """
+    print('frpc Web 管理端已启动')
+    print('  访问地址：http://%s:%d/' % (bind, port))
+    if bind not in ('127.0.0.1', '::1', 'localhost'):
+        print('  ⚠ 已绑定非回环地址：管理端可从网络访问，请确保密码足够强。')
+    if generated_password:
+        print('  首次启动，已生成随机密码（请立即记录并登录后修改）：')
+        print('    用户名：%s' % cfg.get('username'))
+        print('    密码　：%s' % generated_password)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            pass
+
+
 def run(bind=None, port=None, foreground=True, open_browser=False):
     """启动 Web 管理端（常驻服务与前台运行共用此入口）。"""
     # 确保 profiles/logs/backups 存在并执行日志轮转；只靠 Web 管理的主机
@@ -2175,14 +2198,7 @@ def run(bind=None, port=None, foreground=True, open_browser=False):
         raise ValueError('无法监听 %s:%d — %s' % (bind, port, exc))
     _serve_in_thread(app, server, 'main')
 
-    print('frpc Web 管理端已启动')
-    print('  访问地址：http://%s:%d/' % (bind, port))
-    if bind not in ('127.0.0.1', '::1', 'localhost'):
-        print('  ⚠ 已绑定非回环地址：管理端可从网络访问，请确保密码足够强。')
-    if generated:
-        print('  首次启动，已生成随机密码（请立即记录并登录后修改）：')
-        print('    用户名：%s' % cfg.get('username'))
-        print('    密码　：%s' % generated)
+    announce_startup(bind, port, cfg, generated)
     web_audit('start', result='ok', detail='%s:%d' % (bind, port))
     def _escape_watchdog():
         """逃生窗口超时后自动关闭旧监听。"""
@@ -2254,6 +2270,19 @@ def main(argv=None):
             i += 2; continue
         if item == '--set-password':
             set_password = True; i += 1; continue
+        if item == '--disable':
+            ok, message = manager.web_service_disable()
+            print(('已停止并禁用 Web 服务。' if ok else '停用失败：') + (message or ''))
+            if ok:
+                print('  恢复方法：frpc web --enable')
+            return
+        if item == '--enable':
+            ok, message = manager.web_service_enable()
+            print(('已启用并启动 Web 服务。' if ok else '启用失败：') + (message or ''))
+            if ok:
+                cfg = load_web_config()
+                print('  访问地址：http://%s:%s/' % (cfg.get('bind'), cfg.get('port')))
+            return
         if item == '--install-service':
             ok, message = manager.web_service_install()
             print(('已安装并启动 Web 服务：' if ok else '安装失败：') + (message or '完成'))
@@ -2274,7 +2303,7 @@ def main(argv=None):
         if item in ('-h', '--help'):
             print('用法：frpc web [--bind 地址] [--port 端口] [--set-bind 地址] '
                   '[--set-port 端口] [--set-password] [--install-service] '
-                  '[--uninstall-service] [--status]')
+                  '[--uninstall-service] [--disable] [--enable] [--status]')
             return
         raise ValueError('未知参数：' + item)
     if set_password:

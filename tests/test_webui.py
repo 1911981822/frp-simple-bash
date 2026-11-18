@@ -131,7 +131,7 @@ class WebUiConfigTests(unittest.TestCase):
         (self.tmp / w.WEB_CONFIG_NAME).write_text('not json {{{')
         cfg = w.load_web_config()
         self.assertEqual(cfg['port'], 7501)          # 回落到默认值
-        self.assertTrue(cfg['session_secret'])
+        self.assertNotIn('session_secret', cfg)   # 死字段已移除
 
     def test_config_coerces_bad_port(self):
         (self.tmp / w.WEB_CONFIG_NAME).write_text(json.dumps({'port': 'abc'}))
@@ -851,6 +851,56 @@ class HttpApiTests(unittest.TestCase):
         th = threading.Thread(target=worker); th.start(); th.join()
         th2 = threading.Thread(target=other); th2.start(); th2.join()
         self.assertIn('visible', outsider[0])
+
+    # ---- 文档/实现一致性 ----
+
+    def test_session_secret_is_gone(self):
+        """session_secret 从未参与签名，已作为死字段移除。"""
+        cfg = w.load_web_config()
+        self.assertNotIn('session_secret', cfg)
+        self.assertNotIn('session_secret', w.DEFAULT_CONFIG)
+
+    def test_legacy_session_secret_is_stripped(self):
+        """老版本 web.json 里的 session_secret 读取时应被清掉。"""
+        path = self.fx.tmp / w.WEB_CONFIG_NAME
+        cfg = w.load_web_config()
+        cfg['session_secret'] = 'legacy-dead-field'
+        w.save_web_config(cfg)
+        raw = json.loads(path.read_text())
+        self.assertNotIn('session_secret', raw)
+
+    def test_disable_and_enable_cli_flags_exist(self):
+        """文档里承诺的 --disable / --enable 必须真的存在。"""
+        import io as _io
+        for flag in ('--disable', '--enable'):
+            buf = _io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                w.main([flag])          # 未安装服务时应给出提示而不是崩溃
+            self.assertIn('Web 服务', buf.getvalue(), flag)
+
+    def test_help_lists_all_documented_flags(self):
+        import io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            w.main(['--help'])
+        text = buf.getvalue()
+        for flag in ('--bind', '--port', '--set-bind', '--set-port',
+                     '--set-password', '--install-service', '--uninstall-service',
+                     '--disable', '--enable', '--status'):
+            self.assertIn(flag, text, flag)
+
+    def test_startup_flushes_stdout_so_password_is_visible(self):
+        """常驻服务下 stdout 是管道：不 flush 就看不到首次密码（文档让用户 grep journal）。"""
+        import io as _io
+        buf = _io.StringIO()
+        flushes = []
+        original_flush = buf.flush
+        buf.flush = lambda: (flushes.append(1), original_flush())
+        with contextlib.redirect_stdout(buf):
+            w.announce_startup('127.0.0.1', 7501,
+                               {'username': 'admin'}, 'GENPASS12345')
+        self.assertIn('GENPASS12345', buf.getvalue())
+        self.assertTrue(flushes, '启动信息打印后必须 flush')
 
 if __name__ == '__main__':
     unittest.main()

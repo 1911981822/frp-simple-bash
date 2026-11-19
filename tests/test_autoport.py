@@ -147,14 +147,33 @@ class AutoPortTests(unittest.TestCase):
             desired, _ = m.ports_desired(cfg)
         self.assertEqual(len(desired), 5)
 
-    def test_desired_skips_port_held_by_other_process(self):
-        cfg = self.cfg(allow_clients=['clientA'])
-        with patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]), \
-             patch.object(m, 'port_conflict', return_value=True), \
-             patch.object(m, '_service_pid', return_value=1):
-            desired, skipped = m.ports_desired(cfg)
-        self.assertEqual(desired, {})
-        self.assertEqual(skipped[0]['reason'], 'port_in_use')
+    def test_desired_does_not_skip_online_proxy_ports(self):
+        """在线 proxy 的端口由 frps 自己监听，不能因"端口被占用"被跳过。
+
+        历史 bug：这里曾调 port_conflict()，只要拿不到准确的 frps PID
+        （容器/OpenRC/PID 变化/子进程监听）就会把**全部**映射判成占用，
+        表现为"配好了宝塔 API 但一个端口都放不出去"。
+        """
+        cfg = self.cfg(allow_clients=[])
+        for frps_pid in (None, 1, 12345):
+            with patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]), \
+                 patch.object(m, '_service_pid', return_value=frps_pid), \
+                 patch.object(m, 'port_listener_pids', return_value=[999]):
+                desired, skipped = m.ports_desired(cfg)
+            self.assertIn((6000, 'tcp'), desired, 'frps_pid=%r 时不该跳过' % frps_pid)
+            self.assertFalse([s for s in skipped if s.get('reason') == 'port_in_use'])
+
+    def test_whitelist_is_optional(self):
+        """白名单留空 = 放行所有已通过 token 认证的客户端。"""
+        for allow in ([], ['somebody-else']):
+            cfg = self.cfg(allow_clients=allow)
+            with patch.object(m, 'frps_online_proxies', return_value=[self.proxy(6000)]):
+                desired, skipped = m.ports_desired(cfg)
+            if not allow:
+                self.assertIn((6000, 'tcp'), desired)
+            else:
+                self.assertEqual(desired, {})
+                self.assertEqual(skipped[0]['reason'], 'client_not_allowed')
 
     def test_port_conflict_ignores_frps_itself(self):
         with patch.object(m, 'port_listener_pids', return_value=[42, 42]):

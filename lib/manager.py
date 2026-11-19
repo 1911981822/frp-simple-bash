@@ -32,7 +32,7 @@ import socket
 VERSION = '0.72.0'
 # Manager release version (the management scripts themselves, not the frp binary).
 # Bumped on every published release; upgrade() pulls exactly this bundle.
-MANAGER_RELEASE_VERSION = 'v1.0.0-rc.25'
+MANAGER_RELEASE_VERSION = 'v1.0.0-rc.26'
 ROOT = Path(os.environ.get('FRP_CONFIG_DIR', '/etc/frp' if os.name != 'nt' else os.environ.get('ProgramData', 'C:/ProgramData') + '/frp-simple-bash'))
 BIN = Path(os.environ.get('FRP_BINARY_DIR', '/opt/frp-simple-bash/native' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash/native'))
 INSTALL_ROOT = Path(os.environ.get('FRP_INSTALL_DIR', '/opt/frp-simple-bash' if os.name != 'nt' else os.environ.get('ProgramFiles', 'C:/Program Files') + '/frp-simple-bash'))
@@ -2619,9 +2619,14 @@ def server_clients():
         section(f'客户端明细 {start + 1}-{start + len(chunk)} / {len(clients)}')
         for n, item in enumerate(chunk, start + 1):
             state = '在线' if item.get('online') else '离线'
-            print(f'  {n}. ' + str(item.get('hostname') or item.get('clientID') or item.get('key', '未知'))
-                  + '  [' + color_state(state) + ']')
-            print('     版本={0}  IP={1}  代理数={2}'.format(
+            hostname = str(item.get('hostname') or '未命名')
+            # clientID 就是 frps 里的 key，也是白名单/端口映射用的标识。
+            # 早期只显示 hostname，用户去白名单里根本找不到这个客户端。
+            client_id = str(item.get('key') or item.get('clientID')
+                            or item.get('clientId') or '')
+            print(f'  {n}. {hostname}  [' + color_state(state) + ']')
+            print('     clientID={0}  版本={1}  IP={2}  代理数={3}'.format(
+                col_ok(client_id) if client_id else '未知',
                 item.get('version', '-'), item.get('clientIP', '-'),
                 item.get('status', {}).get('proxyCount', '-')))
         if start + page_size < len(clients):
@@ -2638,7 +2643,10 @@ def server_clients():
             status = item.get('status', {})
             phase = str(status.get('phase', '未知'))
             phase_text = color_state(phase_map.get(phase.lower(), phase))
-            print(f'  {n}. {item.get("name", "未知")} [{phase_text}] 类型={item.get("spec", {}).get("type", "未知")}')
+            cid = str(item.get('clientID') or item.get('clientId') or '')
+            print(f'  {n}. {item.get("name", "未知")} [{phase_text}]'
+                  f' 类型={item.get("spec", {}).get("type", "未知")}'
+                  + (' clientID=' + cid if cid else ''))
             print('     今日流量：入 {0} / 出 {1}，连接数 {2}'.format(
                 _human_bytes(status.get('todayTrafficIn', 0)),
                 _human_bytes(status.get('todayTrafficOut', 0)),
@@ -3598,10 +3606,12 @@ def auto_port_config():
         for item in deny:
             try: deny_list.append(int(item))
             except (TypeError, ValueError): continue
-    allow = []
+    allow, seen_allow = [], set()
     for item in (raw.get('allow_clients') or []):
         text = str(item).strip()
-        if text: allow.append(text)
+        # 去重：历史数据/多次添加可能产生重复项，既占地方又让菜单看起来错乱
+        if text and text not in seen_allow:
+            seen_allow.add(text); allow.append(text)
     return {
         'enabled': bool(raw.get('enabled', False)),
         'mode': str(raw.get('mode', 'firewall')),
@@ -3615,7 +3625,15 @@ def auto_port_config():
     }
 
 def save_auto_port_config(cfg):
-    """Persist auto-port config with 0600 permissions."""
+    """Persist auto-port config with 0600 permissions.
+
+    必须**保留**文件里已有的其它键（尤其 [panel] 段）。
+    早期版本整体重写成固定字段集，导致任何一次保存（开关自动同步、改白名单）
+    都会把用户配好的宝塔 API key 抹掉——这就是"key 过一段时间就没了"的根因。
+    """
+    path = auto_port_config_path()
+    raw = read_toml(path) if path.exists() else {}
+    if not isinstance(raw, dict): raw = {}
     payload = {
         'schema_version': 1,
         'enabled': bool(cfg['enabled']),
@@ -3628,7 +3646,11 @@ def save_auto_port_config(cfg):
         'prune_after_seconds': int(cfg['prune_after_seconds']),
         'panel_mode': str(cfg.get('panel_mode', 'auto')),
     }
-    atomic(auto_port_config_path(), toml(payload))
+    # 保留文件中的其它所有键；[panel] 段原样带过去
+    for key, value in raw.items():
+        if key in payload: continue
+        payload[key] = value
+    atomic(path, toml(payload))
     try: os.chmod(str(auto_port_config_path()), 0o600)
     except OSError: pass
     audit('auto-port-config-saved')
@@ -4589,10 +4611,21 @@ def port_listener_pids(port, proto='tcp'):
     return sorted(set(pids))
 
 def port_conflict(port, proto, frps_pid=None):
-    """True when a process OTHER than frps holds the port."""
+    """True when a process OTHER than frps holds the port.
+
+    注意：frps 的 remotePort 由 **frps 自己监听并转发**，所以"端口有监听"
+    是正常现象，不是冲突。这里只在能确定监听者既不是 frps、也不是
+    本工具视角下的 frp 转发时才判冲突。
+    """
     pids = port_listener_pids(port, proto)
     if not pids: return False
-    if frps_pid and all(pid == frps_pid for pid in pids): return False
+    if not frps_pid:
+        # 拿不到 frps PID（容器/OpenRC/PID 变化）时无法区分"frps 转发"
+        # 与"第三方占用"。而端口来自 frps Dashboard 的在线 proxy 列表，
+        # 本身就证明是 frps 在监听——此时一律不判冲突，否则会导致
+        # **所有映射都被跳过、一个端口都放不出去**。
+        return False
+    if all(pid == frps_pid for pid in pids): return False
     return True
 
 # ---------------------------------------------------------------- 数据源
@@ -4630,7 +4663,6 @@ def ports_desired(cfg=None):
     Returns (desired, skipped) where skipped explains every excluded item.
     """
     cfg = cfg or auto_port_config()
-    frps_pid = _service_pid('frps')
     allow = set(cfg['allow_clients'])
     deny = set(cfg['deny_ports']) if cfg['deny_ports_enabled'] else set()
     quota = cfg['max_ports_per_client']
@@ -4647,14 +4679,20 @@ def ports_desired(cfg=None):
         client_id = str(item.get('clientID') or item.get('clientId') or '')
         name = str(item.get('name', ''))
         base = {'port': port, 'proto': proto, 'client_id': client_id, 'proxy': name}
-        if not client_id or client_id not in allow:
+        # 白名单是可选的：留空表示"放行所有已通过 frps auth.token 认证的客户端"。
+        # 能连上 frps 的客户端本来就已经过 token 验证，白名单只是额外的收窄手段，
+        # 不该成为必填步骤（早期版本留空会导致一个端口都不放行）。
+        if allow and (not client_id or client_id not in allow):
             skipped.append(dict(base, reason='client_not_allowed')); continue
         if port in deny:
             skipped.append(dict(base, reason='denied_port')); continue
-        if quota and per_client.get(client_id, 0) >= quota:
+        if quota and client_id and per_client.get(client_id, 0) >= quota:
             skipped.append(dict(base, reason='quota_exceeded')); continue
-        if port_conflict(port, proto, frps_pid):
-            skipped.append(dict(base, reason='port_in_use')); continue
+        # 不做端口占用检查：这些端口来自 frps Dashboard 的**在线** proxy 列表，
+        # 说明 frps 已经在监听并转发它们——"有监听"是正常现象。
+        # 早期版本在这里调 port_conflict()，只要拿不到准确的 frps PID
+        # （容器/OpenRC/PID 变化/子进程监听）就会把全部映射判成"端口被占用"，
+        # 表现为"配好了 API 但一个端口都放不出去"。
         key = (port, proto)
         if key in desired: continue
         per_client[client_id] = per_client.get(client_id, 0) + 1
@@ -5091,7 +5129,7 @@ def auto_port_menu():
             print('  ' + _kv('放行方式', col_ok('宝塔 API 自动') if api_ready
                              else col_warn('手动（未配 API）')))
             print('  ' + _kv('白名单', col_ok('%d 个客户端' % count) if count
-                             else col_bad('空（不会放行任何端口）')))
+                             else _dim('不限（放行所有已认证客户端）')))
             opened = auto_port_state().get('opened') or []
             if not enabled:
                 # 关闭状态下定时器必然不存在，显示它是纯噪声（用户反馈的困惑点）
@@ -5106,23 +5144,23 @@ def auto_port_menu():
             print('  ' + _kv('已放行', (col_ok('%d 个端口' % len(opened)) if opened
                                       else _dim('0 个端口'))
                              + '  ' + _dim('（撤销用 6)')))
-        print('  ' + _dim('命令行等价：frps ports status / plan / apply'))
+            print('  ' + _dim('命令行等价：frps ports status / plan / apply'))
 
         def _guide():
             if count and enabled:
                 return                          # 配置齐全，不再打扰
             if not count:
                 print('  ' + _tag('[提示]') + ' 建议顺序：')
-                print('    ① 3) 白名单 → 加客户端 ID（只有白名单内的映射会被放行）')
-                print('    ② 4) 宝塔 API（可跳过；不配则需自己去面板手工加）')
-                print('    ③ 5) 开启自动同步')
+                print('    ① 4) 宝塔 API（不配则需自己去面板手工加）')
+                print('    ② 5) 开启自动同步')
+                print('    ' + _dim('白名单是可选的：留空 = 放行所有已通过 token 认证的客户端'))
             elif not api_ready:
                 print('  ' + _dim('未配宝塔 API：同步后需到面板手工放行；配了就能全自动。'))
 
         items = [
             '查看待放行端口',
             '同步并放行',
-            '白名单',
+            '白名单（可选）',
             '宝塔 API',
             '关闭自动同步' if enabled else '开启自动同步',
             '撤销全部放行',
@@ -5154,10 +5192,8 @@ def auto_port_menu():
                     ports_timer_remove(); ports_audit('disable', result='ok')
                     result_ok('自动同步已停用。', detail='已放行的端口保持不变，需要时可用 6) 撤销。')
                 else:
-                    if not count:
-                        result_error('白名单为空，先到「3) 白名单」添加客户端。',
-                                     hint='只有白名单内的客户端，其映射端口才会被放行。')
-                        pause(); continue
+                    # 白名单可选（留空 = 放行所有已通过 token 认证的客户端），
+                    # 这里不再强制要求配置白名单
                     if not confirm('开启后每 15 秒自动同步一次，把新映射的端口放行。确认？'):
                         result_info('已取消。'); pause(); continue
                     if ports_enable(cfg, yes=True):
